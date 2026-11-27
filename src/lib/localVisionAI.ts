@@ -24,6 +24,11 @@ import {
   reopenBacklog,
   describeChecklistForUi,
   describeNavForUi,
+  lakeTopBlock,
+  senseMoltenLake,
+  MOLTEN_CELL,
+  MOLTEN_COLS,
+  type MoltenLake,
   type ChecklistItem,
   type LostVerdict,
   type MapHintDir,
@@ -394,6 +399,15 @@ export class LocalVisionAgent {
   private roomTrail: number[] = [];
   private navStartRoomId = -1;
   private navPrevItemCount = 0;
+  /** lago de lava reconhecido no frame (o mapa de blocos vê ar onde há lava) */
+  private lavaLake: MoltenLake | null = null;
+  private lavaLakeRoomId = -1;
+  private lavaLakeTick = -99;
+  private lavaCamX = -1;
+  private lavaCamY = -1;
+  /** sala em que a rota da beira de lava foi "commitada" (o guard não solta o comando) */
+  private lavaEdgeCommitRoom = -1;
+  private lavaTopRow = -1;
   private lastNewRoomTick = 0;
   private lastNavProgressTick = 0;
   private navLost: LostVerdict = { lost: false, cause: null, severity: 0, note: 'navegação ainda não avaliada' };
@@ -520,6 +534,13 @@ export class LocalVisionAgent {
     this.roomTrail = [];
     this.navStartRoomId = -1;
     this.navPrevItemCount = 0;
+    this.lavaLake = null;
+    this.lavaEdgeCommitRoom = -1;
+    this.lavaLakeRoomId = -1;
+    this.lavaLakeTick = -99;
+    this.lavaCamX = -1;
+    this.lavaCamY = -1;
+    this.lavaTopRow = -1;
     this.lastNewRoomTick = 0;
     this.lastNavProgressTick = 0;
     this.navLost = { lost: false, cause: null, severity: 0, note: 'reset' };
@@ -1060,6 +1081,182 @@ export class LocalVisionAgent {
 
   // ===================================================== NAVEGAÇÃO COM O MAPA DO JOGO
 
+  /**
+   * Reconhece lago de lava no frame da sala atual. Precisamos disso porque a lava não é
+   * bloco sólido no Super Metroid: o mapa de blocos diz "ar" e o planejador manda a Samus
+   * caminhar para dentro do lago.
+   */
+  private senseLavaFloor(wram: MetroidWramSnapshot): void {
+    const roomChanged = this.lavaLakeRoomId !== wram.roomId;
+    const camMoved =
+      Math.abs(wram.cameraX - this.lavaCamX) >= MOLTEN_CELL || Math.abs(wram.cameraY - this.lavaCamY) >= MOLTEN_CELL;
+    if (!roomChanged && !camMoved && this.stepIndex - this.lavaLakeTick <= 8) return;
+    const frame = this.lastCapturedFrame;
+    const rgba = frame?.rgba as unknown as Uint8ClampedArray | undefined;
+    if (!rgba || !frame || frame.width < 64) {
+      if (roomChanged) {
+        // sala nova sem frame amostrado ainda: não marca o tick, tenta de novo no próximo
+        this.lavaLakeRoomId = -1;
+        this.lavaLake = null;
+        this.lavaTopRow = -1;
+      }
+      return;
+    }
+    this.lavaLakeRoomId = wram.roomId;
+    this.lavaLakeTick = this.stepIndex;
+    this.lavaCamX = wram.cameraX;
+    this.lavaCamY = wram.cameraY;
+    if (roomChanged) this.lavaEdgeCommitRoom = -1;
+    const lake = senseMoltenLake(rgba, frame.width, frame.height);
+    this.lavaLake = lake;
+    this.lavaTopRow = lake ? lakeTopBlock(lake, wram.cameraY) : -1;
+    if (lake && roomChanged) {
+      // a sala tem chão hostil: registra como perigosa para o plano não voltar por acaso
+      const extra = this.navExtras.get(wram.roomId);
+      if (extra) extra.danger = Math.min(4, extra.danger + 1);
+    }
+  }
+
+  /**
+   * Guard de beira de lava.
+   *
+   * Olha para BAIXO, não só para o pé: no ar acima de um lago a Samus ainda não está na
+   * lava, e é exatamente aí que o passeio cego a empurrava para dentro (o guard antigo só
+   * via o perigo na linha do chão, e entre um pulo e outro outro ramo assumia o controle).
+   *
+   * Ordem de decisão: porta para cima da sala → coluna segura mais próxima (air control) →
+   * parar na beirada. Nunca "inverte o lado" às cegas, porque do outro lado também há lago.
+   */
+  private lavaEdgeInfo(
+    wram: MetroidWramSnapshot,
+    bx: number,
+    by: number,
+    intended: 'LEFT' | 'RIGHT',
+  ): { keys: AIKey[]; reason: string } | null {
+    if (!this.lavaLake) return null;
+    const rw = wram.roomWidthBlocks;
+    const rh = wram.roomHeightBlocks;
+    const lavaAt = (cx: number, cy: number): boolean =>
+      cx >= 0 && cy >= 0 && cx < rw && cy < rh && this.isLavaCell(wram, cx, cy);
+    /** linha em que uma queda nessa coluna terminaria em lava (-1 = seguro) */
+    const dropInto = (cx: number): number => {
+      for (let cy = Math.max(0, by); cy <= Math.min(rh - 1, by + 6); cy++) {
+        if (lavaAt(cx, cy)) return cy;
+      }
+      return -1;
+    };
+
+    const aheadBx = intended === 'RIGHT' ? bx + 1 : bx - 1;
+    const aheadLavaRow = dropInto(aheadBx);
+    const hereLavaRow = dropInto(bx);
+    const threatened = aheadLavaRow >= 0 || hereLavaRow >= 0;
+    // Rota commitada: numa sala com lago, o passeio cego NÃO pode retomar o controle no
+    // meio do caminho (era assim que a cada 2 ticks outro ramo a puxava de volta para o
+    // lado errado). O guard assume a sala até sair dela; sem ameaça imediata ele só guia.
+    const committed = this.lavaEdgeCommitRoom === wram.roomId;
+    if (!threatened && !committed) return null;
+
+    // memória de perigo: a célula do lago fica marcada para as próximas visitas
+    if (aheadLavaRow >= 0) this.dangerCells.add(`${wram.roomId}:${aheadBx},${aheadLavaRow}`);
+    if (threatened) this.lavaEdgeCommitRoom = wram.roomId;
+
+    const { jump: jumpKey, run: dashKey } = wram.controls;
+    const isGrounded = this.isSamusGrounded(wram);
+    const safeColumn = (cx: number): boolean =>
+      cx >= 0 && cx < rw && dropInto(cx) < 0 && !lavaAt(cx, by) && this.resolveBlockType(wram, cx, by) !== 0x8;
+
+    // 1) saída vertical da sala: caminhe até ela pelo que estiver livre e suba
+    const upDoor = wram.doors.find((d) => d.side === 'UP' && !d.blockedByWall);
+    if (upDoor) {
+      const doorBx = Math.floor(upDoor.x / 16);
+      const dir: 'LEFT' | 'RIGHT' = doorBx >= bx ? 'RIGHT' : 'LEFT';
+      const step = dir === 'RIGHT' ? 1 : -1;
+      let clear = true;
+      for (let cx = bx + step; cx !== doorBx + step; cx += step) {
+        if (Math.abs(cx - bx) > 14) break;
+        if (dropInto(cx) >= 0 || this.resolveBlockType(wram, cx, by) === 0x8) {
+          clear = false;
+          break;
+        }
+      }
+      const near = Math.abs(upDoor.x - wram.samusX) < 40;
+      const keys: AIKey[] = clear ? [dir, ...(near ? [] : [dashKey])] : [dir];
+      if (near) keys.push('UP');
+      if (near && isGrounded) keys.push(jumpKey);
+      if (near && !isGrounded) keys.push('UP');
+      return {
+        keys,
+        reason: clear
+          ? near
+            ? 'lava no chão · subindo pela porta superior'
+            : 'lava no chão da sala · andando pela borda até a porta superior'
+          : 'lava bloqueando o chão · pulando a beirada em direção à porta superior',
+      };
+    }
+
+    // 2) sem porta para cima: procure a coluna segura mais próxima (inclusive voltando)
+    for (const dir of [intended === 'RIGHT' ? 'LEFT' : 'RIGHT', intended] as const) {
+      const step = dir === 'RIGHT' ? 1 : -1;
+      for (let d = 1; d <= 8; d++) {
+        const cx = bx + step * d;
+        if (cx < 0 || cx >= rw) break;
+        if (dropInto(cx) >= 0) continue;
+        // plataforma acima naquele lado? serve tanto quanto chão seguro
+        const ledgeUp = [1, 2, 3].some(
+          (lift) => safeColumn(cx) && this.isCellStandableProbe(wram, cx, by - lift) && !this.isHazardAt(wram, cx, by - lift - 1),
+        );
+        if (safeColumn(cx) || ledgeUp) {
+          const keys: AIKey[] = [dir, dashKey];
+          if (isGrounded && (this.stepIndex % 3 === 0 || !safeColumn(bx))) keys.push(jumpKey);
+          return { keys, reason: `lava à frente · voltando para a borda segura a ${dir === 'RIGHT' ? 'direita' : 'esquerda'}` };
+        }
+      }
+    }
+
+    // 3) cercada: não anda para dentro de jeito nenhum. Segura o lugar (e o plano decide se
+    // falta altura de pulo) em vez de inverter o lado e cair no lago do outro lado.
+    return {
+      keys: isGrounded ? [jumpKey] : [],
+      reason: hereLavaRow >= 0
+        ? 'sobre o lago de lava · tentando não afundar'
+        : 'lava dos dois lados · precisando de altura de pulo (Hi-Jump/Space Jump)',
+    };
+  }
+
+  /** Versão barata de "dá para ficar de pé aqui" para o guard de lava. */
+  private isCellStandableProbe(wram: MetroidWramSnapshot, bx: number, by: number): boolean {
+    const t = this.resolveBlockType(wram, bx, by);
+    if (t === 0x8 || t === 0xe) return false;
+    const below = this.resolveBlockType(wram, bx, by + 1);
+    return below === 0x8 || below === 0xa || below === 0x1 || below === 0xb || below === 0xe || below === 0xf;
+  }
+
+  /** Célula hostil (espinho) acima de uma posição? */
+  private isHazardAt(wram: MetroidWramSnapshot, bx: number, by: number): boolean {
+    return this.resolveBlockType(wram, bx, by) === 0xa;
+  }
+
+  /** Esta célula da sala é lava? (amostra o centro e as bordas da célula de 16px) */
+  private isLavaCell(wram: MetroidWramSnapshot, bx: number, by: number): boolean {
+    const lake = this.lavaLake;
+    if (!lake) return false;
+    if (bx < 0 || by < 0 || bx >= wram.roomWidthBlocks || by >= wram.roomHeightBlocks) return false;
+    const camBx = wram.cameraX;
+    const camBy = wram.cameraY;
+    for (const ox of [8, 0, 15]) {
+      for (const oy of [8, 0, 15]) {
+        const sx = bx * 16 + ox - camBx;
+        const sy = by * 16 + oy - camBy;
+        if (sx < 0 || sy < 0) continue;
+        const cc = Math.floor(sx / MOLTEN_CELL);
+        const cr = Math.floor(sy / MOLTEN_CELL);
+        if (cc < 0 || cc >= MOLTEN_COLS || cr < 0 || cr >= lake.mask.length / MOLTEN_COLS) continue;
+        if (lake.mask[cr * MOLTEN_COLS + cc] === 1) return true;
+      }
+    }
+    return false;
+  }
+
   /** Registros por sala que o grafo do agente não guarda (itens, painéis, perigo, chefe). */
   private navRoomExtra(roomId: number, areaIndex: number) {
     let rec = this.navExtras.get(roomId);
@@ -1166,6 +1363,9 @@ export class LocalVisionAgent {
         if (c) this.navDoorColors.set(key, c);
       }
     }
+
+    // (a2) lava no chão: o que decide "não andar para frente" e "subir em vez de atravessar"
+    this.senseLavaFloor(wram);
 
     // (b) itens: conta atual vale até sair da sala; o máximo já visto evita "sumir item" falso
     const itemsNow = wram.roomItems.length;
@@ -1506,6 +1706,9 @@ export class LocalVisionAgent {
       } else if (this.mapHint) {
         const dir = directionForDoor(t.key);
         if (dir === this.mapHint.dir) t.priority = Math.min(t.priority, 0);
+      }
+      if (this.lavaTopRow >= 0 && directionForDoor(t.key) === 'UP') {
+        t.priority = Math.min(t.priority, -1); // cercada por lava: a saída é vertical
       }
       if (target && target.roomId === wram.roomId && target.route.length === 0) {
         t.priority = Math.max(t.priority, 4); // já estamos no alvo: não sair correndo
@@ -1852,6 +2055,8 @@ export class LocalVisionAgent {
             checklistSummary: describeChecklistForUi(this.navChecklist),
             navSummary: describeNavForUi(this.navTarget, this.navBacklog, this.mapReading),
             preferredDirection: this.preferredDirection,
+            floorHazard: this.lavaLake ? 'LAVA' : 'NONE',
+            lavaTopRow: this.lavaTopRow,
             currentRoomDoors: wram.doors.map((d) => ({
               key: d.key,
               color: this.navDoorColors.get(`${wram.roomId}:${d.key}`) ?? 'UNKNOWN',
@@ -2302,8 +2507,12 @@ export class LocalVisionAgent {
     const hasSpaceJump = (wram.itemsMask & 0x0200) !== 0;
     const maxJumpH = hasSpaceJump ? 14 : hasHiJump ? 7 : 5;
 
+    const isLavaHere = (bx: number, by: number): boolean => this.isLavaCell(wram, bx, by);
+
     const isCellAir = (bx: number, by: number, allowBreakable: boolean): boolean => {
       if (bx < 0 || by < 0 || bx >= rw || by >= rh) return false;
+      // lava não é ar navegável: o mapa de blocos não sabe que ali machuca
+      if (isLavaHere(bx, by)) return false;
       const t = tAt(bx, by);
       if (t === 0x8 || t === 0xa || t === 0xe) return false;
       if (t === 0xf) {
@@ -2323,6 +2532,8 @@ export class LocalVisionAgent {
 
     const isFloorTile = (bx: number, by: number): boolean => {
       if (bx < 0 || by < 0 || bx >= rw || by >= rh) return true;
+      // superfície de lava não é chão para se parar em cima
+      if (isLavaHere(bx, by)) return false;
       const t = tAt(bx, by);
       return (
         t === 0x8 ||
@@ -4845,6 +5056,22 @@ export class LocalVisionAgent {
       this.resolveBlockType(wram, samusBx - 1, samusBy - 2) === 0xa ||
       this.resolveBlockType(wram, samusBx + 1, samusBy - 2) === 0xa;
     const ceilingLow = isSolidHead(tileAbove1) || isSolidHead(tileAbove2) || spikeNearHead;
+
+    // Lava primeiro: o chão pode parecer sólido no mapa de blocos e o roteiro da sala pode
+    // mandar para dentro do lago. Nenhuma outra decisão de andar acontece antes deste guard.
+    const lavaEdge = this.lavaEdgeInfo(wram, samusBx, samusBy, pathStep?.dir ?? this.moveDir);
+    if (lavaEdge) {
+      return this.makeMetroidAction(
+        'EXPLORE',
+        lavaEdge.keys,
+        120,
+        'run',
+        motionPct,
+        'Exploração · Beira de lava',
+        `Sala 0x${wram.roomId.toString(16).toUpperCase()} (${wram.samusX},${wram.samusY}) · ${lavaEdge.reason}`,
+        wram,
+      );
+    }
 
     // Bloqueio detectado em Exploração: testa míssil de forma inteligente (apenas se vale a pena)
     if (this.progressStallTicks >= 5) {

@@ -103,7 +103,7 @@ a cor reconhecida, o backlog ("voltar quando tiver o item") e o que falta do che
 
 ```bash
 npm run check:map    # 36 checagens do módulo (portas, tela de mapa pintada, rota, backlog, checklist)
-npm run check:nav    # 24 checagens do agente num mundo de várias salas, com a tela de mapa real
+npm run check:nav    # 34 checagens do agente num mundo de várias salas: mapa real + salas com lava
 npm run check:all    # tudo: codex de chefes + mapa + as duas simulações de agente
 ```
 

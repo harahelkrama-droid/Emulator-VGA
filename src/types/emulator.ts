@@ -223,6 +223,10 @@ export interface AIStatusSnapshot {
     checklistSummary: string;
     navSummary: string;
     preferredDirection: string | null;
+    /** chão hostil da sala atual, reconhecido no frame (lava não é bloco no SM) */
+    floorHazard: 'LAVA' | 'NONE';
+    /** linha (em blocos da sala) onde o lago começa; -1 = sem lago */
+    lavaTopRow: number;
     /** portas da sala atual com a cor reconhecida no frame (base da decisão de abrir/voltar) */
     currentRoomDoors: Array<{ key: string; color: string; closed: boolean }>;
   };

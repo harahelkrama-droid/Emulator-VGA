@@ -22,10 +22,13 @@ const VALID_KEYS: AIKey[] = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'A', 'B', 'X', 'Y', 
 type DoorColor = 'RED' | 'GREEN' | 'BLUE' | 'YELLOW' | 'PINK' | 'UNKNOWN';
 
 interface SimDoor {
-  side: 'LEFT' | 'RIGHT';
+  side: 'LEFT' | 'RIGHT' | 'UP';
   to: number;
   color: DoorColor;
   closed: boolean;
+  /** posição em px para portas verticais */
+  x?: number;
+  y?: number;
 }
 interface SimItem {
   x: number;
@@ -37,6 +40,10 @@ interface SimRoom {
   doors: SimDoor[];
   items: SimItem[];
   bossHp?: number;
+  /** linha (em blocos) onde a lava começa e a coluna onde ela existe à direita */
+  lava?: { topRow: number; fromBx: number };
+  /** linha do "chão" em px (o bloco abaixo é sólido no mapa) */
+  floorY?: number;
 }
 
 let passed = 0;
@@ -116,7 +123,7 @@ class World {
   room(id: number): SimRoom {
     let r = this.rooms.get(id);
     if (!r) {
-      r = { id, doors: [], items: [] };
+      r = { id, doors: [], items: [], floorY: FLOOR_Y };
       this.rooms.set(id, r);
     }
     return r;
@@ -130,8 +137,16 @@ class World {
   }
 
   /** onde a porta está na tela (camera = 0) */
-  doorX(side: 'LEFT' | 'RIGHT'): number {
-    return DOOR_X[side];
+  doorX(d: SimDoor): number {
+    return d.x ?? DOOR_X[d.side as 'LEFT' | 'RIGHT'];
+  }
+  doorY(d: SimDoor): number {
+    return d.y ?? this.room(this.cur).floorY ?? FLOOR_Y;
+  }
+  inLava(sx: number, sy: number): boolean {
+    const lava = this.room(this.cur).lava;
+    if (!lava) return false;
+    return sy >= (lava.topRow - 1) * 16 && Math.floor(sx / 16) >= lava.fromBx;
   }
 
   private baseGame: Uint8ClampedArray | null = null;
@@ -181,8 +196,19 @@ class World {
     }
     // batentes pintados na cor real da comporta
     for (const d of this.room(this.cur).doors) {
-      const x = this.doorX(d.side);
-      rect(x - 7, FLOOR_Y - 6, x + 7, FLOOR_Y + 6, d.closed ? DOOR_RGB[d.color] : DOOR_RGB.PINK);
+      const x = this.doorX(d);
+      const y = this.doorY(d);
+      rect(x - 7, y - 6, x + 7, y + 6, d.closed ? DOOR_RGB[d.color] : DOOR_RGB.PINK);
+    }
+    // lago de lava: a partir da linha indicada, à direita da coluna indicada
+    const lake = this.room(this.cur).lava;
+    if (lake) {
+      for (let y = lake.topRow * 16; y < H; y += 1) {
+        for (let x = lake.fromBx * 16; x < W; x += 1) {
+          const bubble = ((x * 7 + y * 13) % 41) < 6;
+          put(x, y, bubble ? [250, 168, 70] : [240, 120, 40]);
+        }
+      }
     }
     // itens brilham em dourado
     for (const it of this.room(this.cur).items) rect(it.x - 6, it.y - 6, it.x + 6, it.y + 6, [220, 180, 60]);
@@ -196,14 +222,15 @@ class World {
   wram(): MetroidWramSnapshot {
     const room = this.room(this.cur);
     const doors: DoorInfo[] = room.doors.map((d) => {
-      const x = this.doorX(d.side);
+      const x = this.doorX(d);
+      const y = this.doorY(d);
       return {
-        key: `${d.side}@${Math.floor(x / 16)}:7-${FLOOR_Y / 16}`,
+        key: `${d.side}@${Math.floor(x / 16)}:${Math.floor(y / 16)}`,
         side: d.side,
         bx: Math.floor(x / 16),
-        by: 7,
+        by: Math.floor(y / 16),
         x,
-        y: FLOOR_Y,
+        y,
         blockedByWall: d.closed,
         hasCapPlm: false,
         capCount: 0,
@@ -213,8 +240,11 @@ class World {
     if ((room.bossHp ?? 0) > 0) {
       enemies.push({ slot: 0, id: 0x1234, x: 192, y: 112, xRadius: 22, yRadius: 22, hp: room.bossHp as number, props: 0, extraProps: 0, aiHandler: 0x8000 });
     }
+    // o mapa de blocos acha que o lago é chão sólido: é exatamente assim que a lava se
+    // comporta no Super Metroid, e é por isso que o detector precisa olhar o frame
     const blockTypes = new Uint8Array(16 * 14);
-    for (let by = 8; by < 14; by += 1) for (let bx = 0; bx < 16; bx += 1) blockTypes[by * 16 + bx] = 0x8;
+    const floorRow = Math.floor((room.floorY ?? FLOOR_Y) / 16) + 1;
+    for (let by = floorRow; by < 14; by += 1) for (let bx = 0; bx < 16; bx += 1) blockTypes[by * 16 + bx] = 0x8;
     return {
       valid: true,
       gameState: this.mapShown ? 9 : 8,
@@ -281,19 +311,23 @@ class World {
     if (keys.has('Y')) this.selectedHudItem = 0;
     if (keys.has('RIGHT')) this.sx = Math.min(W - 8, this.sx + 5);
     if (keys.has('LEFT')) this.sx = Math.max(8, this.sx - 5);
-    if (keys.has('A') && this.sy >= FLOOR_Y - 1) this.vy = -9;
+    const fy = this.room(this.cur).floorY ?? FLOOR_Y;
+    if (keys.has('A') && this.sy >= fy - 1) this.vy = this.room(this.cur).doors.some((d) => d.side === 'UP') ? -13 : -9;
+    if (keys.has('UP')) this.sy = Math.max(24, this.sy - 6);
     this.vy += 1.6;
     this.sy += this.vy;
-    if (this.sy >= FLOOR_Y) {
-      this.sy = FLOOR_Y;
+    if (this.sy >= fy) {
+      this.sy = fy;
       this.vy = 0;
     }
+    // pisar na lava dói (e é isto que o agente tem que evitar)
+    if (this.inLava(this.sx, this.sy + 6)) this.health = Math.max(1, this.health - 25);
 
     // atirar na comporta fechada: cada cor tem seu preço, exatamente como no manual
     if (keys.has('X')) {
       for (const d of this.room_.doors) {
         if (!d.closed) continue;
-        if (Math.abs(this.sx - this.doorX(d.side)) > 26) continue;
+        if (Math.abs(this.sx - this.doorX(d)) > 26) continue;
         this.hatchShots++;
         // míssil de verdade custa munição: conta e descontar (o feixe é grátis)
         if (this.selectedHudItem >= 1) {
@@ -317,7 +351,18 @@ class World {
     // atravessar
     for (const d of this.room_.doors) {
       if (d.closed) continue;
-      const x = this.doorX(d.side);
+      const x = this.doorX(d);
+      if (d.side === 'UP') {
+        // porta do teto: precisa estar embaixo, com UP pressionado e altura suficiente
+        if (Math.abs(this.sx - x) < 18 && this.sy <= (d.y ?? 60) + 26 && keys.has('UP')) {
+          this.cur = d.to;
+          this.sx = x;
+          this.sy = this.room(this.cur).floorY ?? FLOOR_Y;
+          this.vy = 0;
+          return;
+        }
+        continue;
+      }
       if ((d.side === 'RIGHT' && this.sx >= x - 6) || (d.side === 'LEFT' && this.sx <= x + 6)) {
         const from = this.cur;
         this.cur = d.to;
@@ -475,6 +520,48 @@ section('D. Com chefe na sala, nada de abrir o mapa no meio da luta');
   const starts = actions.filter((a) => ks(a).includes('START')).length;
   check('nenhum START com chefe vivo na tela', starts === 0, `${starts} pressionamentos`);
   check('luta priorizada (modo de combate/observação do chefe)', actions.some((a) => a.snapshot?.bossFight !== undefined) || actions.some((a) => (a.sceneLabel ?? '').includes('Chefe') || (a.sceneLabel ?? '').includes('Combate')));
+}
+
+
+/* =========================================== E. sala cercada por lava (screenshot) */
+section('E. Lava no chão: não andar para dentro, procurar a saída vertical');
+{
+  // Reproduz a forma da sala do print: Samus numa saliência, o lago ocupando o resto do
+  // "chão" (que o mapa de blocos jura que é sólido) e a saída sendo uma porta PARA CIMA.
+  const w = new World();
+  const ledge = w.room(0x10);
+  ledge.floorY = 144;
+  ledge.lava = { topRow: 10, fromBx: 8 };
+  ledge.doors.push({ side: 'UP', to: 0x11, color: 'PINK', closed: false, x: 72, y: 74 });
+  const above = w.room(0x11);
+  above.floorY = FLOOR_Y;
+  above.items.push({ x: 150, y: FLOOR_Y - 6, kind: 'TANK' });
+  const { actions } = run(w, 480);
+  const inLedgeRoom = actions.filter((a) => (a.reason ?? '').includes('0x10'));
+  const n = nav(inLedgeRoom[0] ?? actions[actions.length - 1]!);
+  const hpWhilePinned = actions.map((a) => a.snapshot?.health ?? 199);
+  const sawLavaReason = actions.some((a) => (a.reason ?? '').includes('lava') || (a.sceneLabel ?? '').includes('lava'));
+  check('o lago foi reconhecido do frame', n?.floorHazard === 'LAVA', `hazard=${n?.floorHazard} topRow=${n?.lavaTopRow}`);
+  check('linha da surface registrada (>= 9)', (n?.lavaTopRow ?? -1) >= 9 && (n?.lavaTopRow ?? 99) <= 12, `row=${n?.lavaTopRow}`);
+  check('a vida nunca caiu enquanto na sala de lava', Math.min(...hpWhilePinned.slice(0, 20)) >= 199, `min-vida=${Math.min(...hpWhilePinned)}`);
+  check('o motivo das ações explica a beira de lava', sawLavaReason);
+  check('subiu pela porta superior e saiu da sala', w.cur === 0x11, `sala=0x${w.cur.toString(16)}`);
+  check('chegou ao tanque de energia da sala de cima', w.maxHealth === 299 || w.room(0x11).items.length === 0, `vida máx=${w.maxHealth} itens=${w.room(0x11).items.length}`);
+}
+
+/* =============================================== F. lava sem saída: não se matar */
+section('F. Lava cercada, sala sem saída vertical: parar em vez de morrer');
+{
+  const w = new World();
+  const trap = w.room(0x10);
+  trap.floorY = 144;
+  trap.lava = { topRow: 10, fromBx: 9 };
+  const { actions } = run(w, 1400);
+  const n = nav(actions[actions.length - 1]!);
+  check('não morreu andando na lava (vida >= 190)', w.health >= 190, `vida=${w.health}`);
+  check('ficou na sala, preso na beirada (não teletransportou)', w.cur === 0x10, `sala=0x${w.cur.toString(16)}`);
+  check('declarou-se perdido (o que libera a consulta de mapa)', (n?.lostSeverity ?? 0) >= 1, `sev=${n?.lostSeverity} causa=${n?.lostCause}`);
+  check('tentou a leitura do mapa em vez de só andar de um lado para o outro', actions.some((a) => ks(a).includes('START')));
 }
 
 console.log(

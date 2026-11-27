@@ -996,3 +996,113 @@ export function describeNavForUi(
   if (reading?.ok) parts.push(`mapa ${reading.coveragePct}% coberto`);
   return parts.join(' · ');
 }
+/* --------------------------------------------------------------- lava / chão */
+
+/**
+ * Detector de LAGO DE LAVA pelo frame.
+ *
+ * Por que pixel e não bloco: no Super Metroid a lava não é um bloco sólido — é uma
+ * propriedade de dano do fundo. O mapa de blocos vê "ar" onde há um lago, então o
+ * planejador de rota considera a superfície pisável e o agente anda para dentro, toma
+ * dano, o escape forçado inverte o lado, e ele repete o ciclo até morrer. É exatamente o
+ * formato da sala do screenshot (Samus numa saliência, faixa laranja no chão inteiro).
+ *
+ * Modelo: procura a LINHA mais alta cuja metade da tela é laranja-brilhante-contínuo
+ * (superfície de lago) e marca tudo abaixo dela dentro da extensão horizontal do lago.
+ * Exigir continuidade (run >= 8 células de 8px) é o que separa um lago da rocha
+ * alaranjada salpicada de Norfair, que é irregular.
+ */
+export const MOLTEN_CELL = 8; // resolução da varredura, em px do SNES
+export const MOLTEN_COLS = 32; // 256 / 8
+export const MOLTEN_ROWS = 28; // 224 / 8
+
+export interface MoltenLake {
+  /** máscara MOLTEN_COLS*MOLTEN_ROWS em coordenadas de TELA (células de 8px) */
+  mask: Uint8Array;
+  /** linha (em células de 8px, coords de tela) da superfície; -1 se não achou lago */
+  surfaceRow: number;
+  /** extensão horizontal do lago em células de tela */
+  col0: number;
+  col1: number;
+  /** quantas células marcadas (fração do chão) */
+  cells: number;
+}
+
+function isMolten(r: number, g: number, b: number): boolean {
+  return r > 150 && g >= 55 && g <= 180 && b < 100 && r - b > 80;
+}
+
+export function senseMoltenLake(
+  rgba: Uint8ClampedArray | Uint8Array,
+  frameW: number,
+  frameH: number,
+): MoltenLake | null {
+  if (!rgba || rgba.length === 0 || frameW < 64 || frameH < 64) return null;
+  const sx = frameW / 256;
+  const sy = frameH / 224;
+  const raw = new Uint8Array(MOLTEN_COLS * MOLTEN_ROWS);
+
+  // a faixa superior é HUD (contadores laranjas) — não varremos ali
+  const firstRow = Math.ceil((30 * sy) / (MOLTEN_CELL * sy));
+  for (let cr = firstRow; cr < MOLTEN_ROWS; cr++) {
+    let rowHits = 0;
+    for (let cc = 0; cc < MOLTEN_COLS; cc++) {
+      const px0 = Math.floor((cc * MOLTEN_CELL + MOLTEN_CELL * 0.25) * sx);
+      const px1 = Math.floor((cc * MOLTEN_CELL + MOLTEN_CELL * 0.75) * sx);
+      const py0 = Math.floor((cr * MOLTEN_CELL + MOLTEN_CELL * 0.25) * sy);
+      const py1 = Math.floor((cr * MOLTEN_CELL + MOLTEN_CELL * 0.75) * sy);
+      let hot = 0;
+      let n = 0;
+      for (let py = py0; py <= py1; py += Math.max(1, Math.round(2 * sy))) {
+        for (let px = px0; px <= px1; px += Math.max(1, Math.round(2 * sx))) {
+          const i = (py * frameW + px) * 4;
+          n++;
+          if (isMolten(rgba[i] ?? 0, rgba[i + 1] ?? 0, rgba[i + 2] ?? 0)) hot++;
+        }
+      }
+      // bolhas claras no meio do lago não podem contar como "não é lava"
+      const lit = n > 0 && hot / n >= 0.55;
+      raw[cr * MOLTEN_COLS + cc] = lit ? 1 : 0;
+      if (lit) rowHits++;
+    }
+    // O que separa um lago de rocha alaranjada salpicada é a CONTINUIDADE horizontal:
+    // 10 células de 8px seguidas = 80px de superfície lisa.
+    const run = longestRun(raw, cr);
+    if (run.len < 10) continue;
+    if (rowHits < 8) continue;
+
+    const mask = new Uint8Array(MOLTEN_COLS * MOLTEN_ROWS);
+    for (let r = cr; r < MOLTEN_ROWS; r++) {
+      for (let c = run.from; c <= run.to; c++) {
+        // abaixo da superfície é lago mesmo se uma plataforma tapar a visão
+        mask[r * MOLTEN_COLS + c] = 1;
+      }
+    }
+    let cells = 0;
+    for (let i = 0; i < mask.length; i++) cells += mask[i]!;
+    return { mask, surfaceRow: cr, col0: run.from, col1: run.to, cells };
+  }
+  return null;
+}
+
+function longestRun(mask: Uint8Array, row: number): { len: number; from: number; to: number } {
+  let best = { len: 0, from: 0, to: 0 };
+  let cur = -1;
+  for (let c = 0; c < MOLTEN_COLS; c++) {
+    const on = mask[row * MOLTEN_COLS + c] === 1;
+    if (on && cur < 0) cur = c;
+    if ((!on || c === MOLTEN_COLS - 1) && cur >= 0) {
+      const end = on ? c : c - 1;
+      const len = end - cur + 1;
+      if (len > best.len) best = { len, from: cur, to: end };
+      cur = -1;
+    }
+  }
+  return best;
+}
+
+/** Célula de sala (blocos de 16px) → linha da superfície do lago, também em blocos. */
+export function lakeTopBlock(lake: MoltenLake, cameraY: number): number {
+  return Math.floor((cameraY + lake.surfaceRow * MOLTEN_CELL) / 16);
+}
+
