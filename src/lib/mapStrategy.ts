@@ -813,22 +813,25 @@ export function planNextTarget(input: PlanInput): PlanResult {
       label = `${room.itemsPending} item(ns) · ${label}`;
       reasons.push('coleta pendente');
     }
+    // MISSÃO PRINCIPAL: terminais de energia (energia auxiliar das bases) têm
+    // prioridade sobre chefes comuns — só se luta contra chefe quando não há
+    // energia pendente nem itens para coletar pelo caminho normal do jogo.
+    if (room.terminalsPending > 0) {
+      score += 30;
+      if (kind === 'FRONTIER') kind = 'TERMINAL';
+      reasons.push('reativar energia (missão principal)');
+    }
     const boss = bossRooms.get(room.id);
     if (boss && !boss.defeated) {
-      score += 44;
+      score += 28;
       kind = 'BOSS';
       label = `chefe ${boss.name} · ${label}`;
       reasons.push('chefe declarado pelo codex');
     } else if (room.bossName && !room.bossDefeated) {
-      score += 44;
+      score += 28;
       kind = 'BOSS';
       label = `chefe ${room.bossName} · ${label}`;
       reasons.push('chefe visto na sala');
-    }
-    if (room.terminalsPending > 0) {
-      score += 22;
-      if (kind === 'FRONTIER') kind = 'TERMINAL';
-      reasons.push('reativar energia');
     }
     if (!room.visited && !isCurrent) {
       score += 16;

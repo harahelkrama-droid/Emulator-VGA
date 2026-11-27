@@ -122,6 +122,7 @@ let cachedDoorHeight = 0;
 let cachedDoorShapes: CachedDoorShape[] = [];
 
 function findRamBase(state: Uint8Array): number {
+  // Estratégia 1: cache válido (mesmo tamanho de estado)
   if (cachedRamOffset > 10 && cachedStateLen === state.length) {
     if (
       state[cachedRamOffset - 1] === 58 &&
@@ -132,18 +133,42 @@ function findRamBase(state: Uint8Array): number {
       return cachedRamOffset;
     }
   }
+
+  // Estratégia 2: assinatura "RAM:" (padrão do EmulatorJS)
+  const signatureScan = scanForSignature(state);
+  if (signatureScan >= 0) {
+    cachedRamOffset = signatureScan;
+    cachedStateLen = state.length;
+    return cachedRamOffset;
+  }
+
+  // Estratégia 3: offsets conhecidos comuns do SNES (fallback quando a assinatura varia por versão do core)
+  const knownOffsets = [0x0000, 0x1000, 0x2000, 0x7E0000, 0x7F0000, 0x100000];
+  for (const off of knownOffsets) {
+    if (off + 0x2000 >= state.length) continue;
+    // Validação rápida: gameState em 0x0998 deve ser um valor plausível (0..0x2A ou 8)
+    const gs = state[off + 0x0998] | (state[off + 0x0999] << 8);
+    if (gs === 0 || gs === 8 || (gs >= 1 && gs <= 0x2A)) {
+      cachedRamOffset = off;
+      cachedStateLen = state.length;
+      return cachedRamOffset;
+    }
+  }
+
+  return -1;
+}
+
+function scanForSignature(state: Uint8Array): number {
   let i = 0;
   const limit = state.length - 12;
   while (i < limit) {
-    const pos = state.indexOf(82, i);
+    const pos = state.indexOf(82, i); // 'R'
     if (pos < 0 || pos >= limit) break;
     if (state[pos + 1] === 65 && state[pos + 2] === 77 && state[pos + 3] === 58) {
       let j = pos + 4;
       while (j < pos + 24 && state[j] !== 58) j++;
       if (state[j] === 58) {
-        cachedRamOffset = j + 1;
-        cachedStateLen = state.length;
-        return cachedRamOffset;
+        return j + 1;
       }
     }
     i = pos + 1;
@@ -409,9 +434,12 @@ export async function readMetroidWram(): Promise<MetroidWramSnapshot | null> {
     const maxHealth = u16(0x09c4);
     const health = u16(0x09c2);
 
+    // Validação relaxada: aceita estados iniciais (tela título / carregando) e estados
+    // em jogo. ROMs hack (ex.: X-Fusion) podem ter offsets ligeiramente diferentes,
+    // então não rejeitamos apenas por maxHealth fora de um intervalo estreito.
     const looksLikeMetroid =
-      (gameState <= 0x2a && maxHealth === 0 && health === 0) ||
-      (maxHealth >= 99 && maxHealth <= 3000 && health <= maxHealth + 99);
+      (gameState <= 0x2a && maxHealth === 0 && health === 0) || // título / carregando
+      (maxHealth > 0 && maxHealth <= 9999 && health <= maxHealth + 9999); // em jogo
 
     if (!looksLikeMetroid) return null;
 

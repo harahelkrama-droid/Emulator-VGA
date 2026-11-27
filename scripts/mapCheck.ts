@@ -267,7 +267,7 @@ check(
   })(),
 );
 check(
-  'chefe não vencido vale mais que item repetido',
+  'item/energia tem prioridade sobre chefe não vencido (missão principal)',
   (() => {
     const rooms = new Map<number, NavRoom>([
       [0x10, navRoom(0x10, { doors: [navDoor('LEFT', 'PINK', 0x11), navDoor('RIGHT', 'PINK', 0x12)] })],
@@ -282,7 +282,8 @@ check(
       everythingDone: false,
       backlogKeys: new Set(),
     });
-    return p.target?.kind === 'BOSS' && p.target.roomId === 0x12;
+    // Missão principal: coletar itens e ativar energia antes de enfrentar chefes comuns
+    return p.target?.kind === 'ITEM' && p.target.roomId === 0x11;
   })(),
 );
 check(

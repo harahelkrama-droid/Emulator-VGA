@@ -56,6 +56,7 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
     active: false,
     controller: null,
   });
+  const consecutiveAiErrors = useRef(0);
 
   const [ready, setReady] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -354,6 +355,7 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
     agentRef.current.reset();
     aiLoopStopRef.current.active = true;
     setAiActive(true);
+    consecutiveAiErrors.current = 0;
 
     while (aiLoopStopRef.current.active) {
       try {
@@ -445,11 +447,22 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
           onNotify('Sem internet: alternado para IA Local sem API.');
           continue;
         }
+        // Não deixa a IA morrer no primeiro erro: tenta recuperar até 3 vezes com backoff.
+        consecutiveAiErrors.current = (consecutiveAiErrors.current ?? 0) + 1;
+        if (consecutiveAiErrors.current <= 3) {
+          const backoff = Math.min(1000, consecutiveAiErrors.current * 600);
+          setAiStatusText(`Erro IA (tentativa ${consecutiveAiErrors.current}/3) — recuperando em ${backoff}ms`);
+          setAiReason(error.message);
+          releaseAllGameInputs();
+          await sleep(backoff);
+          continue;
+        }
         setAiStatusText(`Erro: ${error.message.slice(0, 48)}`);
         setAiReason(error.message);
         releaseAllGameInputs();
         aiLoopStopRef.current.active = false;
         setAiActive(false);
+        onNotify(`IA parou após ${consecutiveAiErrors.current} falhas seguidas. Clique para reiniciar.`);
         break;
       }
     }
@@ -855,11 +868,15 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
               </span>
               <span>·</span>
               <span className="font-mono-data">
-                {snapshot.bossFight.distance}px · HP {Math.round(snapshot.bossFight.hpPct * 100)}%
+                Distância {snapshot.bossFight.distance}px · {snapshot.bossFight.rangeState === 'TOO_CLOSE' ? 'MUITO PERTO' : snapshot.bossFight.rangeState === 'TOO_FAR' ? 'MUITO LONGE' : 'ALCANCE OK'}
+              </span>
+              <span>·</span>
+              <span className={`text-${snapshot.bossFight.hpPct > 0.5 ? '#6ee7b7' : snapshot.bossFight.hpPct > 0.25 ? '#fbbf24' : '#f87171'}`}>
+                HP {Math.round(snapshot.bossFight.hpPct * 100)}%
               </span>
               <span>·</span>
               <span className="font-mono-data">
-                dano {snapshot.bossFight.damageDealt} em {snapshot.bossFight.hits} acerto(s)
+                Dano {snapshot.bossFight.damageDealt} em {snapshot.bossFight.hits} acerto(s)
               </span>
             </div>
 
@@ -881,7 +898,22 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
               )}
               {snapshot.bossFight.probeMode && (
                 <span className="rounded-md bg-[#f87171]/15 px-1.5 py-0.5 text-[#f87171]">
-                  plano do guia não estava ferindo · caçando a munição que funciona
+                  plano do guia não feriu · caçando munição que funciona
+                </span>
+              )}
+              {snapshot.bossFight.doNotKill && (
+                <span className="rounded-md bg-[#f87171]/15 px-1.5 py-0.5 text-[#f87171]">
+                  NÃO MATAR — evento roteirizado
+                </span>
+              )}
+              {snapshot.bossFight.letDrain && (
+                <span className="rounded-md bg-[#fbbf24]/15 px-1.5 py-0.5 text-[#fbbf24]">
+                  deixe drenar (evento Metroid Grande)
+                </span>
+              )}
+              {snapshot.bossFight.collectWhenExposed && (
+                <span className="rounded-md bg-[#6ee7b7]/15 px-1.5 py-0.5 text-[#6ee7b7]">
+                  poder exposto — perseguir e coletar
                 </span>
               )}
             </div>
@@ -1021,13 +1053,107 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
         )}
 
         {snapshot?.armorAnalysis && (
-          <div className="mt-4 border-t border-[#24314a] pt-3.5">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#94a3bf]">
-                <span className="inline-flex items-center gap-1.5 font-semibold text-[#eef3fb]">
-                  <Shield className="h-3.5 w-3.5 text-[#6ee7b7]" />
-                  Análise de Armadura e Peças
+          <>
+            {/* Painel de Status do Jogador — habilidades, energia, munição, armadura */}
+            <div className="mt-3 rounded-xl border border-[#24314a] bg-[#0d1322]/80 p-3">
+              <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+                <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#eef3fb]">
+                  <Cpu className="h-3.5 w-3.5 text-[#6ee7b7]" />
+                  Status do Jogador
                 </span>
+                <span className="text-[11px] text-[#94a3bf]">
+                  Nível: <strong className="text-[#eef3fb]">{snapshot.armorAnalysis.suitTier}</strong>
+                </span>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+                <span className="font-mono-data">
+                  Energia:{' '}
+                  <strong className={`text-${snapshot.armorAnalysis.damageReductionPct > 0 ? '#6ee7b7' : '#f87171'}`}>
+                    {snapshot.health}/{snapshot.maxHealth}
+                  </strong>
+                </span>
+                <span className="font-mono-data">
+                  Reserva:{' '}
+                  <strong className="text-[#eef3fb]">
+                    {snapshot.reserveEnergy ?? 0}/{snapshot.reserveMax ?? 0}
+                  </strong>
+                </span>
+                <span className="font-mono-data">
+                  Mísseis:{' '}
+                  <strong className="text-[#eef3fb]">{snapshot.missiles ?? 0}/{snapshot.maxMissiles ?? 0}</strong>
+                </span>
+                <span className="font-mono-data">
+                  Super:{' '}
+                  <strong className="text-[#eef3fb]">{snapshot.supers ?? 0}/{snapshot.maxSupers ?? 0}</strong>
+                </span>
+                <span className="font-mono-data">
+                  Bombas:{' '}
+                  <strong className="text-[#eef3fb]">{snapshot.powerBombs ?? 0}/{snapshot.maxPowerBombs ?? 0}</strong>
+                </span>
+                <span className="font-mono-data">
+                  Habilidades:{' '}
+                  <strong className="text-[#eef3fb]">{snapshot.agentLoadout?.totalAbilities ?? 0}/16</strong>
+                </span>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]">
+                {snapshot.agentLoadout?.hasVaria && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Varia Suit</span>
+                )}
+                {snapshot.agentLoadout?.hasGravity && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Gravity Suit</span>
+                )}
+                {snapshot.agentLoadout?.hasMorphBall && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Morph Ball</span>
+                )}
+                {snapshot.agentLoadout?.hasBombs && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Bombas</span>
+                )}
+                {snapshot.agentLoadout?.hasSpaceJump && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Space Jump</span>
+                )}
+                {snapshot.agentLoadout?.hasScrewAttack && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Screw Attack</span>
+                )}
+                {snapshot.agentLoadout?.hasChargeBeam && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Charge Beam</span>
+                )}
+                {snapshot.agentLoadout?.hasIceBeam && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Ice Beam</span>
+                )}
+                {snapshot.agentLoadout?.hasWaveBeam && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Wave Beam</span>
+                )}
+                {snapshot.agentLoadout?.hasSpazer && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Spazer</span>
+                )}
+                {snapshot.agentLoadout?.hasPlasmaBeam && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Plasma Beam</span>
+                )}
+                {snapshot.agentLoadout?.hasGrapple && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Grapple</span>
+                )}
+                {snapshot.agentLoadout?.hasXRay && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">X-Ray</span>
+                )}
+                {snapshot.agentLoadout?.hasHiJump && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Hi-Jump</span>
+                )}
+                {snapshot.agentLoadout?.hasSpringBall && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Spring Ball</span>
+                )}
+                {snapshot.agentLoadout?.hasSpeedBooster && (
+                  <span className="rounded-md bg-[#6ee7b7]/20 px-1.5 py-0.5 text-[#6ee7b7]">Speed Booster</span>
+                )}
+              </div>
+            </div>
+
+            <div className="mt-4 border-t border-[#24314a] pt-3.5">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#94a3bf]">
+                  <span className="inline-flex items-center gap-1.5 font-semibold text-[#eef3fb]">
+                    <Shield className="h-3.5 w-3.5 text-[#6ee7b7]" />
+                    Análise de Armadura e Peças
+                  </span>
                 <span>·</span>
                 <span>
                   Traje: <strong className="text-[#eef3fb]">{snapshot.armorAnalysis.suitTier}</strong>
@@ -1123,6 +1249,7 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
               </div>
             )}
           </div>
+        </>
         )}
 
         <div className="mt-4 border-t border-[#24314a] pt-3.5">

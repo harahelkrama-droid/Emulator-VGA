@@ -122,6 +122,10 @@ export interface BossFightStatus {
   probeMode: boolean;
   /** Poder do Core-X exposto: parar de atirar e ir coletar. */
   collectWhenExposed: boolean;
+  /** Chefe é evento roteirizado: não deve ser morto (ex.: Ridley prólogo, Omega). */
+  doNotKill: boolean;
+  /** Deixe o inimigo drenar vida/habilidade em vez de atacá-lo (ex.: Metroid Grande). */
+  letDrain: boolean;
   note: string;
   source: string;
   summary: string;
@@ -140,8 +144,11 @@ export interface AIStatusSnapshot {
   reserveEnergy?: number;
   reserveMax?: number;
   missiles?: number;
+  maxMissiles?: number;
   supers?: number;
+  maxSupers?: number;
   powerBombs?: number;
+  maxPowerBombs?: number;
   roomId?: number;
   abilities: string[];
   pendingBacktracks: number;
@@ -166,6 +173,9 @@ export interface AIStatusSnapshot {
     hasGravity: boolean;
     hasMorphBall: boolean;
     hasBombs: boolean;
+    hasHiJump: boolean;
+    hasSpringBall: boolean;
+    hasSpeedBooster: boolean;
     hasSpaceJump: boolean;
     hasScrewAttack: boolean;
     hasGrapple: boolean;

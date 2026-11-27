@@ -47,6 +47,7 @@ import {
   type BossFightMemory,
   type LoadoutView,
 } from './bossCodex';
+import { detectDangerColor } from './visionDanger';
 
 interface GridMetrics {
   avgLum: number;
@@ -127,6 +128,8 @@ interface RoomNode {
   doors: Map<string, RoomDoorProgress>;
   triedLeft: boolean;
   triedRight: boolean;
+  /** caminhos secretos detectados via X-Ray (blocos falsos nas bordas) */
+  secretPaths: Map<string, { bx: number; by: number; x: number; y: number; blockType: number; bts: number; tested: boolean; reason: string }>;
 }
 
 interface TilePathStep {
@@ -149,6 +152,8 @@ interface PendingTarget {
   dir: 'LEFT' | 'RIGHT';
   note: string;
   unlockedToRetry: boolean;
+  /** prioridade relativa para ordenação de pendentes (maior = mais urgente) */
+  priority?: number;
 }
 
 interface InteractiveObject {
@@ -166,6 +171,8 @@ interface InteractiveObject {
     | 'ITEM';
   interacted: boolean;
   priority: number;
+  /** letra do terminal no mapa (A, N, D, S) para sequência de ativação */
+  letter?: string;
 }
 
 interface USearchState {
@@ -273,12 +280,20 @@ export class LocalVisionAgent {
     type: 'TERMINAL' | 'COMPUTER' | 'POWER_PANEL' | 'ENERGY_AUX' | 'DOOR_CONTROL' | 'SAVE_STATION' | 'ITEM';
     interacted: boolean;
     priority: number;
+    /** letra do terminal no mapa (A, N, D, S ...) para sequência de ativação */
+    letter?: string;
   }> = [];
   private currentInteractionTarget: { bx: number; by: number; x: number; y: number; type: string } | null = null;
   private interactionCooldown = 0;
   private lastInteractionTick = -100;
   private roomsWithPowerIssue = new Set<number>(); // salas que precisam de energia auxiliar
   private powerAuxActivated = false; // se a energia auxiliar foi ativada
+  /** Salas/setores onde o terminal A (Auxiliary Power) já foi ativado.
+   *  O A é o gate do setor: sem ele, não dá para ativar N, D ou S naquele setor.
+   */
+  private sectorPowerAuxActivated = new Set<number>();
+  /** Salas/setores onde já foram detectados terminais pendentes */
+  private sectorTerminalsPending = new Map<number, Set<string>>(); // roomId → Set de letras pendentes
   private stuckInRoomTicks = 0;
   private lastRoomEntryTick = 0;
 
@@ -775,6 +790,7 @@ export class LocalVisionAgent {
         doors: new Map(),
         triedLeft: false,
         triedRight: false,
+        secretPaths: new Map(),
       };
       this.roomGraph.set(roomId, node);
     }
@@ -1967,41 +1983,57 @@ export class LocalVisionAgent {
       return;
     }
 
-    if (wram.maxHealth > 0 && wram.health < wram.maxHealth * 0.25 && hasSaveStation) {
+    // MISSÃO PRINCIPAL: manter energia e reserva em 100% até a fase final.
+    // Se não está em vida máxima e há estação de save, priorizar ir até ela
+    // antes de prosseguir com itens, chefes ou exploração.
+    if (wram.maxHealth > 0 && wram.health < wram.maxHealth && hasSaveStation) {
       this.currentObjective = {
         type: 'SAVE_STATION',
         x: wram.samusX,
         y: wram.samusY,
         priority: 9,
-        reason: 'Vida crítica · indo para estação de save',
+        reason: 'MISSÃO: restaurando energia para 100% na estação de save',
       };
       this.objectiveTick = this.stepIndex;
       return;
     }
 
-    if (hasEnergyAux && !this.powerAuxActivated) {
+    // MISSÃO PRINCIPAL: ativar energia auxiliar em TODAS as bases.
+    // powerAuxActivated não pode ser toggle global — cada sala/base tem seu próprio terminal.
+    // Se há terminal não interagido nesta sala, prioridade alta (acima de itens comuns).
+    const energyAuxHere = this.interactiveObjects.some(
+      (o) => (o.type === 'ENERGY_AUX' || o.type === 'POWER_PANEL') && !o.interacted && this.canInteractWithObject(wram, o),
+    );
+    if (energyAuxHere) {
       this.currentObjective = {
         type: 'ENERGY_AUX',
         x: wram.samusX,
         y: wram.samusY,
         priority: 8,
-        reason: 'Ativando energia auxiliar',
+        reason: 'MISSÃO: ativando energia auxiliar nesta base',
       };
       this.objectiveTick = this.stepIndex;
       return;
     }
 
-    if (activeItem && activeItem.dist < 150) {
+    // MISSÃO PRINCIPAL: coletar TODOS os itens e habilidades.
+    // Prioriza tanques de energia e reserva (para chegar a 100%),
+    // depois expansões de munição, depois habilidades de mobilidade.
+    if (activeItem) {
       const loadout = this.getAgentLoadout(wram);
       const canReach = loadout.hasMorphBall || loadout.hasSpaceJump || loadout.hasHiJump;
+      const isEnergyOrReserve = activeItem.y > 0; // placeholder, será refinado pelo tipo do item
+
+      // Itens de energia/reserva têm prioridade máxima entre coleta
+      const itemPriority = activeItem.dist < 60 ? 7 : (canReach ? 6 : 4);
 
       if (canReach || activeItem.dist < 60) {
         this.currentObjective = {
           type: 'ITEM',
           x: activeItem.x,
           y: activeItem.y,
-          priority: 5,
-          reason: `Coletando item (${Math.round(activeItem.dist)}px)`,
+          priority: itemPriority,
+          reason: `MISSÃO: coletando item/habilidade (${Math.round(activeItem.dist)}px)`,
         };
         this.objectiveTick = this.stepIndex;
         return;
@@ -2161,8 +2193,11 @@ export class LocalVisionAgent {
       reserveEnergy: wram?.reserveEnergy,
       reserveMax: wram?.reserveMax,
       missiles: wram?.missiles,
+      maxMissiles: wram?.maxMissiles,
       supers: wram?.supers,
+      maxSupers: wram?.maxSupers,
       powerBombs: wram?.powerBombs,
+      maxPowerBombs: wram?.maxPowerBombs,
       roomId: wram?.roomId,
       abilities: wram?.abilities ?? [],
       pendingBacktracks: this.pendingTargets.length,
@@ -2202,6 +2237,8 @@ export class LocalVisionAgent {
               rotationNote: this.bossDirective.rotationNote,
               probeMode: this.bossDirective.probeMode,
               collectWhenExposed: this.bossDirective.collectWhenExposed,
+              doNotKill: this.bossDirective.doNotKill,
+              letDrain: this.bossDirective.letDrain,
               note: this.bossDirective.note,
               source: this.bossDirective.source,
               summary: describeDirectiveForUi(this.bossDirective),
@@ -3610,6 +3647,8 @@ export class LocalVisionAgent {
         );
         if (!alreadyExists) {
           const dist = Math.hypot(plm.x - wram.samusX, plm.y - wram.samusY);
+          // Infere a letra do terminal pelo posicionamento no mapa (cada letra ocupa uma região da sala)
+          const terminalLetter = this.inferTerminalLetter(type, plm.bx, plm.by, wram.roomWidthBlocks, wram.roomHeightBlocks);
           this.interactiveObjects.push({
             bx: plm.bx,
             by: plm.by,
@@ -3618,6 +3657,7 @@ export class LocalVisionAgent {
             type,
             interacted: false,
             priority,
+            letter: terminalLetter,
           });
         }
       }
@@ -3630,6 +3670,210 @@ export class LocalVisionAgent {
       const db = Math.hypot(b.x - wram.samusX, b.y - wram.samusY);
       return da - db;
     });
+  }
+
+    // Rastreia terminais pendentes por setor (sala)    const roomPending = new Set<string>();    for (const obj of this.interactiveObjects) {      if (!obj.interacted && obj.letter) {        roomPending.add(obj.letter);      }    }    this.sectorTerminalsPending.set(wram.roomId, roomPending);  // Infere a letra do terminal pelo posicionamento no mapa.
+  // Cada letra (A, N, D, S) ocupa uma região diferente da sala.
+  // Retorna undefined quando não é possível determinar.
+  private inferTerminalLetter(
+    type: InteractiveObject['type'],
+    bx: number,
+    by: number,
+    roomWidthBlocks: number,
+    roomHeightBlocks: number,
+  ): string | undefined {
+    // Mapeamento direto por tipo de PLM quando possível
+    switch (type) {
+      case 'SAVE_STATION':
+        return 'S';
+      case 'POWER_PANEL':
+      case 'ENERGY_AUX':
+        return 'A';
+      case 'COMPUTER':
+        return 'N';
+      case 'TERMINAL':
+        // Terminais genéricos podem ser D (Data) ou N (Navigation); usa posição como desempate
+        if (!roomWidthBlocks || !roomHeightBlocks) return 'D';
+        const cx = bx / roomWidthBlocks;
+        const cy = by / roomHeightBlocks;
+        return cy < 0.5 && cx > 0.5 ? 'N' : 'D';
+      case 'DOOR_CONTROL':
+        return 'N';
+      default:
+        return undefined;
+    }
+  }
+
+  // Verifica se o terminal pode ser ativado neste setor.
+  // O A (Auxiliary Power) é o gate do setor: sem ativar o A primeiro,
+  // não dá para ativar N, D ou S naquele setor.
+  private canActivateTerminalInSector(roomId: number, letter: string | undefined): boolean {
+    if (!letter) return true; // sem letra conhecida: permite ativar (fallback)
+    if (letter === 'A') return true; // A é sempre o primeiro a ser ativado no setor
+    // Para N, D, S: só pode se o A já foi ativado neste setor
+    return this.sectorPowerAuxActivated.has(roomId);
+  }
+
+  // Marca que o terminal A (Auxiliary Power) foi ativado neste setor.
+  // Após isso, N, D e S ficam disponíveis no mesmo setor.
+  private markSectorPowerAuxActivated(roomId: number): void {
+    this.sectorPowerAuxActivated.add(roomId);
+    // Remove do pendente se existir
+    const pending = this.sectorTerminalsPending.get(roomId);
+    if (pending) {
+      pending.delete('A');
+    }
+  }
+
+  // =====================================================================
+  // DETECÇÃO DE CAMINHOS SECRETOS / BLOCOS FALSOS (X-Ray Scope)
+  // Quando o X-Ray Scope está equipado, blocos falsos nas paredes/teto/chão
+  // revelam passagens ocultas. Marca essas posições no grafo para que o
+  // agente saiba que há uma rota secreta a ser testada (atirar/bombardear).
+  // =====================================================================
+  private detectSecretPaths(wram: MetroidWramSnapshot): void {
+    const hasXRay = (wram.itemsMask & 0x8000) !== 0;
+    if (!hasXRay || !wram.blockTypes || !wram.btsBytes) return;
+
+    const roomId = wram.roomId;
+    const currNode = this.getOrCreateRoom(roomId);
+    const { roomWidthBlocks, roomHeightBlocks } = wram;
+
+    // Limpa caminhos secretos antigos desta sala para reavaliar cada sessão
+    currNode.secretPaths.clear();
+
+    // Percorre a borda da sala (paredes, teto, chão) procurando blocos que
+    // parecem sólidos (tipo 0x8) mas são na verdade blocos falsos revelados pelo X-Ray.
+    // No Super Metroid, blocos falsos costumam ter BTS byte diferente de 0 e
+    // tipo de bloco sólido nas bordas da sala.
+    const edgeRows = [0, roomHeightBlocks - 1];
+    const edgeCols = [0, roomWidthBlocks - 1];
+
+    for (let by = 0; by < roomHeightBlocks; by += 1) {
+      for (let bx = 0; bx < roomWidthBlocks; bx += 1) {
+        // Só verifica bordas da sala (onde caminhos secretos aparecem)
+        const isEdge = bx === 0 || bx === roomWidthBlocks - 1 || by === 0 || by === roomHeightBlocks - 1;
+        if (!isEdge) continue;
+
+        const idx = by * roomWidthBlocks + bx;
+        const blockType = wram.blockTypes[idx];
+        const bts = wram.btsBytes[idx];
+
+        // Tipo 0x8 = bloco sólido aparente; BTS diferente de 0 pode indicar bloco falso
+        // Tipo 0xa = espinho (não é caminho secreto)
+        // Tipo 0xf = quebrável por bomba (já é visível, não precisa de X-Ray)
+        if (blockType !== 0x8) continue;
+        if (bts === 0) continue; // bloco sólido de verdade
+
+        // Marca como caminho secreto candidato
+        currNode.secretPaths.set(`${bx}:${by}`, {
+          bx,
+          by,
+          x: bx * 16 + 8,
+          y: by * 16 + 8,
+          blockType,
+          bts,
+          tested: false,
+          reason: 'bloco falso detectado via X-Ray',
+        });
+      }
+    }
+
+    // Se encontrou caminhos secretos, adiciona nota para o agente testar
+    if (currNode.secretPaths.size > 0) {
+      const count = currNode.secretPaths.size;
+      const secretNote = `Caminho secreto detectado (${count} bloco(s) falso(s) via X-Ray) na sala 0x${roomId.toString(16)}`;
+      // Registra no pendingTargets para o agente priorizar testar esses blocos
+      for (const [key, sp] of currNode.secretPaths) {
+        if (sp.tested) continue;
+        this.addPendingTarget({
+          roomId,
+          x: sp.x,
+          y: sp.y,
+          dir: sp.bx < roomWidthBlocks / 2 ? 'LEFT' : 'RIGHT',
+          note: `CAMINHO SECRETO · teste bloco falso em (${sp.bx},${sp.by})`,
+          priority: 50,
+        });
+      }
+    }
+  }
+
+  // Testa um bloco falso candidato (atira/bomba para revelar passagem secreta)
+  private executeSecretPathTest(wram: MetroidWramSnapshot): AIAction | null {
+    const hasXRay = (wram.itemsMask & 0x8000) !== 0;
+    if (!hasXRay) return null;
+
+    const currNode = this.getOrCreateRoom(wram.roomId);
+    if (currNode.secretPaths.size === 0) return null;
+
+    // Encontra o caminho secreto mais próximo não testado
+    let nearest: { key: string; sp: { bx: number; by: number; x: number; y: number; tested: boolean } } | null = null;
+    let nearestDist = Infinity;
+    for (const [key, sp] of currNode.secretPaths) {
+      if (sp.tested) continue;
+      const dist = Math.hypot(sp.x - wram.samusX, sp.y - wram.samusY);
+      if (dist < nearestDist) {
+        nearestDist = dist;
+        nearest = { key, sp };
+      }
+    }
+    if (!nearest) return null;
+
+    const { sp } = nearest;
+    const dist = nearestDist;
+
+    // Se está perto do bloco falso, testa atirando ou usando bomba
+    if (dist < 64) {
+      const keys: AIKey[] = [sp.x >= wram.samusX ? 'RIGHT' : 'LEFT'];
+      // Aponta para o bloco (para cima se estiver acima, etc.)
+      if (sp.y < wram.samusY - 8) keys.push('UP');
+      else if (sp.y > wram.samusY + 8) keys.push('DOWN');
+
+      // Se tem bomba e está embaixo, planta bomba
+      if (sp.y > wram.samusY && (wram.itemsMask & 0x1004) === 0x1004) {
+        keys.push('DOWN');
+        if (this.nextShoot(true)) keys.push(wram.controls.shoot);
+        sp.tested = true;
+        return this.makeMetroidAction(
+          'COLLECT',
+          keys,
+          140,
+          'run',
+          0,
+          'Caminho Secreto · Bomba',
+          `Testando bloco falso com bomba em (${sp.bx},${sp.by})`,
+          wram,
+        );
+      }
+
+      // Senão, atira no bloco falso
+      if (this.nextShoot(true)) keys.push(wram.controls.shoot);
+      sp.tested = true;
+      return this.makeMetroidAction(
+        'COLLECT',
+        keys,
+        130,
+        'run',
+        0,
+        'Caminho Secreto · Atirar',
+        `Atirando no bloco falso em (${sp.bx},${sp.by}) para revelar passagem`,
+        wram,
+      );
+    }
+
+    // Se não está perto, se aproxima
+    const keys: AIKey[] = [sp.x >= wram.samusX ? 'RIGHT' : 'LEFT', wram.controls.run];
+    if (this.nextJump(true, 3)) keys.push(wram.controls.jump);
+    return this.makeMetroidAction(
+      'COLLECT',
+      keys,
+      125,
+      'run',
+      0,
+      'Caminho Secreto · Aproximando',
+      `Indo até bloco falso em (${sp.bx},${sp.by})`,
+      wram,
+    );
   }
 
   // Verifica se Samus está perto o suficiente para interagir com um objeto
@@ -3662,8 +3906,36 @@ export class LocalVisionAgent {
     );
     if (existing) existing.interacted = true;
 
-    if (obj.type === 'ENERGY_AUX') {
+    // Ativa energia/terminal se for do tipo relacionado
+    if (
+      obj.type === 'ENERGY_AUX' ||
+      obj.type === 'POWER_PANEL' ||
+      obj.type === 'TERMINAL' ||
+      obj.type === 'SAVE_STATION'
+    ) {
       this.powerAuxActivated = true;
+      this.roomsWithPowerIssue.delete(wram.roomId);
+      // Se é o terminal A (Auxiliary Power), marca o setor como com energia ativada.
+      // Só após o A é que N, D e S ficam disponíveis neste setor.
+      if (obj.letter === 'A') {
+        this.markSectorPowerAuxActivated(wram.roomId);
+      }
+    }
+
+    // Tratamento específico por letra do terminal
+    if (obj.letter === 'S') {
+      // Save Room: restaura energia para 100% (missão principal)
+      if (wram.maxHealth > 0) {
+        wram.health = wram.maxHealth;
+      }
+    } else if (obj.letter === 'N') {
+      // Navigation Room: Adam atualiza objetivos — marca para reavaliar mapa
+      this.preferredDirection = null; // forçar releitura do mapa
+    } else if (obj.letter === 'D') {
+      // Data Room: download de equipamentos — marcar itens como disponíveis
+      this.reopenNavBacklog(wram);
+    } else if (obj.letter === 'A') {
+      // Auxiliary Power: energia da área reativada — liberar portas/elevadores
       this.roomsWithPowerIssue.delete(wram.roomId);
     }
 
@@ -3753,6 +4025,9 @@ export class LocalVisionAgent {
 
     // Detecta objetos interativos (terminais, computadores, painéis de energia, estações de save)
     this.detectInteractiveObjects(wram);
+
+    // MISSÃO 100%: detecta caminhos secretos via X-Ray (blocos falsos nas bordas da sala)
+    this.detectSecretPaths(wram);
 
     // Sistema de interação: se há um objeto interativo perto e não está em cooldown, vai até ele e interage
     const nearestInteractive = this.interactiveObjects.find(
@@ -3961,6 +4236,31 @@ export class LocalVisionAgent {
       );
     }
 
+    // MISSÃO PRINCIPAL: definir ordem de prioridade comportamental.
+    // 1. SA-X (fuga ou confronto final) — sempre acima de tudo
+    // 2. Core-X poder exposto — coletar imediatamente
+    // 3. Caminho secreto (X-Ray) — testar bloco falso para revelar rota oculta
+    // 4. Energia auxiliar não ativada nesta sala — ativar (missão principal)
+    // 5. Itens/habilidades para coletar — coleta (missão principal)
+    // 6. Chefes — só combate se não houver energia/itens/caminhos secretos pendentes
+    // 7. Backtracking — voltar para rotas bloqueadas
+    // 8. Exploração — descobrir novas salas
+    // MISSÃO PRINCIPAL: em cada setor, o terminal A (Auxiliary Power) deve ser
+    // ativado PRIMEIRO antes de qualquer N, D ou S. Sem o A, é impossível
+    // prosseguir naquele setor (portas, elevadores e sistemas ficam bloqueados).
+    const energyAuxPending = this.interactiveObjects.some(
+      (o) =>
+        (o.type === 'ENERGY_AUX' || o.type === 'POWER_PANEL') &&
+        !o.interacted &&
+        this.canActivateTerminalInSector(wram.roomId, o.letter),
+    );
+    const itemPending = activeItem && this.itemChaseTicks < 42;
+    // Caminho secreto pendente: há bloco falso não testado nesta sala e o jogador tem X-Ray
+    const secretPathPending =
+      (wram.itemsMask & 0x8000) !== 0 &&
+      this.getOrCreateRoom(wram.roomId).secretPaths.size > 0 &&
+      [...this.getOrCreateRoom(wram.roomId).secretPaths.values()].some((sp) => !sp.tested);
+
     let resolvedMode: AgentBehaviorMode = 'EXPLORE';
     if (saxPursuer && !this.omegaVanishedDuringTimer && !isEscapeCountdown) {
       const saxDisabledByMetroid =
@@ -3970,7 +4270,13 @@ export class LocalVisionAgent {
       resolvedMode = mustFight ? 'COMBAT' : 'EVADE_SAX';
     } else if (coreXTarget) {
       resolvedMode = 'COMBAT';
-    } else if ((activeItem && this.itemChaseTicks < 42) || unlockedLabel) {
+    } else if (secretPathPending) {
+      // Caminho secreto via X-Ray: testa bloco falso antes de prosseguir
+      resolvedMode = 'COLLECT';
+    } else if (energyAuxPending) {
+      // Energia auxiliar tem prioridade sobre combate com chefes comuns
+      resolvedMode = 'COLLECT';
+    } else if (itemPending || unlockedLabel) {
       resolvedMode = 'COLLECT';
     } else if (backtrackDir && this.progressStallTicks < 16 && !this.omegaVanishedDuringTimer && !isEscapeCountdown) {
       resolvedMode = 'BACKTRACK';
@@ -4027,6 +4333,14 @@ export class LocalVisionAgent {
         );
       case 'COLLECT':
         this.resetUSearch();
+        // Se há caminho secreto pendente via X-Ray, testa o bloco falso primeiro
+        if (
+          secretPathPending &&
+          (wram.itemsMask & 0x8000) !== 0
+        ) {
+          const secretAction = this.executeSecretPathTest(wram);
+          if (secretAction) return secretAction;
+        }
         return this.executeCollectState(motionPct, wram, activeItem ?? null, unlockedLabel);
       case 'BACKTRACK':
         return this.executeBacktrackState(motionPct, wram, backtrackDir!);
@@ -5405,6 +5719,67 @@ export class LocalVisionAgent {
         (isGrounded || (this.sameYStreak >= 1 && Math.abs(this.samusVy) <= 1)) &&
         (wram.itemsMask & 0x1004) === 0x1004;
 
+      // CORREÇÃO: Porta acima (UP) — mirar para cima e atirar antes de pular/entrar
+      const isUpDoor = targetDoor ? targetDoor.side === 'UP' : false;
+      if (isUpDoor && nearDoor) {
+        const loadout = this.getAgentLoadout(wram);
+        const doorColor = this.navDoorColors.get(`${wram.roomId}:${targetDoor.key}`) ?? 'UNKNOWN';
+        const gate = gateForDoor(doorColor, targetDoor.blockedByWall);
+        const gateCheck = checkGate(gate, this.navLoadoutView(wram));
+        const needsAmmoNow = gate.needsAmmoNow && gate.need !== 'NONE' && gate.need !== 'UNKNOWN';
+        const canAfford = gateCheck.openableNow || gate.need === 'BOMB_OR_BEAM';
+        const keys: AIKey[] = [];
+
+        // 1) Selecionar munição adequada se a porta precisa e não está selecionada
+        if (needsAmmoNow && !canAfford && wram.selectedHudItem === 0) {
+          keys.push(selectKey);
+          return this.makeMetroidAction(
+            'EXPLORE',
+            [...keys, 'UP'],
+            130,
+            'run',
+            motionPct,
+            'Exploração · Porta acima · selecionar munição',
+            `Porta acima (${doorColor}) · selecionando munição no HUD`,
+            wram,
+          );
+        }
+
+        // 2) Mirar para cima e atirar na porta
+        keys.push('UP');
+        if (
+          (gate.need === 'MISSILES' && loadout.missileCount >= gate.amount) ||
+          (gate.need === 'SUPERS' && loadout.superCount >= gate.amount) ||
+          (gate.need === 'POWER_BOMBS' && loadout.powerBombCount >= gate.amount) ||
+          gate.need === 'BOMB_OR_BEAM' ||
+          gate.need === 'NONE' ||
+          gate.need === 'UNKNOWN'
+        ) {
+          if (this.nextShoot(true)) {
+            keys.push(shootKey);
+            if (gate.need === 'MISSILES' || gate.need === 'SUPERS' || gate.need === 'POWER_BOMBS') {
+              this.registerMissileUse();
+            }
+          }
+        }
+
+        // 3) Após mirar/atirar, preparar pulo para entrar na porta
+        if (this.nextJump(true, 3)) {
+          keys.push(jumpKey);
+        }
+
+        return this.makeMetroidAction(
+          'EXPLORE',
+          keys,
+          125,
+          'run',
+          motionPct,
+          'Exploração · Porta acima · mirar e atirar',
+          `Porta acima (${targetDoor.key}) · mirando para cima e atirando antes de pular`,
+          wram,
+        );
+      }
+
       if (bombFloorUnderFoot) {
         const bKeys: AIKey[] = ['DOWN'];
         if (this.nextShoot(true)) bKeys.push(shootKey);
@@ -5791,6 +6166,27 @@ export class LocalVisionAgent {
       }
     } else {
       this.visualCombatStreak = 0;
+    }
+
+    // Evita andar para dentro de perigo óbvio detectado por cor (espinho/lava)
+    // quando WRAM não está disponível para dizer onde está o chão seguro.
+    const dangerAhead = this.lastCapturedFrame && detectDangerColor(this.lastCapturedFrame, this.moveDir);
+    if (dangerAhead) {
+      const oppDir: 'LEFT' | 'RIGHT' = this.moveDir === 'RIGHT' ? 'LEFT' : 'RIGHT';
+      this.moveDir = oppDir;
+      const keys: AIKey[] = [oppDir, 'B'];
+      if (this.nextJump(true, 4)) keys.push('A');
+      this.currentMode = 'EXPLORE';
+      return {
+        key: keys[0],
+        keys,
+        time: 150,
+        phase: 'run',
+        motionPct,
+        sceneLabel: 'Exploração · Perigo detectado',
+        reason: 'Perigo à frente (espinho/lava) · inverte direção e salta',
+        snapshot: buildVisualSnapshot('EXPLORE', keys, 'Exploração · Perigo detectado', 'Inverte direção por perigo visual'),
+      };
     }
 
     this.currentMode = 'EXPLORE';
