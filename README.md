@@ -101,6 +101,15 @@ sala da sessão — não é só uma mudança de rótulo.
 O painel **“Mapa & Objetivos”** mostra alvo e rota, barra de cobertura, portas da sala atual com
 a cor reconhecida, o backlog ("voltar quando tiver o item") e o que falta do checklist.
 
+Para calibrar os detectores com material real, `scripts/videoFrames.py` amostra um vídeo de
+gameplay (frame a cada N segundos) e imprime as paletas dominantes do chão/HUD — é como se
+confere, por exemplo, se a lava do hack bate com o threshold do `senseMoltenLake`:
+
+```bash
+python3 -m venv /tmp/vid && /tmp/vid/bin/pip install av pillow numpy
+/tmp/vid/bin/python scripts/videoFrames.py gameplay.mp4 --every 1 --out video-analysis
+```
+
 ```bash
 npm run check:map    # 36 checagens do módulo (portas, tela de mapa pintada, rota, backlog, checklist)
 npm run check:nav    # 50 checagens do agente num mundo de várias salas: mapa real + salas com lava
