@@ -198,6 +198,8 @@ export class LocalVisionAgent {
   private recentBlockedSpots: Array<{ x: number; y: number; dir: 'LEFT' | 'RIGHT' }> = [];
   private itemChaseTicks = 0;
   private unbreakableGates = new Set<string>();
+  // Células do mapa de blocos onde a IA morreu ou ficou presa (aprendizado de falhas)
+  private dangerCells = new Set<string>();
 
   // Padrão de busca em 'U' para contornar bloqueios durante Exploração
   private uSearch: USearchState = {
@@ -298,6 +300,7 @@ export class LocalVisionAgent {
     this.recentBlockedSpots = [];
     this.itemChaseTicks = 0;
     this.unbreakableGates.clear();
+    this.dangerCells.clear();
     this.resetUSearch();
     this.visualUSearch = {
       active: false,
@@ -682,6 +685,7 @@ export class LocalVisionAgent {
       this.itemChaseTicks = 0;
       this.recentBlockedSpots = [];
       this.unbreakableGates.clear();
+      this.dangerCells.clear();
       this.omegaIntroSeenTicks = 0;
       this.omegaVanishedDuringTimer = false;
       this.bigMetroidDrainSeen = false;
@@ -703,6 +707,7 @@ export class LocalVisionAgent {
       }
       this.recentBlockedSpots = [];
       this.unbreakableGates.clear();
+      this.dangerCells.clear();
     }
     return { unlockedLabel: unlocked, energyOrStateReset };
   }
@@ -776,7 +781,10 @@ export class LocalVisionAgent {
     this.lastMetrics = m;
     const motionPct = Math.round(m.totalMotion * 1000) / 10;
 
-    if (wram && wram.valid && profile === 'action') {
+    // Se a memória do SNES está válida (detectada como Super Metroid por readMetroidWram),
+    // use a IA de WRAM independente do perfil escolhido. O perfil 'rpg' não deve bloquear
+    // a inteligência real de Metroid (salas, portas, chefes, itens, SA-X, Core-X).
+    if (wram && wram.valid) {
       return this.decideMetroidReal(m, motionPct, targetDifficulty, wram);
     }
 
@@ -1022,6 +1030,10 @@ export class LocalVisionAgent {
       }
       if (deltaHp >= 25) {
         this.recentDamageSpikeTick = this.stepIndex;
+        // Aprendizado de falhas: marca a célula atual como perigosa para evitar no futuro
+        const bx = Math.floor(wram.samusX / 16);
+        const by = Math.floor(wram.samusY / 16);
+        this.dangerCells.add(`${wram.roomId}:${bx},${by}`);
       } else if (wram.health > this.prevHealth + 15) {
         // Energia recarregada/resetada pelo Metroid Grande, estação ou tanque de reserva
         this.recentDamageSpikeTick = -100;
@@ -1111,6 +1123,28 @@ export class LocalVisionAgent {
       return t;
     }
     return 0x8;
+  }
+
+  // Verifica se Samus está pisando em chão sólido (bloco floor abaixo dos pés),
+  // em vez de confiar apenas no proxy sameYStreak.
+  private isSamusGrounded(wram: MetroidWramSnapshot): boolean {
+    const bt = wram.blockTypes;
+    const rw = wram.roomWidthBlocks;
+    const rh = wram.roomHeightBlocks;
+    if (!bt || rw <= 0 || rh <= 0) return false;
+    const bx = Math.max(0, Math.min(rw - 1, Math.floor(wram.samusX / 16)));
+    const by = Math.max(1, Math.min(rh - 2, Math.floor(wram.samusY / 16)));
+    const below = this.resolveBlockType(wram, bx, by + 1);
+    const isSolidFloor =
+      below === 0x8 ||
+      below === 0xa ||
+      below === 0x1 ||
+      below === 0xb ||
+      below === 0xc ||
+      below === 0xe ||
+      below === 0xf ||
+      (below === 0x9 && by === rh - 1);
+    return isSolidFloor;
   }
 
   private planPathInRoom(
@@ -1227,6 +1261,30 @@ export class LocalVisionAgent {
       }
     }
 
+    // Posições de inimigos ativos para evitar no pathfinding (obstáculos dinâmicos)
+    const enemyCells: Array<{ bx: number; by: number; distPx: number }> = [];
+    for (const e of wram.enemies) {
+      if (e.hp <= 0) continue;
+      const d = Math.hypot(e.x - wram.samusX, e.y - wram.samusY);
+      if (d > 220) continue; // só considera inimigos próximos
+      enemyCells.push({
+        bx: Math.max(0, Math.min(rw - 1, Math.floor(e.x / 16))),
+        by: Math.max(1, Math.min(rh - 2, Math.floor(e.y / 16))),
+        distPx: d,
+      });
+    }
+
+    const isNearEnemy = (bx: number, by: number): boolean => {
+      const dangerKey = `${wram.roomId}:${bx},${by}`;
+      if (this.dangerCells.has(dangerKey)) return true;
+      for (const ec of enemyCells) {
+        const dx = Math.abs(bx - ec.bx);
+        const dy = Math.abs(by - ec.by);
+        if (dx <= 2 && dy <= 2) return true; // célula ocupada ou adjacente a inimigo
+      }
+      return false;
+    };
+
     const total = rw * rh;
     const dist = new Int32Array(total).fill(0x3f3f3f3f);
     const closed = new Uint8Array(total);
@@ -1298,7 +1356,9 @@ export class LocalVisionAgent {
       if (nx < 0 || ny < 1 || nx >= rw || ny >= rh - 1) return;
       const nIdx = ny * rw + nx;
       if (closed[nIdx]) return;
-      const nextCost = dist[fromIdx] + edgeCost;
+      let nextCost = dist[fromIdx] + edgeCost;
+      // Penaliza células próximas a inimigos ativos para evitar caminhar direto neles
+      if (isNearEnemy(nx, ny)) nextCost += 40;
       if (nextCost < dist[nIdx]) {
         dist[nIdx] = nextCost;
         parent[nIdx] = fromIdx;
@@ -2430,18 +2490,40 @@ export class LocalVisionAgent {
     }
 
     const isBossEnemy = target.hp >= 450;
-    const bossApproach: AIKey = isBossEnemy && target.dist < 56 ? (faceDir === 'RIGHT' ? 'LEFT' : 'RIGHT') : faceDir;
-    const keys: AIKey[] = [bossApproach];
+    const lowHealth = wram.maxHealth > 0 && wram.health < wram.maxHealth * 0.30;
+
+    // Com vida baixa, prioriza afastar-se do inimigo em vez de se aproximar
+    let approachDir: AIKey;
+    if (lowHealth) {
+      approachDir = faceDir === 'RIGHT' ? 'LEFT' : 'RIGHT';
+    } else if (isBossEnemy && target.dist < 56) {
+      approachDir = faceDir === 'RIGHT' ? 'LEFT' : 'RIGHT';
+    } else {
+      approachDir = faceDir;
+    }
+    const keys: AIKey[] = [approachDir];
     if (target.y < wram.samusY - 18) keys.push('UP');
+
+    // Chefes: usa mísseis/supers sempre que disponível; inimigos comuns usam feixe normal
     const useHeavyForBoss = isBossEnemy && (wram.supers > 0 || wram.missiles > 0);
-    if (useHeavyForBoss && wram.selectedHudItem === 0) {
+    const hasHeavyAmmo = wram.supers > 0 || wram.missiles > 0;
+    const needSelectAmmo = hasHeavyAmmo && wram.selectedHudItem === 0;
+
+    if (useHeavyForBoss && needSelectAmmo) {
       keys.push(selectKey);
     } else if (this.nextShoot(true)) {
       keys.push(shootKey);
     }
-    if (this.nextJump(target.dist < 52 || (isBossEnemy && (target.y < wram.samusY - 24 || this.stepIndex % 7 === 0)), isBossEnemy ? 3 : 2)) {
+
+    // Pulo: chefe próximo ou inimigo muito perto -> salta para não ficar no alcance de contato
+    const wantsJump =
+      target.dist < 52 ||
+      (isBossEnemy && (target.y < wram.samusY - 24 || this.stepIndex % 7 === 0)) ||
+      (target.dist < 36 && this.stepIndex % 5 === 0);
+    if (this.nextJump(wantsJump, isBossEnemy ? 3 : 2)) {
       keys.push(jumpKey);
     }
+
     return this.makeMetroidAction(
       'COMBAT',
       keys,
@@ -2449,9 +2531,11 @@ export class LocalVisionAgent {
       'run',
       motionPct,
       isBossEnemy ? 'Combate · Enfrentando Chefe' : 'Combate · Eliminando inimigo',
-      isBossEnemy
-        ? `Atacando chefe da sala (${Math.round(target.dist)} px · HP ${target.hp})`
-        : `Atacando inimigo confirmado (${Math.round(target.dist)} px · HP ${target.hp})`,
+      lowHealth
+        ? `Vida baixa! Recuando do ${isBossEnemy ? 'chefe' : 'inimigo'} (${Math.round(target.dist)} px · HP ${target.hp})`
+        : isBossEnemy
+          ? `Atacando chefe da sala (${Math.round(target.dist)} px · HP ${target.hp})`
+          : `Atacando inimigo confirmado (${Math.round(target.dist)} px · HP ${target.hp})`,
       wram,
     );
   }
@@ -2502,7 +2586,7 @@ export class LocalVisionAgent {
         : 'LEFT';
     this.moveDir = dirToItem;
     const keys: AIKey[] = [dirToItem, dashKey];
-    const isGrounded = this.sameYStreak >= 2 && Math.abs(this.samusVy) <= 1;
+    const isGrounded = this.isSamusGrounded(wram);
     const wantsJump = itemPath
       ? !itemPath.drop && (itemPath.jump || itemPath.wpBy * 16 + 8 < wram.samusY - 12)
       : activeItem!.y < wram.samusY - 12 || this.progressStallTicks >= 4;
@@ -2813,7 +2897,7 @@ export class LocalVisionAgent {
     }
 
     const hasSpaceJump = (wram.itemsMask & 0x0200) !== 0;
-    const isGrounded = this.sameYStreak >= 2 && Math.abs(this.samusVy) <= 1;
+    const isGrounded = this.isSamusGrounded(wram);
     const samusBx = Math.max(0, Math.min(wram.roomWidthBlocks - 1, Math.floor(wram.samusX / 16)));
     const samusBy = Math.max(1, Math.min(wram.roomHeightBlocks - 2, Math.floor(wram.samusY / 16)));
     const tileAbove1 = this.resolveBlockType(wram, samusBx, samusBy - 1);
