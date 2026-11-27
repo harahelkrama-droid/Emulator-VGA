@@ -121,6 +121,50 @@ export interface AIStatusSnapshot {
   countdownActive?: boolean;
   countdownSeconds?: number;
   energyResetDetected?: boolean;
+  // Sistema de loadout: habilidades, armadura e ferramentas do agente
+  agentLoadout?: {
+    totalAbilities: number;
+    energyTanks: number;
+    missileCount: number;
+    superCount: number;
+    powerBombCount: number;
+    hasVaria: boolean;
+    hasGravity: boolean;
+    hasMorphBall: boolean;
+    hasBombs: boolean;
+    hasSpaceJump: boolean;
+    hasScrewAttack: boolean;
+    hasGrapple: boolean;
+    hasXRay: boolean;
+    hasChargeBeam: boolean;
+    hasWaveBeam: boolean;
+    hasIceBeam: boolean;
+    hasSpazer: boolean;
+    hasPlasmaBeam: boolean;
+    hasMissiles: boolean;
+    hasSupers: boolean;
+    hasPowerBombs: boolean;
+    hasReserveTank: boolean;
+  };
+  // Sistema de exploração do mapa
+  mapExploration?: {
+    roomsExplored: number;
+    mapFullyExplored: boolean;
+  };
+  // Sistema de interação com objetos/terminal/energia
+  interaction?: {
+    nearbyObjects: Array<{
+      type: string;
+      x: number;
+      y: number;
+      priority: number;
+      interacted: boolean;
+    }>;
+    currentTarget: string | null;
+    powerAuxActivated: boolean;
+    roomsWithPowerIssue: number;
+    stuckInRoomTicks: number;
+  };
 }
 
 export interface AIAction {
