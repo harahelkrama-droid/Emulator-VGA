@@ -128,6 +128,8 @@ interface RoomNode {
   doors: Map<string, RoomDoorProgress>;
   triedLeft: boolean;
   triedRight: boolean;
+  /** caminhos secretos detectados via X-Ray (blocos falsos nas bordas) */
+  secretPaths: Map<string, { bx: number; by: number; x: number; y: number; blockType: number; bts: number; tested: boolean; reason: string }>;
 }
 
 interface TilePathStep {
@@ -150,6 +152,8 @@ interface PendingTarget {
   dir: 'LEFT' | 'RIGHT';
   note: string;
   unlockedToRetry: boolean;
+  /** prioridade relativa para ordenação de pendentes (maior = mais urgente) */
+  priority?: number;
 }
 
 interface InteractiveObject {
@@ -776,6 +780,7 @@ export class LocalVisionAgent {
         doors: new Map(),
         triedLeft: false,
         triedRight: false,
+        secretPaths: new Map(),
       };
       this.roomGraph.set(roomId, node);
     }
@@ -3654,6 +3659,157 @@ export class LocalVisionAgent {
     });
   }
 
+  // =====================================================================
+  // DETECÇÃO DE CAMINHOS SECRETOS / BLOCOS FALSOS (X-Ray Scope)
+  // Quando o X-Ray Scope está equipado, blocos falsos nas paredes/teto/chão
+  // revelam passagens ocultas. Marca essas posições no grafo para que o
+  // agente saiba que há uma rota secreta a ser testada (atirar/bombardear).
+  // =====================================================================
+  private detectSecretPaths(wram: MetroidWramSnapshot): void {
+    const hasXRay = (wram.itemsMask & 0x8000) !== 0;
+    if (!hasXRay || !wram.blockTypes || !wram.btsBytes) return;
+
+    const roomId = wram.roomId;
+    const currNode = this.getOrCreateRoom(roomId);
+    const { roomWidthBlocks, roomHeightBlocks } = wram;
+
+    // Limpa caminhos secretos antigos desta sala para reavaliar cada sessão
+    currNode.secretPaths.clear();
+
+    // Percorre a borda da sala (paredes, teto, chão) procurando blocos que
+    // parecem sólidos (tipo 0x8) mas são na verdade blocos falsos revelados pelo X-Ray.
+    // No Super Metroid, blocos falsos costumam ter BTS byte diferente de 0 e
+    // tipo de bloco sólido nas bordas da sala.
+    const edgeRows = [0, roomHeightBlocks - 1];
+    const edgeCols = [0, roomWidthBlocks - 1];
+
+    for (let by = 0; by < roomHeightBlocks; by += 1) {
+      for (let bx = 0; bx < roomWidthBlocks; bx += 1) {
+        // Só verifica bordas da sala (onde caminhos secretos aparecem)
+        const isEdge = bx === 0 || bx === roomWidthBlocks - 1 || by === 0 || by === roomHeightBlocks - 1;
+        if (!isEdge) continue;
+
+        const idx = by * roomWidthBlocks + bx;
+        const blockType = wram.blockTypes[idx];
+        const bts = wram.btsBytes[idx];
+
+        // Tipo 0x8 = bloco sólido aparente; BTS diferente de 0 pode indicar bloco falso
+        // Tipo 0xa = espinho (não é caminho secreto)
+        // Tipo 0xf = quebrável por bomba (já é visível, não precisa de X-Ray)
+        if (blockType !== 0x8) continue;
+        if (bts === 0) continue; // bloco sólido de verdade
+
+        // Marca como caminho secreto candidato
+        currNode.secretPaths.set(`${bx}:${by}`, {
+          bx,
+          by,
+          x: bx * 16 + 8,
+          y: by * 16 + 8,
+          blockType,
+          bts,
+          tested: false,
+          reason: 'bloco falso detectado via X-Ray',
+        });
+      }
+    }
+
+    // Se encontrou caminhos secretos, adiciona nota para o agente testar
+    if (currNode.secretPaths.size > 0) {
+      const count = currNode.secretPaths.size;
+      const secretNote = `Caminho secreto detectado (${count} bloco(s) falso(s) via X-Ray) na sala 0x${roomId.toString(16)}`;
+      // Registra no pendingTargets para o agente priorizar testar esses blocos
+      for (const [key, sp] of currNode.secretPaths) {
+        if (sp.tested) continue;
+        this.addPendingTarget({
+          roomId,
+          x: sp.x,
+          y: sp.y,
+          dir: sp.bx < roomWidthBlocks / 2 ? 'LEFT' : 'RIGHT',
+          note: `CAMINHO SECRETO · teste bloco falso em (${sp.bx},${sp.by})`,
+          priority: 50,
+        });
+      }
+    }
+  }
+
+  // Testa um bloco falso candidato (atira/bomba para revelar passagem secreta)
+  private executeSecretPathTest(wram: MetroidWramSnapshot): AIAction | null {
+    const hasXRay = (wram.itemsMask & 0x8000) !== 0;
+    if (!hasXRay) return null;
+
+    const currNode = this.getOrCreateRoom(wram.roomId);
+    if (currNode.secretPaths.size === 0) return null;
+
+    // Encontra o caminho secreto mais próximo não testado
+    let nearest: { key: string; sp: { bx: number; by: number; x: number; y: number; tested: boolean } } | null = null;
+    let nearestDist = Infinity;
+    for (const [key, sp] of currNode.secretPaths) {
+      if (sp.tested) continue;
+      const dist = Math.hypot(sp.x - wram.samusX, sp.y - wram.samusY);
+      if (dist < nearestDist) {
+        nearestDist = dist;
+        nearest = { key, sp };
+      }
+    }
+    if (!nearest) return null;
+
+    const { sp } = nearest;
+    const dist = nearestDist;
+
+    // Se está perto do bloco falso, testa atirando ou usando bomba
+    if (dist < 64) {
+      const keys: AIKey[] = [sp.x >= wram.samusX ? 'RIGHT' : 'LEFT'];
+      // Aponta para o bloco (para cima se estiver acima, etc.)
+      if (sp.y < wram.samusY - 8) keys.push('UP');
+      else if (sp.y > wram.samusY + 8) keys.push('DOWN');
+
+      // Se tem bomba e está embaixo, planta bomba
+      if (sp.y > wram.samusY && (wram.itemsMask & 0x1004) === 0x1004) {
+        keys.push('DOWN');
+        if (this.nextShoot(true)) keys.push(wram.controls.shoot);
+        sp.tested = true;
+        return this.makeMetroidAction(
+          'COLLECT',
+          keys,
+          140,
+          'run',
+          0,
+          'Caminho Secreto · Bomba',
+          `Testando bloco falso com bomba em (${sp.bx},${sp.by})`,
+          wram,
+        );
+      }
+
+      // Senão, atira no bloco falso
+      if (this.nextShoot(true)) keys.push(wram.controls.shoot);
+      sp.tested = true;
+      return this.makeMetroidAction(
+        'COLLECT',
+        keys,
+        130,
+        'run',
+        0,
+        'Caminho Secreto · Atirar',
+        `Atirando no bloco falso em (${sp.bx},${sp.by}) para revelar passagem`,
+        wram,
+      );
+    }
+
+    // Se não está perto, se aproxima
+    const keys: AIKey[] = [sp.x >= wram.samusX ? 'RIGHT' : 'LEFT', wram.controls.run];
+    if (this.nextJump(true, 3)) keys.push(wram.controls.jump);
+    return this.makeMetroidAction(
+      'COLLECT',
+      keys,
+      125,
+      'run',
+      0,
+      'Caminho Secreto · Aproximando',
+      `Indo até bloco falso em (${sp.bx},${sp.by})`,
+      wram,
+    );
+  }
+
   // Verifica se Samus está perto o suficiente para interagir com um objeto
   private canInteractWithObject(wram: MetroidWramSnapshot, obj: InteractiveObject): boolean {
     const dist = Math.hypot(obj.x - wram.samusX, obj.y - wram.samusY);
@@ -3775,6 +3931,9 @@ export class LocalVisionAgent {
 
     // Detecta objetos interativos (terminais, computadores, painéis de energia, estações de save)
     this.detectInteractiveObjects(wram);
+
+    // MISSÃO 100%: detecta caminhos secretos via X-Ray (blocos falsos nas bordas da sala)
+    this.detectSecretPaths(wram);
 
     // Sistema de interação: se há um objeto interativo perto e não está em cooldown, vai até ele e interage
     const nearestInteractive = this.interactiveObjects.find(
@@ -3986,15 +4145,21 @@ export class LocalVisionAgent {
     // MISSÃO PRINCIPAL: definir ordem de prioridade comportamental.
     // 1. SA-X (fuga ou confronto final) — sempre acima de tudo
     // 2. Core-X poder exposto — coletar imediatamente
-    // 3. Energia auxiliar não ativada nesta sala — ativar (missão principal)
-    // 4. Itens/habilidades para coletar — coleta (missão principal)
-    // 5. Chefes — só combate se não houver energia/itens pendentes de maior prioridade
-    // 6. Backtracking — voltar para rotas bloqueadas
-    // 7. Exploração — descobrir novas salas
+    // 3. Caminho secreto (X-Ray) — testar bloco falso para revelar rota oculta
+    // 4. Energia auxiliar não ativada nesta sala — ativar (missão principal)
+    // 5. Itens/habilidades para coletar — coleta (missão principal)
+    // 6. Chefes — só combate se não houver energia/itens/caminhos secretos pendentes
+    // 7. Backtracking — voltar para rotas bloqueadas
+    // 8. Exploração — descobrir novas salas
     const energyAuxPending = this.interactiveObjects.some(
       (o) => (o.type === 'ENERGY_AUX' || o.type === 'POWER_PANEL') && !o.interacted,
     );
     const itemPending = activeItem && this.itemChaseTicks < 42;
+    // Caminho secreto pendente: há bloco falso não testado nesta sala e o jogador tem X-Ray
+    const secretPathPending =
+      (wram.itemsMask & 0x8000) !== 0 &&
+      this.getOrCreateRoom(wram.roomId).secretPaths.size > 0 &&
+      [...this.getOrCreateRoom(wram.roomId).secretPaths.values()].some((sp) => !sp.tested);
 
     let resolvedMode: AgentBehaviorMode = 'EXPLORE';
     if (saxPursuer && !this.omegaVanishedDuringTimer && !isEscapeCountdown) {
@@ -4005,6 +4170,9 @@ export class LocalVisionAgent {
       resolvedMode = mustFight ? 'COMBAT' : 'EVADE_SAX';
     } else if (coreXTarget) {
       resolvedMode = 'COMBAT';
+    } else if (secretPathPending) {
+      // Caminho secreto via X-Ray: testa bloco falso antes de prosseguir
+      resolvedMode = 'COLLECT';
     } else if (energyAuxPending) {
       // Energia auxiliar tem prioridade sobre combate com chefes comuns
       resolvedMode = 'COLLECT';
@@ -4065,6 +4233,14 @@ export class LocalVisionAgent {
         );
       case 'COLLECT':
         this.resetUSearch();
+        // Se há caminho secreto pendente via X-Ray, testa o bloco falso primeiro
+        if (
+          secretPathPending &&
+          (wram.itemsMask & 0x8000) !== 0
+        ) {
+          const secretAction = this.executeSecretPathTest(wram);
+          if (secretAction) return secretAction;
+        }
         return this.executeCollectState(motionPct, wram, activeItem ?? null, unlockedLabel);
       case 'BACKTRACK':
         return this.executeBacktrackState(motionPct, wram, backtrackDir!);
