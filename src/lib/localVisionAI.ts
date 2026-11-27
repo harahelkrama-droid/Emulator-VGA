@@ -201,6 +201,16 @@ export class LocalVisionAgent {
   // Células do mapa de blocos onde a IA morreu ou ficou presa (aprendizado de falhas)
   private dangerCells = new Set<string>();
 
+  // Sistema de exploração do mapa: rastreia salas visitadas e quando o mapa foi "ganho"
+  private roomsExplored = new Set<number>();
+  private mapExploredThreshold = 12; // número de salas únicas para considerar o mapa explorado
+  private mapFullyExplored = false;
+  private lastMapCheckTick = 0;
+
+  // Controle de uso de míssil: só usa míssil em boss, porta bloqueada ou situação especial
+  private lastMissileUseTick = -100;
+  private missileCooldownTicks = 60; // evita spam de míssil
+
   // Padrão de busca em 'U' para contornar bloqueios durante Exploração
   private uSearch: USearchState = {
     active: false,
@@ -724,6 +734,121 @@ export class LocalVisionAgent {
     return hasHighEnergy && hasSuit && hasStrongBeam && hasHeavyAmmo;
   }
 
+  // Verifica quais habilidades, armadura e ferramentas o agente possui no momento
+  private getAgentLoadout(wram: MetroidWramSnapshot): {
+    hasVaria: boolean;
+    hasGravity: boolean;
+    hasMorphBall: boolean;
+    hasBombs: boolean;
+    hasSpringBall: boolean;
+    hasHiJump: boolean;
+    hasSpaceJump: boolean;
+    hasSpeedBooster: boolean;
+    hasScrewAttack: boolean;
+    hasGrapple: boolean;
+    hasXRay: boolean;
+    hasChargeBeam: boolean;
+    hasWaveBeam: boolean;
+    hasIceBeam: boolean;
+    hasSpazer: boolean;
+    hasPlasmaBeam: boolean;
+    hasMissiles: boolean;
+    hasSupers: boolean;
+    hasPowerBombs: boolean;
+    hasReserveTank: boolean;
+    energyTanks: number;
+    missileCount: number;
+    superCount: number;
+    powerBombCount: number;
+    totalAbilities: number;
+  } {
+    const itemsMask = wram.itemsMask;
+    const beamsMask = wram.beamsMask;
+
+    const hasVaria = (itemsMask & 0x0001) !== 0;
+    const hasGravity = (itemsMask & 0x0020) !== 0;
+    const hasMorphBall = (itemsMask & 0x0004) !== 0;
+    const hasBombs = (itemsMask & 0x1000) !== 0;
+    const hasSpringBall = (itemsMask & 0x0002) !== 0;
+    const hasHiJump = (itemsMask & 0x0100) !== 0;
+    const hasSpaceJump = (itemsMask & 0x0200) !== 0;
+    const hasSpeedBooster = (itemsMask & 0x2000) !== 0;
+    const hasScrewAttack = (itemsMask & 0x0008) !== 0;
+    const hasGrapple = (itemsMask & 0x4000) !== 0;
+    const hasXRay = (itemsMask & 0x8000) !== 0;
+
+    const hasChargeBeam = (beamsMask & 0x1000) !== 0;
+    const hasWaveBeam = (beamsMask & 0x0001) !== 0;
+    const hasIceBeam = (beamsMask & 0x0002) !== 0;
+    const hasSpazer = (beamsMask & 0x0004) !== 0;
+    const hasPlasmaBeam = (beamsMask & 0x0008) !== 0;
+
+    const hasMissiles = wram.missiles > 0;
+    const hasSupers = wram.supers > 0;
+    const hasPowerBombs = wram.powerBombs > 0;
+    const hasReserveTank = wram.reserveMax > 0;
+
+    const energyTanks = Math.max(0, Math.floor((wram.maxHealth - 99) / 100));
+
+    const totalAbilities = [
+      hasVaria, hasGravity, hasMorphBall, hasBombs, hasSpringBall, hasHiJump,
+      hasSpaceJump, hasSpeedBooster, hasScrewAttack, hasGrapple, hasXRay,
+      hasChargeBeam, hasWaveBeam, hasIceBeam, hasSpazer, hasPlasmaBeam,
+    ].filter(Boolean).length;
+
+    return {
+      hasVaria, hasGravity, hasMorphBall, hasBombs, hasSpringBall, hasHiJump,
+      hasSpaceJump, hasSpeedBooster, hasScrewAttack, hasGrapple, hasXRay,
+      hasChargeBeam, hasWaveBeam, hasIceBeam, hasSpazer, hasPlasmaBeam,
+      hasMissiles, hasSupers, hasPowerBombs, hasReserveTank,
+      energyTanks,
+      missileCount: wram.missiles,
+      superCount: wram.supers,
+      powerBombCount: wram.powerBombs,
+      totalAbilities,
+    };
+  }
+
+  // Decide se o agente deve usar míssil com base no loadout e contexto
+  // Só usa míssil se: for boss, porta bloqueada, ou situação especial (SA-X, Core-X)
+  // Não usa míssil em inimigos comuns para não munição
+  private shouldUseMissile(
+    wram: MetroidWramSnapshot,
+    target: EnemyInfo | null,
+    isBoss: boolean,
+    isBlockedDoor: boolean,
+    isSpecialEntity: boolean,
+  ): boolean {
+    const loadout = this.getAgentLoadout(wram);
+
+    // Não tem míssil disponível
+    if (!loadout.hasMissiles && !loadout.hasSupers) return false;
+
+    // Cooldown de míssil para evitar spam
+    if (this.stepIndex - this.lastMissileUseTick < this.missileCooldownTicks) return false;
+
+    // Sem munição suficiente (reserva para boss/porta)
+    if (loadout.missileCount < 5 && loadout.superCount === 0) return false;
+
+    // Sempre usa míssil em boss
+    if (isBoss) return true;
+
+    // Sempre usa míssil em porta bloqueada
+    if (isBlockedDoor) return true;
+
+    // Sempre usa míssil em entidade especial (SA-X, Core-X, etc.)
+    if (isSpecialEntity) return true;
+
+    // Não usa míssil em inimigo comum - economiza para boss/porta
+    return false;
+  }
+
+  // Registra uso de míssil para controle de cooldown
+  private registerMissileUse(): void {
+    this.lastMissileUseTick = this.stepIndex;
+    this.missileProbeCount++;
+  }
+
   private buildSnapshot(
     mode: AgentBehaviorMode,
     keys: AIKey[],
@@ -765,6 +890,15 @@ export class LocalVisionAgent {
       countdownActive: wram?.countdownActive,
       countdownSeconds: wram?.countdownSeconds,
       energyResetDetected: this.lastEnergyResetTick === this.stepIndex,
+      // Sistema de loadout: mostra quais habilidades/armadura/ferramentas o agente tem
+      agentLoadout: wram ? this.getAgentLoadout(wram) : undefined,
+      // Sistema de exploração do mapa
+      mapExploration: wram
+        ? {
+            roomsExplored: this.roomsExplored.size,
+            mapFullyExplored: this.mapFullyExplored,
+          }
+        : undefined,
     };
   }
 
@@ -935,6 +1069,15 @@ export class LocalVisionAgent {
       }
 
       this.lastRoomId = wram.roomId;
+      // Rastreia salas exploradas para detectar quando o mapa foi "ganho"
+      if (!this.roomsExplored.has(wram.roomId)) {
+        this.roomsExplored.add(wram.roomId);
+        // Verifica se o mapa foi explorado o suficiente
+        if (!this.mapFullyExplored && this.roomsExplored.size >= this.mapExploredThreshold) {
+          this.mapFullyExplored = true;
+          this.lastMapCheckTick = this.stepIndex;
+        }
+      }
       this.activeDoorKey = null;
       this.entryDoorKey = null;
       this.roomTicks = 0;
@@ -2384,8 +2527,22 @@ export class LocalVisionAgent {
       const hasHeavyAmmo = wram.supers > 0 || wram.missiles > 0;
       const needSelectAmmo = hasHeavyAmmo && wram.selectedHudItem === 0;
       const keys: AIKey[] = [moveKey];
-      if (needSelectAmmo) {
+
+      // SA-X é entidade especial: sempre usa míssil quando disponível
+      const shouldFireMissile = this.shouldUseMissile(
+        wram,
+        saxPursuer,
+        false,
+        false,
+        true, // entidade especial (SA-X)
+      );
+
+      if (shouldFireMissile && needSelectAmmo) {
         keys.push(selectKey);
+        this.registerMissileUse();
+      } else if (shouldFireMissile && this.nextShoot(true)) {
+        keys.push(shootKey);
+        this.registerMissileUse();
       } else if (this.nextShoot(true)) {
         keys.push(shootKey);
       }
@@ -2433,8 +2590,22 @@ export class LocalVisionAgent {
       const moveKey: AIKey = target.dist < 54 ? (faceDir === 'RIGHT' ? 'LEFT' : 'RIGHT') : faceDir;
       const keys: AIKey[] = [moveKey];
       if (target.y < wram.samusY - 18) keys.push('UP');
-      if (hasMissiles && wram.selectedHudItem === 0) {
+
+      // Core-X é entidade especial: sempre usa míssil quando disponível
+      const shouldFireMissile = this.shouldUseMissile(
+        wram,
+        target,
+        false,
+        false,
+        true, // entidade especial (Core-X)
+      );
+
+      if (shouldFireMissile && wram.selectedHudItem === 0) {
         keys.push(selectKey);
+        this.registerMissileUse();
+      } else if (shouldFireMissile && this.nextShoot(true)) {
+        keys.push(shootKey);
+        this.registerMissileUse();
       } else if (this.nextShoot(true)) {
         keys.push(shootKey);
       }
@@ -2464,13 +2635,27 @@ export class LocalVisionAgent {
       const hasMissiles = wram.missiles > 0 || wram.supers > 0;
       const keys: AIKey[] = [faceDir];
       if (target.y < wram.samusY - 16) keys.push('UP');
+
+      // Metroid é entidade especial: usa míssil para estilhaçar após congelar
+      const shouldFireMissile = this.shouldUseMissile(
+        wram,
+        target,
+        false,
+        false,
+        true, // entidade especial (Metroid)
+      );
+
       // Alterna feixe de gelo para congelar e míssil para estilhaçar
       const freezePhase = hasIce && this.stepIndex % 4 < 2;
       if (freezePhase) {
         if (wram.selectedHudItem !== 0) keys.push(cancelKey);
         else if (this.nextShoot(true)) keys.push(shootKey);
-      } else if (hasMissiles && wram.selectedHudItem === 0) {
+      } else if (shouldFireMissile && wram.selectedHudItem === 0) {
         keys.push(selectKey);
+        this.registerMissileUse();
+      } else if (shouldFireMissile && this.nextShoot(true)) {
+        keys.push(shootKey);
+        this.registerMissileUse();
       } else if (this.nextShoot(true)) {
         keys.push(shootKey);
       }
@@ -2504,13 +2689,25 @@ export class LocalVisionAgent {
     const keys: AIKey[] = [approachDir];
     if (target.y < wram.samusY - 18) keys.push('UP');
 
-    // Chefes: usa mísseis/supers sempre que disponível; inimigos comuns usam feixe normal
+    // Sistema inteligente de míssil: só usa míssil se for boss, porta bloqueada ou entidade especial
     const useHeavyForBoss = isBossEnemy && (wram.supers > 0 || wram.missiles > 0);
     const hasHeavyAmmo = wram.supers > 0 || wram.missiles > 0;
     const needSelectAmmo = hasHeavyAmmo && wram.selectedHudItem === 0;
 
-    if (useHeavyForBoss && needSelectAmmo) {
+    const shouldFireMissile = this.shouldUseMissile(
+      wram,
+      target,
+      isBossEnemy,
+      false, // não é porta no combate
+      false, // não é entidade especial no combate geral
+    );
+
+    if (shouldFireMissile && needSelectAmmo) {
       keys.push(selectKey);
+      this.registerMissileUse();
+    } else if (shouldFireMissile && this.nextShoot(true)) {
+      keys.push(shootKey);
+      this.registerMissileUse();
     } else if (this.nextShoot(true)) {
       keys.push(shootKey);
     }
@@ -2616,15 +2813,57 @@ export class LocalVisionAgent {
     wram: MetroidWramSnapshot,
     backtrackDir: 'LEFT' | 'RIGHT',
   ): AIAction {
-    const { shoot: shootKey, jump: jumpKey, run: dashKey } = wram.controls;
+    const { shoot: shootKey, jump: jumpKey, run: dashKey, cancel: cancelKey, select: selectKey } = wram.controls;
+    const loadout = this.getAgentLoadout(wram);
     this.moveDir = backtrackDir;
     const keys: AIKey[] = [backtrackDir, dashKey];
+
+    // Durante backtracking, cancela arma secundária se não for necessária
+    if (wram.selectedHudItem !== 0 && !loadout.hasSupers && !loadout.hasMissiles) {
+      keys.push(cancelKey);
+    }
+
+    // Se tem bomba e está em passagem baixa, usa morph ball
+    if (loadout.hasMorphBall && loadout.hasBombs && this.progressStallTicks >= 3) {
+      keys.push('DOWN');
+      if (this.nextShoot(true)) {
+        keys.push(shootKey);
+        this.registerMissileUse();
+      }
+      return this.makeMetroidAction(
+        'BACKTRACK',
+        keys,
+        140,
+        'run',
+        motionPct,
+        'Backtracking · Morph Ball',
+        `Retornando com Morph Ball (${backtrackDir === 'RIGHT' ? 'direita' : 'esquerda'})`,
+        wram,
+      );
+    }
+
     if (this.nextJump(this.progressStallTicks >= 4 || this.stepIndex % 9 === 0, 3)) {
       keys.push(jumpKey);
     }
-    if (this.nextShoot(this.progressStallTicks >= 3)) {
+
+    // Usa míssil só se for porta bloqueada durante backtracking
+    const shouldFireMissile = this.shouldUseMissile(
+      wram,
+      null,
+      false,
+      this.progressStallTicks >= 24, // porta bloqueada após stall
+      false,
+    );
+    if (shouldFireMissile && wram.selectedHudItem === 0) {
+      keys.push(selectKey);
+      this.registerMissileUse();
+    } else if (shouldFireMissile && this.nextShoot(this.progressStallTicks >= 3)) {
+      keys.push(shootKey);
+      this.registerMissileUse();
+    } else if (this.nextShoot(this.progressStallTicks >= 3)) {
       keys.push(shootKey);
     }
+
     return this.makeMetroidAction(
       'BACKTRACK',
       keys,
@@ -2632,7 +2871,7 @@ export class LocalVisionAgent {
       'run',
       motionPct,
       'Backtracking · Nova rota',
-      `Retornando pela rota (${backtrackDir === 'RIGHT' ? 'direita' : 'esquerda'}) com nova habilidade`,
+      `Retornando pela rota (${backtrackDir === 'RIGHT' ? 'direita' : 'esquerda'}) · Habilidades: ${loadout.totalAbilities}/16`,
       wram,
     );
   }
@@ -2910,23 +3149,41 @@ export class LocalVisionAgent {
       this.resolveBlockType(wram, samusBx + 1, samusBy - 2) === 0xa;
     const ceilingLow = isSolidHead(tileAbove1) || isSolidHead(tileAbove2) || spikeNearHead;
 
-    // Bloqueio detectado em Exploração: testa míssil (se tiver) e aciona Busca em 'U' antes de desistir
+    // Bloqueio detectado em Exploração: testa míssil de forma inteligente (apenas se vale a pena)
     if (this.progressStallTicks >= 5) {
       if (
         this.progressStallTicks >= 14 &&
         this.progressStallTicks <= 20 &&
-        this.missileProbeCount < 2 &&
-        (wram.missiles > 0 || wram.supers > 0)
+        this.missileProbeCount < 2
       ) {
-        if (wram.selectedHudItem === 0) {
-          return this.makeMetroidAction('EXPLORE', [this.moveDir, selectKey], 130, 'run', motionPct, 'Exploração · Testando Míssil', 'Selecionando míssil para verificar porta', wram);
+        // Determina se a porta está bloqueada e precisa de míssil
+        const targetDoor = pathStep ? wram.doors.find((d) => d.key === pathStep.goalKey) : null;
+        const isBlockedDoor = targetDoor ? targetDoor.blockedByWall : false;
+        const useMissile = this.shouldUseMissile(
+          wram,
+          null,
+          false, // não é boss na exploração
+          isBlockedDoor,
+          false, // não é entidade especial na exploração
+        );
+
+        if (useMissile) {
+          if (wram.selectedHudItem === 0) {
+            return this.makeMetroidAction('EXPLORE', [this.moveDir, selectKey], 130, 'run', motionPct, 'Exploração · Testando Míssil', 'Selecionando míssil para porta bloqueada', wram);
+          }
+          const keys: AIKey[] = [this.moveDir];
+          if (this.nextShoot(true)) {
+            keys.push(shootKey);
+            this.registerMissileUse();
+          }
+          return this.makeMetroidAction('EXPLORE', keys, 130, 'run', motionPct, 'Exploração · Disparando Míssil', 'Abrindo porta bloqueada com míssil', wram);
+        } else {
+          // Não usa míssil - marca porta como trancada e segue para busca em U ou inverte
+          if (this.activeDoorKey) {
+            const rd = currNode.doors.get(this.activeDoorKey);
+            if (rd) rd.locked = true;
+          }
         }
-        const keys: AIKey[] = [this.moveDir];
-        if (this.nextShoot(true)) {
-          keys.push(shootKey);
-          this.missileProbeCount++;
-        }
-        return this.makeMetroidAction('EXPLORE', keys, 130, 'run', motionPct, 'Exploração · Disparando Míssil', 'Testando abertura de porta com míssil', wram);
       }
 
       if (this.progressStallTicks >= 21 && this.progressStallTicks <= 23 && (wram.itemsMask & 0x0004) && isGrounded && !hasSpaceJump) {
