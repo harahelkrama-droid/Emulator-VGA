@@ -40,6 +40,12 @@ interface SimRoom {
   doors: SimDoor[];
   items: SimItem[];
   bossHp?: number;
+  /** lava pintada mas INOFENSIVA: é assim que se prova o falso-positivo de paleta (a IA tem
+   * que descobrir sozinha que aquele vermelho é cenário, não lago) */
+  lavaHarmless?: boolean;
+  /** Metroid que atravessa a sala — a IA tem que ESCOLTAR, não atirar nele */
+  /** `big` = Metroid Grande (o do evento de dreno); sem ele é o ômega/larva que atravessa */
+  metroid?: { x: number; y: number; vx: number; big?: boolean };
   /** linha (em blocos) onde a lava começa e a coluna onde ela existe à direita; `rgb`
    * permite pintar uma paleta que NENHUM tier do detector conhece — é assim que se testa a
    * autocorreção (a IA tem que descobrir o corte sozinha, depois de apanhar) */
@@ -116,6 +122,8 @@ class World {
   maxBombs = 0;
   health = 199;
   maxHealth = 199;
+  /** contagem regressiva do evento (a IA tem que treating o tempo como recurso) */
+  countdownActive = false;
   itemsMask = 0;
   beamsMask = 0;
   selectedHudItem = 0;
@@ -148,6 +156,7 @@ class World {
   inLava(sx: number, sy: number): boolean {
     const lava = this.room(this.cur).lava;
     if (!lava) return false;
+    if (this.room(this.cur).lavaHarmless) return false;
     return sy >= (lava.topRow - 1) * 16 && Math.floor(sx / 16) >= lava.fromBx;
   }
 
@@ -216,6 +225,20 @@ class World {
     for (const it of this.room(this.cur).items) rect(it.x - 6, it.y - 6, it.x + 6, it.y + 6, [220, 180, 60]);
     // chefe (corpo grande, só para o teste de "não interromper a luta")
     if ((this.room(this.cur).bossHp ?? 0) > 0) rect(170, 90, 214, 134, [200, 40, 60]);
+    // Metroid atravessando a sala: anel verde-neon com núcleo vermelho (a assinatura que o
+    // detector de entidade especial lê)
+    const met = this.room(this.cur).metroid;
+    if (met) {
+      const ax = met.big ? 24 : 18;
+      const ay = met.big ? 22 : 16;
+      for (let y = -ay; y <= ay; y++) {
+        for (let x = -ax; x <= ax; x++) {
+          const d = Math.hypot(x / ax, y / ay);
+          if (d > 1.05) continue;
+          put(Math.round(met.x) + x, Math.round(met.y) + y, d > 0.55 ? [70, 225, 96] : [222, 42, 58]);
+        }
+      }
+    }
     // Samus
     rect(this.sx - 6, this.sy - 14, this.sx + 6, this.sy + 2, [230, 90, 60]);
     return { base64Jpeg: '', width: W, height: H, rgba: rgba as unknown as Uint8ClampedArray, signature: `w-${this.tick}`, source: 'canvas.drawImage', fresh: true };
@@ -239,6 +262,11 @@ class World {
       };
     });
     const enemies: EnemyInfo[] = [];
+    const met = this.room(this.cur).metroid;
+    if (met) {
+      const rad = met.big ? 22 : 20;
+      enemies.push({ slot: 7, id: 0x2ae, x: Math.round(met.x), y: Math.round(met.y), xRadius: rad, yRadius: rad, hp: met.big ? 120 : 400, props: 0, extraProps: 0, aiHandler: 0x8000 });
+    }
     if ((room.bossHp ?? 0) > 0) {
       enemies.push({ slot: 0, id: 0x1234, x: 192, y: 112, xRadius: 22, yRadius: 22, hp: room.bossHp as number, props: 0, extraProps: 0, aiHandler: 0x8000 });
     }
@@ -286,7 +314,7 @@ class World {
       enemies,
       ignoredBackgroundEnemies: 0,
       timerStatus: 0,
-      countdownActive: false,
+      countdownActive: this.countdownActive,
       countdownSeconds: 0,
       roomItems: room.items.map((it) => ({ plmId: it.kind === 'TANK' ? 0xeee2 : 0xeee0, x: it.x, y: it.y })),
       plms: [],
@@ -325,6 +353,13 @@ class World {
       this.sy = fy;
       this.vy = 0;
     }
+    // o Metroid segue o roteiro dele: atravessa a sala e sai pelo batente
+    const metRoom = this.room(this.cur).metroid;
+    if (metRoom) {
+      metRoom.x += metRoom.vx;
+      if (metRoom.x < -30 || metRoom.x > W + 30) this.room(this.cur).metroid = undefined;
+    }
+
     // pisar na lava dói (e é isto que o agente tem que evitar); com Gravity Suit é só um
     // esquentado — o mesmo contrato do jogo real
     if (this.inLava(this.sx, this.sy + 6)) {
@@ -413,14 +448,18 @@ interface Run {
   actions: AIAction[];
 }
 
-function run(world: World, ticks: number, log: (t: number, a: AIAction) => void = () => {}): Run {
+function run(
+  world: World,
+  ticks: number,
+  log: (t: number, a: AIAction, agent: LocalVisionAgent) => void = () => {},
+): Run {
   const agent = new LocalVisionAgent();
   agent.menuArmAfterTicks = 0; // nestes cenários o portão de 3 min não é o objeto do teste
   const actions: AIAction[] = [];
   for (let t = 0; t < ticks; t++) {
     const action = agent.decide(world.frame(), 'action', 'Difícil', world.wram());
     actions.push(action);
-    log(t, action);
+    log(t, action, agent);
     world.apply(action);
   }
   return { agent, world, actions };
@@ -693,6 +732,107 @@ section('J. Lava de paleta DESCONHECIDA: a IA descobre o corte sozinha e para de
   check('não ficou andando para dentro: terminou fora da lava', w.sx < 8 * 16, `x=${Math.round(w.sx)}`);
   check('a revisão classificou a correção', rec?.status === 'ACTIVE' || rec?.status === 'HELPED', rec?.status);
   console.log(`    \x1b[2m↳ ${rec?.diagnosis}\n      ↳ ${rec?.action}\x1b[0m`);
+}
+
+/* ========== K0. Metroid Grande: dreno só no prólogo; depois do resgate, seguir em frente */
+section('K0. Evento do Metroid Grande: deixar drenar e NÃO ficar esperando depois');
+{
+  // (1) prólogo: o dreno é o roteiro — ela tem que IR para o contato, não fugir;
+  // (2) passado o resgate, o bicho é boletim: o que vale é a próxima coisa da lista.
+  const mk = () => {
+    const w = new World();
+    w.health = 60;
+    w.maxHealth = 99;
+    w.countdownActive = true;
+    const room = w.room(0x10);
+    room.floorY = 144;
+    room.metroid = { x: 200, y: 128, vx: 0, big: true };
+    w.sx = 110;
+    w.sy = 144;
+    return w;
+  };
+
+  const prologue = mk();
+  prologue.room(0x10).items.push({ x: 240, y: 138, kind: 'MISSILE' });
+  const r1 = run(prologue, 120);
+  const closedIn = Math.abs((prologue.room(0x10).metroid?.x ?? 0) - prologue.sx);
+  check('no prólogo ela NÃO foge do Metroid Grande', !r1.actions.some((a) => (a.reason ?? '').includes('fugir')), 'sem fuga');
+  check('ela fecha para o contato (o dreno é por toque)', closedIn < 110, `distância=${Math.round(closedIn)}`);
+  check(
+    'o motivo diz que ela está SEGUINDO o bicho (e não atirando nele)',
+    r1.actions.some((a) => /dreno|escolt|acompanh/i.test(`${a.reason ?? ''} ${a.sceneLabel ?? ''}`)),
+    r1.actions[r1.actions.length - 1]?.sceneLabel,
+  );
+  check(
+    'sem bala gasta no Metroid (ele não morre sem gelo)',
+    !r1.actions.some((a) => (a.keys ?? []).some((k) => k === 'X') || a.key === 'X'),
+  );
+
+  const after = mk();
+  // já saiu do estado "prólogo" (tem o lançador de mísseis): o bicho deixa de ser o ROTEIRO
+  // e passa a ser só um dado do quadro — o que vale é o item parado na sala
+  after.itemsMask = 0x0001;
+  after.room(0x10).items.push({ x: 60, y: 138, kind: 'MISSILE' });
+  // t=4: o resgate do prólogo aconteceu (o codex marca o heal); o que vem depois é o teste
+  const r2 = run(after, 300, (t, _a, agent) => {
+    if (t === 4) (agent as unknown as { bigMetroidHealedTick: number }).bigMetroidHealedTick = 4;
+  });
+  const idle = r2.actions.filter((a) => !ks(a).some((k) => k === 'LEFT' || k === 'RIGHT' || k === 'UP' || k === 'DOWN')).length;
+  check('depois do resgate ela não fica parada ao lado do bicho', idle < r2.actions.length * 0.35, `${idle}/${r2.actions.length} ticks parado`);
+  check('volta a buscar o item da sala (tempo é recurso)', after.room(0x10).items.length === 0, `itens=${after.room(0x10).items.length}`);
+}
+
+/* ============ K. falso-positivo de paleta: vermelho de cenário não é lago ============ */
+section('K. "Lava" que não machuca: ela descobre pisando e para de vetar o chão');
+{
+  // A paleta do print do usuário enganou o detector numa sala SEM lava (estrutura carmim
+  // idêntica à do poço). Se o veto não puder ser desmentido, a IA fica parada na beira para
+  // sempre — é o "está confusa, não consegue avançar". Aqui o chão é pintado como lava mas
+  // não causa dano: a prova negativa tem que derrubar o veto.
+  const w = new World();
+  const room = w.room(0x10);
+  room.floorY = 144;
+  room.lava = { topRow: 9, fromBx: 6 };
+  room.lavaHarmless = true;
+  room.items.push({ x: 214, y: 138, kind: 'MISSILE' });
+  // ela COMEÇA em cima do "lago": é assim que o chão do print aparece — vermelhíssimo sob os
+  // próprios pés, com o veto ligado
+  w.sx = 140;
+  w.sy = 144;
+  const { actions } = run(w, 520);
+  const first = nav(actions[0]!);
+  const last = nav(actions[actions.length - 1]!);
+  check('no começo o detector vê o "lago" (é o engano real)', first?.floorHazard === 'LAVA', `hazard=${first?.floorHazard}`);
+  check('o veto chegou a travar o caminho (lava citada nas ações)', actions.some((a) => /lava/i.test(a.reason ?? '')));
+  check('pisar sem dano derruba o veto da sala', last?.floorHazard === 'NONE', `hazard=${last?.floorHazard}`);
+  check('e ela pega o item do outro lado', w.room(0x10).items.length === 0, `itens=${w.room(0x10).items.length}`);
+  const rec = last?.corrections?.find((c) => c.kind === 'HAZARD_FALSE_POSITIVE');
+  check('o caderno registra o falso-positivo como erro MEU', Boolean(rec), JSON.stringify(last?.corrections?.map((c) => c.kind) ?? []));
+  const atVetoOff = actions.findIndex((a) => a.snapshot?.mapExploration?.floorHazard === 'NONE');
+  check('e isso acontece cedo (segundos, não um minuto parado)', atVetoOff > 0 && atVetoOff < 300, `tick=${atVetoOff}`);
+}
+
+/* ============ L. Metroid atravessando a sala: escoltar, não atirar ============ */
+section('L. Metroid na sala: seguir o bicho até a saída em vez de gastar a run');
+{
+  // O relato: "fica muito tempo ali acabando perdendo o tempo por bobagem em vez de seguir o
+  // ômega metroid". O Metroid atravessa a sala para a direita, pela porta aberta; a IA tem que
+  // IR ATRÁS dele, sem atirar (matar Metroid exige Ice Beam + míssil, e ela não tem aqui).
+  const w = new World();
+  const room = w.room(0x10);
+  room.floorY = 144;
+  room.metroid = { x: 150, y: 120, vx: 0.8 };
+  room.doors.push({ side: 'RIGHT', to: 0x21, color: 'PINK', closed: false });
+  const missilesBefore = w.missiles;
+  const { actions } = run(w, 460);
+  const escorting = actions.filter((a) => /scolt/i.test(a.reason ?? ''));
+  check('reconheceu o Metroid e entrou em modo de escolta', escorting.length > 20, `${escorting.length} ticks`);
+  check('o motivo diz para seguir, não para atirar', escorting.some((a) => /sa\u00edda|escolt/i.test(a.reason ?? '')));
+  check('atravessou a porta atrás dele', w.cur === 0x21, `sala=0x${w.cur.toString(16)}`);
+  check('sem gastar munição no bicho', w.missiles === missilesBefore, `${missilesBefore}→${w.missiles}`);
+  check('e sem tiroteio de mob no caminho', !actions.some((a) => /atirando para cima/i.test(a.reason ?? '')));
+  const leftAt = actions.findIndex((a) => a.snapshot?.sceneLabel?.includes('Escoltando'));
+  check('não ficou parado esperando: começou a andar na hora', leftAt >= 0 && leftAt < 30, `tick=${leftAt}`);
 }
 
 console.log(

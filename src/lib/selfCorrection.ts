@@ -40,7 +40,9 @@ export type FaultKind =
   /** empurro o mesmo ponto sem me mover */
   | 'POSITION_STALL'
   /** morri / perdi itens (reset de energia) */
-  | 'RESPAWN';
+  | 'RESPAWN'
+  /** EU chamei de perigo e pisei sem tomar dano: o detector deu falso-positivo */
+  | 'HAZARD_FALSE_POSITIVE';
 
 export interface FaultEvidence {
   kind: FaultKind;
@@ -100,6 +102,8 @@ export interface CorrectionEffect {
   doorOverride?: { doorKey: string; color: DoorColor };
   /** raio de amostragem da cor da porta (encolhe para fugir de pulga/lava no batente) */
   doorSampleRadius?: number;
+  /** veto de chão hostil DESLIGADO para a sala (falso-positivo provado) */
+  vetoRoomOff?: number;
   /** célula a tratar como inquebrável / a adicionar às perigosas */
   unbreakable?: string;
   dangerCells?: string[];
@@ -272,6 +276,12 @@ export class SelfCorrectionLedger {
             `${this.doorSampleRadius_} → ${Math.max(3, this.doorSampleRadius_ - 1)} (menos contaminação de pulga/lava)`,
         );
       }
+      case 'HAZARD_FALSE_POSITIVE':
+        return base(
+          'HAZARD_FALSE_POSITIVE',
+          `chamei de lava o chão desta sala e pisei nele sem tomar NENHUM dano`,
+          `sala ${e.roomId}: desligo o veto de chão hostil — a paleta vermelha do cenário não é lago`,
+        );
       case 'AMMO_WASTED':
         return base(
           'AMMO_WASTED',
@@ -330,6 +340,11 @@ export class SelfCorrectionLedger {
           rec.doorSampleRadius = this.doorSampleRadius_;
           eff.doorSampleRadius = this.doorSampleRadius_;
         }
+        break;
+      }
+      case 'HAZARD_FALSE_POSITIVE': {
+        // o efeito é tirar o veto da sala inteira (e não somar perigo, como nas outras)
+        eff.vetoRoomOff = e.roomId;
         break;
       }
       case 'AMMO_WASTED': {

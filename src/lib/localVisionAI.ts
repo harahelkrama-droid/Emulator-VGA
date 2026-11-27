@@ -43,6 +43,13 @@ import {
   type NavTarget,
   type DoorColor, type CompletionTotals, XFUSION_TOTALS, COMPLETION_TOTALS,} from './mapStrategy';
 import {
+  decideEscort,
+  ESCORT_MEMORY_TICKS,
+  metroidKillReady,
+  type EscortDoor,
+  type EscortEntity,
+} from './metroidEscort';
+import {
   SelfCorrectionLedger,
   type CorrectionEffect,
   type FaultKind,
@@ -433,6 +440,24 @@ export class LocalVisionAgent {
   private selfFix = new SelfCorrectionLedger();
   /** tiros dados em cada porta sem a porta mudar de estado (3 = minha premissa estava errada) */
   private doorShotTally = new Map<string, number>();
+  /**
+   * Testemunha de chão: célula a célula, quantos ticks ela ficou marcada como lava enquanto a
+   * Samus estava em cima SEM tomar dano. Chega a 10 → aquilo não é lava (a paleta vermelha do
+   * cenário do hack engana o detector, e foi isso que a travou na sala do print). Prova negativa
+   * vale tanto quanto a positiva: um detector que só sabe dizer "sim" vira superstição.
+   */
+  private lavaWitness = new Map<string, number>();
+  /** vida no último tick, para a testemunha ver o dano que AINDA VAI SER ROTULADO neste tick */
+  private lavaWitnessHealth = -1;
+  private lavaProvenSafe = new Set<string>();
+  /** salas onde o veto de chão hostil foi desligado por falso-positivo provado */
+  private lavaVetoOff = new Set<number>();
+  // memória da escolta de Metroid (o bicho é o roteiro: seguir, não atirar)
+  private metroidSeenTick = -9999;
+  private metroidSeenRoomId = -1;
+  private metroidPrevX = 0;
+  private metroidExitDir: 'LEFT' | 'RIGHT' | null = null;
+  private escortIgnoreMobsUntil = -1;
   private lastFaultTick = new Map<string, number>();
   private lavaLake: MoltenLake | null = null;
   private lavaLakeRoomId = -1;
@@ -444,6 +469,16 @@ export class LocalVisionAgent {
   private lavaTopRow = -1;
   private lastNewRoomTick = 0;
   private lastNavProgressTick = 0;
+  /**
+   * Sonda deliberada do "lago". O veto por cor é a proteção certa contra lava de verdade, mas
+   * tem um ângulo cego: se o vermelho for cenário, NADA a faz pisar ali para descobrir, e ela
+   * passa o countdown dançando na beira (foi o que o print mostrou). Depois de um tempo preso
+   * sem progresso, o medo é suspenso por alguns ticks de PROPÓSITO: atravessar e medir. Errar
+   * custa alguns pontos de vida; não arriscar custa a run.
+   */
+  private lavaProbeUntil = -1;
+  private lavaProbeLockUntil = -1;
+  private lavaProbeFails = 0;
   private navLost: LostVerdict = { lost: false, cause: null, severity: 0, note: 'navegação ainda não avaliada' };
   private navBacklog: NavBacklogEntry[] = [];
   private navTarget: NavTarget | null = null;
@@ -1214,8 +1249,17 @@ export class LocalVisionAgent {
     this.lavaLakeTick = this.stepIndex;
     this.lavaCamX = wram.cameraX;
     this.lavaCamY = wram.cameraY;
-    if (roomChanged) this.lavaEdgeCommitRoom = -1;
-    const lake = senseMoltenLake(rgba, frame.width, frame.height, this.selfFix.lavaCalib);
+    if (roomChanged) {
+      this.lavaEdgeCommitRoom = -1;
+      this.lavaProbeUntil = -1; // sala nova: a sonda da anterior não contamina
+    }
+    let lake = senseMoltenLake(rgba, frame.width, frame.height, this.selfFix.lavaCalib);
+    if (lake && this.lavaVetoOff.has(wram.roomId)) {
+      // falso-positivo já provado nesta sala: segue sem veto (o ledger decidiu com prova, não por gosto)
+      lake = null;
+    } else if (lake) {
+      lake = this.pruneProvenSafeCells(wram, lake);
+    }
     this.lavaLake = lake;
     this.lavaTopRow = lake ? lakeTopBlock(lake, wram.cameraY) : -1;
     if (lake && roomChanged) {
@@ -1414,6 +1458,83 @@ export class LocalVisionAgent {
     }
   }
 
+  /**
+   * Registra o contraste entre "o detector chamou de lava" e "estou dentro disso e estou
+   * inteira". Dano zera a testemunha da célula (ela É lava); 10 ticks seguidos sem dano dentro
+   * da região marcada provam o contrário. Não precisa estar no chão: numa lava de verdade o
+   * dano vem em qualquer tick de sobreposição, e em cima do lago (ar livre) a célula nem está
+   * marcada, então "no ar sobre o lago" não gera prova falsa.
+   */
+  private noteLavaWitness(wram: MetroidWramSnapshot, lake: MoltenLake): void {
+    // O dano é rotulado MAIS ABAIXO no mesmo tick (this.samusDamagedThisTick ainda está false
+    // aqui). Sem ler a vida eu apagaria um lago VERDADEIRO: a prova "não doeu" só vale se o
+    // HP é o mesmo do tick anterior.
+    const hurt = this.lavaWitnessHealth >= 0 && wram.health < this.lavaWitnessHealth;
+    this.lavaWitnessHealth = wram.health;
+    const cx = Math.floor((wram.samusX - wram.cameraX) / MOLTEN_CELL);
+    const cy = Math.floor((wram.samusY + 6 - wram.cameraY) / MOLTEN_CELL);
+    for (let dc = -1; dc <= 1; dc++) {
+      const cc = cx + dc;
+      if (cc < 0 || cc >= MOLTEN_COLS || cy < 0 || cy >= MOLTEN_ROWS) continue;
+      const cellKey = `${wram.roomId}:${cy}:${cc}`;
+      if (lake.mask[cy * MOLTEN_COLS + cc] !== 1) continue;
+      if (this.lavaProvenSafe.has(cellKey)) continue;
+      if (hurt) {
+        // doeu exatamente onde o detector marcou: o detector estava CERTO. Zero a testemunha e
+        // deixo o veto (e a penalidade, que quem calibra é o selfCorrection).
+        this.lavaWitness.delete(cellKey);
+        this.lavaProvenSafe.delete(cellKey);
+        continue;
+      }
+      const n = (this.lavaWitness.get(cellKey) ?? 0) + 1;
+      this.lavaWitness.set(cellKey, n);
+      if (n >= 10) {
+        this.lavaProvenSafe.add(cellKey);
+        this.lavaWitness.delete(cellKey);
+      }
+    }
+  }
+
+  /** Tira do lago o que já foi provado firme; se sobrar pouco, não é lago nenhum. */
+  private pruneProvenSafeCells(wram: MetroidWramSnapshot, lake: MoltenLake): MoltenLake | null {
+    if (this.lavaProvenSafe.size === 0) return lake;
+    // Quatro células firmes do mesmo tom numa sala já respondem a pergunta inteira: o vermelho
+    // dali é cenário. Sem este limiar a testemunha só esvaziaria o chão ATRÁS dela e a IA
+    // seguiria travada na próxima célula marcada — o que é exatamente a sala do print.
+    const prefix = `${wram.roomId}:`;
+    let proven = 0;
+    for (const k of this.lavaProvenSafe) if (k.startsWith(prefix)) proven++;
+    if (proven >= 4) {
+      this.recordFalsePositive(wram, lake, proven);
+      return null;
+    }
+    let kept = 0;
+    const mask = new Uint8Array(lake.mask.length);
+    for (let r = 0; r < MOLTEN_ROWS; r++) {
+      for (let c = 0; c < MOLTEN_COLS; c++) {
+        const on = lake.mask[r * MOLTEN_COLS + c] === 1 && !this.lavaProvenSafe.has(`${wram.roomId}:${r}:${c}`);
+        mask[r * MOLTEN_COLS + c] = on ? 1 : 0;
+        if (on) kept++;
+      }
+    }
+    if (kept >= Math.max(6, Math.floor(lake.cells * 0.55))) return { ...lake, mask, cells: kept };
+    this.recordFalsePositive(wram, lake, lake.cells - kept);
+    return null;
+  }
+
+  /** O "lago" era o cenário: erro MEU, registrado no caderno com a correção que o resolve. */
+  private recordFalsePositive(wram: MetroidWramSnapshot, lake: MoltenLake, provenCells: number): void {
+    if (!this.faultCooldownOk('HAZARD_FALSE_POSITIVE', `sala ${wram.roomId}`, this.stepIndex)) return;
+    this.applyCorrection(
+      this.selfFix.observe({
+        kind: 'HAZARD_FALSE_POSITIVE',
+        tick: this.stepIndex,
+        roomId: wram.roomId,
+        attempts: provenCells,
+      }),
+    );
+  }
+
   /** Versão barata de "dá para ficar de pé aqui" para o guard de lava. */
   private isCellStandableProbe(wram: MetroidWramSnapshot, bx: number, by: number): boolean {
     const t = this.resolveBlockType(wram, bx, by);
@@ -1454,12 +1575,23 @@ export class LocalVisionAgent {
     return true;
   }
 
+  /** A escolta está no comando? Enquanto for, mob no caminho não é combate: é atraso. */
+  private get escortActive(): boolean {
+    return this.stepIndex < this.escortIgnoreMobsUntil;
+  }
+
   /** Única ponte entre o diagnóstico e o controle: aplica no agente o que o ledger decidiu. */
   private applyCorrection(eff: CorrectionEffect | null | undefined): void {
     if (!eff) return;
     if (eff.unbreakable) this.unbreakableGates.add(eff.unbreakable);
     if (eff.dangerCells) for (const c of eff.dangerCells) this.dangerCells.add(c);
     if (eff.doorOverride) this.navDoorColors.set(eff.doorOverride.doorKey, eff.doorOverride.color);
+    if (typeof eff.vetoRoomOff === 'number') {
+      // o veto sai da sala inteira e as testemunhas são zeradas (o detector pode voltar a valer
+      // se um dia o chão ali MACHUCAR de verdade — a prova positiva tem precedência)
+      this.lavaVetoOff.add(eff.vetoRoomOff);
+      for (const k of [...this.lavaWitness.keys()]) if (k.startsWith(`${eff.vetoRoomOff}:`)) this.lavaWitness.delete(k);
+    }
     if (eff.rescanNow) {
       // a calibração nova só vale se o frame for relido AGORA: esperar o throttle de
       // amostragem custaria mais um passo dentro da lava
@@ -1602,6 +1734,9 @@ export class LocalVisionAgent {
 
   /** Esta célula da sala é lava? (amostra o centro e as bordas da célula de 16px) */
   private isLavaCell(wram: MetroidWramSnapshot, bx: number, by: number): boolean {
+    // durante a sonda a célula marcada vira chão normal para o pathfinding (o detector continua
+    // lendo o frame, então a prova negativa pode ser coletada em cima dela)
+    if (this.stepIndex < this.lavaProbeUntil) return false;
     const lake = this.lavaLake;
     if (!lake) return false;
     if (bx < 0 || by < 0 || bx >= wram.roomWidthBlocks || by >= wram.roomHeightBlocks) return false;
@@ -1758,6 +1893,20 @@ export class LocalVisionAgent {
 
     // (a2) lava no chão: o que decide "não andar para frente" e "subir em vez de atravessar"
     this.senseLavaFloor(wram);
+    // e a testemunha roda TODO tick (não no throttle do frame): é o contraditório do detector —
+    // célula marcada como lava em que ela está em cima sem tomar dano
+    if (this.lavaLake) this.noteLavaWitness(wram, this.lavaLake);
+    // (a3) presa pelo veto sem progresso = hora de testar o chão, não de esperar mais
+    if (
+      this.lavaLake &&
+      !this.lavaSafe &&
+      this.stepIndex - this.lastNavProgressTick > 90 &&
+      this.stepIndex >= this.lavaProbeUntil &&
+      this.stepIndex >= this.lavaProbeLockUntil &&
+      this.lavaProbeFails < 2
+    ) {
+      this.lavaProbeUntil = this.stepIndex + 150;
+    }
 
     // (b) itens: conta atual vale até sair da sala; o máximo já visto evita "sumir item" falso
     const itemsNow = wram.roomItems.length;
@@ -2581,7 +2730,7 @@ export class LocalVisionAgent {
             checklistSummary: describeChecklistForUi(this.navChecklist),
             navSummary: describeNavForUi(this.navTarget, this.navBacklog, this.mapReading),
             preferredDirection: this.preferredDirection,
-            floorHazard: this.lavaLake ? 'LAVA' : 'NONE',
+            floorHazard: this.lavaLake ? (this.stepIndex < this.lavaProbeUntil ? 'LAVA_PROBE' : 'LAVA') : 'NONE',
             completionProfile: this.completionProfile,
             lavaTopRow: this.lavaTopRow,
             lavaCalib: { ...this.selfFix.lavaCalib },
@@ -2893,6 +3042,12 @@ export class LocalVisionAgent {
       if (deltaHp >= 6) {
         samusDamagedThisTick = true;
         damageDelta = deltaHp;
+        // doeu DURANTE a sonda: era lava de verdade. Volta o veto e não insiste toda hora
+        if (this.stepIndex < this.lavaProbeUntil) {
+          this.lavaProbeFails++;
+          this.lavaProbeUntil = -1;
+          this.lavaProbeLockUntil = this.stepIndex + 900;
+        }
       }
       if (deltaHp >= 25) {
         this.recentDamageSpikeTick = this.stepIndex;
@@ -4457,23 +4612,139 @@ export class LocalVisionAgent {
     const backtrackDir = this.findBfsStepTowardPending(wram.roomId);
 
     // 2) Máquina de Estados de Comportamento (com prioridades especiais X-Fusion)
-    if (bigMetroid && this.bigMetroidHealedTick < 0) {
-      // Imagem 9: deixar o Metroid Grande drenar vida/habilidades sem fugir da sala (mesmo com SA-X presente)
-      this.bigMetroidDrainSeen = true;
-      this.resetUSearch();
-      this.planBossFor(wram, bigMetroid, null);
-      const approachDir: AIKey = bigMetroid.x >= wram.samusX ? 'RIGHT' : 'LEFT';
-      const keys: AIKey[] = bigMetroid.dist > 44 ? [approachDir] : ['NONE'];
-      return this.makeMetroidAction(
-        'COLLECT',
-        keys,
-        140,
-        'run',
-        motionPct,
-        'Metroid Grande · Evento de Dreno',
-        'Permitindo o dreno do Metroid Grande para ativar o resgate contra SA-X',
-        wram,
-      );
+    //
+    // 2a) ESCOLTA DE METROID — no Super Metroid (e no X-Fusion) o Metroid Grande/Ômega não é
+    // um inimigo a matar nem um evento a esperar: ele é o ROTEIRO, é ele que abre o caminho.
+    // O frame real do usuário (sala azul, TIME 00'50"94) mostrou os dois modos de errar:
+    // atirar num bicho que não morre sem Ice Beam, e ficar PARADA esperando um dreno que só
+    // existe no prólogo. Aqui a regra é uma só: fica na zona dele, segue por onde ele sai,
+    // e não para para brigar com mob no caminho.
+    {
+      const met = bigMetroid && this.bigMetroidHealedTick < 0 ? bigMetroid : omegaIntro ?? metroidLarva;
+      const escortEntity: EscortEntity | null = met
+        ? {
+            x: met.x,
+            y: met.y,
+            vx: met.x - this.metroidPrevX,
+            vy: 0,
+            hp: met.hp,
+            kind: met === omegaIntro ? 'OMEGA' : met === bigMetroid ? 'BIG' : 'LARVA',
+          }
+        : null;
+      if (escortEntity) {
+        this.metroidSeenTick = this.stepIndex;
+        this.metroidSeenRoomId = wram.roomId;
+        this.metroidPrevX = escortEntity.x;
+        if (escortEntity.x < 40) this.metroidExitDir = 'LEFT';
+        else if (escortEntity.x > wram.roomWidthPx - 40) this.metroidExitDir = 'RIGHT';
+      } else if (this.stepIndex - this.metroidSeenTick >= ESCORT_MEMORY_TICKS) {
+        this.metroidExitDir = null;
+      }
+      // memória de escolta não pode arrastar a Samus pelo mapa afora: ela vale na sala do bicho
+      // e por mais ~90 ticks (o tempo de cruzar a porta atrás dele); depois disso é história
+      const escortMemoryOk =
+        this.metroidSeenRoomId === wram.roomId || this.stepIndex - this.metroidSeenTick < 90;
+      const escortDoors: EscortDoor[] = wram.doors.map((d) => ({
+        key: d.key,
+        side: d.side,
+        x: d.x,
+        y: d.y,
+        open: !d.blockedByWall,
+      }));
+      if (escortEntity || (this.stepIndex - this.metroidSeenTick < ESCORT_MEMORY_TICKS && escortMemoryOk)) {
+        const escort = decideEscort({
+          samusX: wram.samusX,
+          samusY: wram.samusY,
+          entity: escortEntity,
+          ticksSinceSeen: escortEntity ? 0 : this.stepIndex - this.metroidSeenTick,
+          lastExitDir: this.metroidExitDir,
+          doors: escortDoors,
+          // Metroid só morre congelado: sem Ice Beam + míssil, atirar nele é perder a run
+          canKill: metroidKillReady(wram.beamsMask, wram.missiles),
+          // o dreno "resolve" alguma coisa apenas no prólogo, onde a SA-X vem e o resgate existe
+          drainResolvesRescue:
+            wram.maxHealth <= 199 &&
+            (wram.itemsMask & 0x0021) === 0 &&
+            (wram.countdownActive || saxPursuer !== null) &&
+            this.bigMetroidHealedTick < 0,
+          roomHasPendingBusiness: Boolean(activeItem) || bossEngaged || Boolean(coreXTarget),
+          ticksSinceProgress: this.stepIndex - this.lastNavProgressTick,
+          roomWidthPx: wram.roomWidthPx,
+        });
+        if (escort.action === 'HOLD' && bigMetroid) {
+          // Imagem 9 (ramo original, agora dentro da escolta): deixar o Metroid Grande drenar
+          // vida/habilidades sem fugir da sala, mesmo com a SA-X presente. "HOLD" NÃO é parar —
+          // o dreno só existe por CONTATO, então é chegar nele e ficar (parar aqui é exatamente
+          // o "fica ali paradinha e perde o tempo" do print).
+          this.bigMetroidDrainSeen = true;
+          this.resetUSearch();
+          this.planBossFor(wram, bigMetroid, null);
+          const approachDir: AIKey = bigMetroid.x >= wram.samusX ? 'RIGHT' : 'LEFT';
+          const drainKeys: AIKey[] = bigMetroid.dist > 44 ? [approachDir] : ['NONE'];
+          return this.makeMetroidAction(
+            'COLLECT',
+            drainKeys,
+            140,
+            'run',
+            motionPct,
+            'Metroid Grande · Evento de Dreno',
+            'Permitindo o dreno do Metroid Grande para ativar o resgate contra SA-X',
+            wram,
+          );
+        }
+        // "já estou na zona dele" NÃO é um plano: ficar ali parado vendo o bicho é exatamente
+        // o que come o countdown. Ela avança para a saída na direção do bicho (e o ramo normal
+        // continua valendo para item/pulta, que é progresso de verdade).
+        if (!escort.dir && !escort.vertical && escort.action === 'FOLLOW') {
+          this.escortIgnoreMobsUntil = this.stepIndex + 40;
+          const heading = escortEntity && Math.abs(escortEntity.vx) > 0.2
+            ? (escortEntity.vx > 0 ? 'RIGHT' : 'LEFT')
+            : null;
+          const exit = wram.doors.find(
+            (d) => !d.blockedByWall && (heading === null || (heading === 'RIGHT' ? d.x > wram.samusX + 8 : d.x < wram.samusX - 8)),
+          );
+          if (exit && !activeItem) {
+            const dir: AIKey = exit.x >= wram.samusX ? 'RIGHT' : 'LEFT';
+            this.moveDir = dir;
+            this.resetUSearch();
+            return this.makeMetroidAction(
+              'COLLECT',
+              [dir, wram.controls.run],
+              128,
+              'run',
+              motionPct,
+              'Escoltando o Metroid · até a saída',
+              `Metroid na zona dele; avançando para a saída ${exit.side} em vez de esperar`,
+              wram,
+            );
+          }
+        }
+        if ((escort.action === 'FOLLOW' || escort.action === 'CHASE_DOOR') && (escort.dir || escort.vertical)) {
+          this.escortIgnoreMobsUntil = this.stepIndex + 120;
+          this.resetUSearch();
+          const { run: dashKey, jump: jumpKey } = wram.controls;
+          const keys: AIKey[] = [];
+          if (escort.dir) {
+            keys.push(escort.dir, dashKey);
+            this.moveDir = escort.dir === 'LEFT' ? 'LEFT' : 'RIGHT';
+          }
+          if (escort.vertical === 'UP' && this.nextJump(true, 3)) keys.push(jumpKey);
+          if (escort.vertical === 'DOWN' && !this.isSamusGrounded(wram)) keys.push('DOWN');
+          if (keys.length === 0) keys.push('NONE');
+          return this.makeMetroidAction(
+            'COLLECT',
+            keys,
+            130,
+            'run',
+            motionPct,
+            escort.action === 'CHASE_DOOR'
+              ? 'Escoltando o Metroid · atrás da saída'
+              : 'Escoltando o Metroid (não atirar)',
+            escort.reason,
+            wram,
+          );
+        }
+      }
     }
 
     if (coreXTarget && coreXTarget.stage === 'PODER_EXPOSTO') {
@@ -4506,7 +4777,9 @@ export class LocalVisionAgent {
     }
 
     if (omegaIntro) {
-      // Imagem 1: acompanhar o ritmo do Omega Metroid inicial até o timer disparar e ele sumir
+      // Imagem 1: acompanhar o ritmo do Omega Metroid inicial até o timer disparar e ele sumir.
+      // Fallback: só chega aqui quando a ESCOLTA decidiu BRIGAR (Ice Beam + míssil na mão) ou
+      // quando não há escolta ativa — sem isso, atirar no bicho é o modo padrão de perder a run.
       this.resetUSearch();
       const { shoot: shootKey, jump: jumpKey, run: dashKey } = wram.controls;
       const aimDir: 'LEFT' | 'RIGHT' = omegaIntro.x >= wram.samusX ? 'RIGHT' : 'LEFT';
@@ -4514,7 +4787,10 @@ export class LocalVisionAgent {
         omegaIntro.dist < 68 ? (aimDir === 'RIGHT' ? 'LEFT' : 'RIGHT') : aimDir;
       this.moveDir = paceDir;
       const keys: AIKey[] = [paceDir, dashKey];
-      if (this.nextShoot(true)) keys.push(shootKey);
+      // Atirar no ômega sem gelo+míssil não faz NADA com ele e custa o tempo da corrida: só
+      // dispara quem tem como matar (a mesma regra que a escolta usa — uma fonte de verdade).
+      const canFight = metroidKillReady(wram.beamsMask, wram.missiles);
+      if (canFight && this.nextShoot(true)) keys.push(shootKey);
       if (this.nextJump(omegaIntro.dist < 85 || this.stepIndex % 7 === 0, 3)) keys.push(jumpKey);
       return this.makeMetroidAction(
         'COMBAT',
@@ -4615,6 +4891,9 @@ export class LocalVisionAgent {
       resolvedMode = 'BACKTRACK';
     } else if (
       (metroidLarva || nearbyEnemy) &&
+      // na escolta de Metroid, mob no caminho é atraso — os ~20 s atirando num bicho que não
+      // morre sem Ice Beam foram exatamente o que o usuário chamou de "perder tempo por bobagem"
+      !this.escortActive &&
       (bossEngaged || (!this.uSearch.active && this.progressStallTicks < 12)) &&
       !this.omegaVanishedDuringTimer &&
       (!isEscapeCountdown || Boolean(nearbyEnemy && nearbyEnemy.hp >= 450))
