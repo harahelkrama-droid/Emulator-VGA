@@ -675,7 +675,7 @@ export async function readMetroidWram(): Promise<MetroidWramSnapshot | null> {
             if (adjT === 0xc || adjT === 0xd || adjT === 0xf) capCount++;
           }
           const hasCapPlm = plms.some(
-            (p) => Math.abs(p.bx - shape.midBx) <= 2 && Math.abs(p.by - shape.midBy) <= 3 && (p.id < 0xeed0 || p.id > 0xf150),
+            (p) => Math.abs(p.bx - shape.midBx) <= 3 && Math.abs(p.by - shape.midBy) <= 4 && (p.id < 0xeed0 || p.id > 0xf150),
           );
           const blockedByWall = solidAdj === shape.clusterLength && !hasCapPlm && capCount === 0;
           doors.push({

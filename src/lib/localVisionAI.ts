@@ -1040,7 +1040,7 @@ export class LocalVisionAgent {
 
     if (!this.uSearch.active) {
       const horizDist = Math.abs(wram.samusX - this.anchorX);
-      const vertMoved = Math.abs(wram.samusY - this.anchorY) >= 48;
+      const vertMoved = Math.abs(wram.samusY - this.anchorY) >= 28;
 
       if (horizDist >= 20 || vertMoved) {
         this.anchorX = wram.samusX;
@@ -1082,7 +1082,8 @@ export class LocalVisionAgent {
 
     const hasMorph = (wram.itemsMask & 0x0004) !== 0;
     const hasHiJump = (wram.itemsMask & 0x0100) !== 0;
-    const maxJumpH = hasHiJump ? 7 : 5;
+    const hasSpaceJump = (wram.itemsMask & 0x0200) !== 0;
+    const maxJumpH = hasSpaceJump ? 14 : hasHiJump ? 7 : 5;
 
     const isCellAir = (bx: number, by: number, allowBreakable: boolean): boolean => {
       if (bx < 0 || by < 0 || bx >= rw || by >= rh) return false;
@@ -1112,7 +1113,7 @@ export class LocalVisionAgent {
     let startBx = Math.max(0, Math.min(rw - 1, Math.floor(wram.samusX / 16)));
     let startBy = Math.max(1, Math.min(rh - 2, Math.floor(wram.samusY / 16)));
 
-    if (!isStandable(startBx, startBy, true)) {
+    if (!isStandable(startBx, startBy, true) && !(hasSpaceJump && isBodyFree(startBx, startBy, true))) {
       let found = false;
       // Primeiro procura o piso diretamente abaixo da posição horizontal atual
       for (let dy = 0; dy <= 16; dy++) {
@@ -1304,6 +1305,26 @@ export class LocalVisionAgent {
           relaxEdge(idx, tx, ny, jumpCost, dir, true, false, tGate, tGate);
         }
       }
+
+      // 4) Voo contínuo com Space Jump (contorna passarelas e alcança portas suspensas em poços altos)
+      if (hasSpaceJump) {
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = bx + dx;
+            const ny = by + dy;
+            if (!isBodyFree(nx, ny, true)) continue;
+            const tt = tAt(nx, ny);
+            const isGate = tt === 0xc || tt === 0xd;
+            const moveDir: 'LEFT' | 'RIGHT' =
+              dx !== 0 ? (dx > 0 ? 'RIGHT' : 'LEFT') : bx >= rw / 2 ? 'LEFT' : 'RIGHT';
+            const needJump = dy < 0 || !isFloorTile(nx, ny + 1);
+            const needDrop = dy > 0 && !isFloorTile(nx, ny + 1);
+            const flyCost = (dy <= 0 ? 2 : 1) + (dx === 0 ? 1 : 0) + (isGate ? 2 : 0);
+            relaxEdge(idx, nx, ny, flyCost, moveDir, needJump, needDrop, isGate, isGate);
+          }
+        }
+      }
     }
 
     // Seleciona o alvo alcançável com melhor prioridade e menor custo real
@@ -1311,8 +1332,8 @@ export class LocalVisionAgent {
     for (const target of targets) {
       let bestNodeForTarget = -1;
       let bestNodeCost = Infinity;
-      for (let dy = -2; dy <= 2; dy++) {
-        for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -3; dy <= 3; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
           const cx = Math.max(0, Math.min(rw - 1, target.bx + dx));
           const cy = Math.max(1, Math.min(rh - 2, target.by + dy));
           const cIdx = cy * rw + cx;
@@ -1382,7 +1403,7 @@ export class LocalVisionAgent {
 
     const cx = Math.round(((enemy.x - wram.cameraX) / 256) * frame.width);
     const cy = Math.round(((enemy.y - wram.cameraY) / 224) * frame.height);
-    if (cx < -24 || cx > frame.width + 24 || cy < 12 || cy > frame.height + 24) return null;
+    if (cx < -8 || cx > frame.width + 8 || cy < 16 || cy > frame.height + 8) return null;
 
     const rx = Math.max(10, Math.min(34, Math.round(enemy.xRadius * 0.95)));
     const ry = Math.max(10, Math.min(32, Math.round(enemy.yRadius * 0.8)));
@@ -1542,28 +1563,45 @@ export class LocalVisionAgent {
         continue;
       }
 
-      // 4) SA-X (Varia / Gravity / Monstro Final) — Imagens 2, 3 e 11
+      // 4) SA-X (Varia / Gravity / Monstro Final) — somente quando VISÍVEL na tela e com cores/silhueta reais da SA-X
       const movingOrConfirmed = Boolean(
-        track?.hostileConfirmed || (track?.totalMoved ?? 0) >= 2 || (track?.seenTicks ?? 0) < 8 || e.hp >= 450,
+        track?.hostileConfirmed || (track?.totalMoved ?? 0) >= 2 || (track?.seenTicks ?? 0) < 8 || e.hp >= 900,
       );
-      const isSaxCandidate =
-        (e.hp >= 450 && dist < 460 && movingOrConfirmed) ||
-        (this.stepIndex - this.recentDamageSpikeTick < 14 && dist < 240);
+      const isHumanSaxShape =
+        e.xRadius >= 6 && e.xRadius <= 18 && e.yRadius >= 15 && e.yRadius <= 26 && e.yRadius >= e.xRadius;
+      const looksSaxVariaPixels = Boolean(
+        colors &&
+          colors.orangeRatio + colors.goldRatio >= 0.14 &&
+          colors.redRatio >= 0.05 &&
+          colors.neonGreenRatio < 0.10,
+      );
+      const looksSaxGravityPixels = Boolean(
+        colors &&
+          colors.purpleRatio >= 0.09 &&
+          colors.purpleRatio > colors.orangeRatio * 1.15 &&
+          colors.redRatio >= 0.03,
+      );
+      const postRescue = this.bigMetroidHealedTick > 0 && this.stepIndex - this.bigMetroidHealedTick < 600;
+      const looksSaxMonster =
+        isLarge &&
+        e.hp >= 1200 &&
+        dist < 440 &&
+        ((colors !== null && colors.purpleRatio + colors.redRatio + colors.orangeRatio >= 0.18) ||
+          (postRescue && !hasOpenExit && this.stepIndex - this.bigMetroidHealedTick > 200));
 
-      if (isSaxCandidate) {
-        const postRescue = this.bigMetroidHealedTick > 0 && this.stepIndex - this.bigMetroidHealedTick < 600;
-        const looksMonster =
-          isLarge ||
-          (postRescue && !hasOpenExit && this.stepIndex - this.bigMetroidHealedTick > 200) ||
-          Boolean(
-            colors &&
-              isLarge &&
-              colors.purpleRatio + colors.redRatio + colors.orangeRatio > 0.20,
-          );
+      const isConfirmedHumanSax =
+        Boolean(colors) &&
+        isHumanSaxShape &&
+        e.hp >= 900 &&
+        dist < 320 &&
+        movingOrConfirmed &&
+        (looksSaxVariaPixels || looksSaxGravityPixels);
+
+      if (looksSaxMonster || isConfirmedHumanSax) {
         let saxKind: 'SAX_VARIA' | 'SAX_GRAVITY' | 'SAX_MONSTER' = 'SAX_VARIA';
-        if (looksMonster) {
+        if (looksSaxMonster) {
           saxKind = 'SAX_MONSTER';
-        } else if (colors && colors.purpleRatio > colors.orangeRatio * 1.15 && colors.purpleRatio > 0.06) {
+        } else if (looksSaxGravityPixels) {
           saxKind = 'SAX_GRAVITY';
         }
         if (track) track.specialType = saxKind;
@@ -1686,7 +1724,12 @@ export class LocalVisionAgent {
     const nearbyEnemy = activeEnemies
       .map((e) => ({ ...e, dist: Math.hypot(e.x - wram.samusX, e.y - wram.samusY) }))
       .filter((e) => {
-        if (e.dist >= 132 || e.hp <= 0 || e.hp >= 450) return false;
+        if (e.hp <= 0) return false;
+        const isRegularBoss = e.hp >= 450;
+        if (isRegularBoss) {
+          return e.dist < 300;
+        }
+        if (e.dist >= 136) return false;
         const track = this.enemyTracks.get(e.slot);
         if (track && !track.hostileConfirmed && track.totalMoved <= 1 && track.seenTicks >= 4) {
           return e.dist < 64 && Math.abs(e.y - wram.samusY) < 36;
@@ -1785,8 +1828,9 @@ export class LocalVisionAgent {
       );
     }
 
+    const isEscapeCountdown = wram.countdownActive && !omegaIntro;
     let resolvedMode: AgentBehaviorMode = 'EXPLORE';
-    if (saxPursuer && !this.omegaVanishedDuringTimer) {
+    if (saxPursuer && !this.omegaVanishedDuringTimer && !isEscapeCountdown) {
       const saxDisabledByMetroid =
         this.bigMetroidHealedTick > 0 && this.stepIndex - this.bigMetroidHealedTick < 320;
       const mustFight =
@@ -1796,13 +1840,14 @@ export class LocalVisionAgent {
       resolvedMode = 'COMBAT';
     } else if ((activeItem && this.itemChaseTicks < 42) || unlockedLabel) {
       resolvedMode = 'COLLECT';
-    } else if (backtrackDir && this.progressStallTicks < 16 && !this.omegaVanishedDuringTimer) {
+    } else if (backtrackDir && this.progressStallTicks < 16 && !this.omegaVanishedDuringTimer && !isEscapeCountdown) {
       resolvedMode = 'BACKTRACK';
     } else if (
       (metroidLarva || nearbyEnemy) &&
       !this.uSearch.active &&
       this.progressStallTicks < 12 &&
-      !this.omegaVanishedDuringTimer
+      !this.omegaVanishedDuringTimer &&
+      (!isEscapeCountdown || Boolean(nearbyEnemy && nearbyEnemy.hp >= 450))
     ) {
       resolvedMode = 'COMBAT';
     } else {
@@ -2097,18 +2142,29 @@ export class LocalVisionAgent {
       );
     }
 
-    const keys: AIKey[] = [faceDir];
+    const isBossEnemy = target.hp >= 450;
+    const bossApproach: AIKey = isBossEnemy && target.dist < 56 ? (faceDir === 'RIGHT' ? 'LEFT' : 'RIGHT') : faceDir;
+    const keys: AIKey[] = [bossApproach];
     if (target.y < wram.samusY - 18) keys.push('UP');
-    if (this.nextShoot(true)) keys.push(shootKey);
-    if (this.nextJump(target.dist < 48, 2)) keys.push(jumpKey);
+    const useHeavyForBoss = isBossEnemy && (wram.supers > 0 || wram.missiles > 0);
+    if (useHeavyForBoss && wram.selectedHudItem === 0) {
+      keys.push(selectKey);
+    } else if (this.nextShoot(true)) {
+      keys.push(shootKey);
+    }
+    if (this.nextJump(target.dist < 52 || (isBossEnemy && (target.y < wram.samusY - 24 || this.stepIndex % 7 === 0)), isBossEnemy ? 3 : 2)) {
+      keys.push(jumpKey);
+    }
     return this.makeMetroidAction(
       'COMBAT',
       keys,
       125,
       'run',
       motionPct,
-      'Combate · Eliminando inimigo',
-      `Atacando inimigo confirmado (${Math.round(target.dist)} px · HP ${target.hp})`,
+      isBossEnemy ? 'Combate · Enfrentando Chefe' : 'Combate · Eliminando inimigo',
+      isBossEnemy
+        ? `Atacando chefe da sala (${Math.round(target.dist)} px · HP ${target.hp})`
+        : `Atacando inimigo confirmado (${Math.round(target.dist)} px · HP ${target.hp})`,
       wram,
     );
   }
@@ -2442,26 +2498,35 @@ export class LocalVisionAgent {
     // Planejamento real sobre o mapa de blocos $7F:0002 da sala atual
     const currNode = this.getOrCreateRoom(wram.roomId);
     const nextRoomTowardUnexplored = this.findRoomWithUnexploredDoor(wram.roomId);
+    const isTimedEscape = wram.countdownActive;
     const doorTargets: Array<{ key: string; bx: number; by: number; priority: number }> = [];
 
     for (const d of wram.doors) {
-      if (d.blockedByWall) continue;
+      if (d.blockedByWall && !isTimedEscape) continue;
       const rec = currNode.doors.get(d.key);
-      if (rec?.locked) continue;
+      if (rec?.locked && !isTimedEscape) continue;
 
       let priority = 3;
       if (!rec || rec.targetRoomId === undefined) {
-        priority = d.key === this.entryDoorKey ? 2 : 0; // Porta nova nunca explorada tem prioridade máxima!
+        priority = d.key === this.entryDoorKey ? 2 : 0;
       } else if (nextRoomTowardUnexplored && rec.targetRoomId === nextRoomTowardUnexplored) {
-        priority = 1; // Conecta ao grafo com salas ainda inexploradas
+        priority = 1;
       }
       doorTargets.push({ key: d.key, bx: d.bx, by: d.by, priority });
+    }
+    if (doorTargets.length === 0 && wram.doors.length > 0) {
+      for (const d of wram.doors) {
+        doorTargets.push({ key: d.key, bx: d.bx, by: d.by, priority: d.key === this.entryDoorKey ? 2 : 0 });
+      }
     }
 
     const pathStep = this.planPathInRoom(wram, doorTargets);
     if (pathStep) {
       this.activeDoorKey = pathStep.goalKey;
     }
+
+    const hasSpaceJump = (wram.itemsMask & 0x0200) !== 0;
+    const isGrounded = this.sameYStreak >= 2 && Math.abs(this.samusVy) <= 1;
 
     // Bloqueio detectado em Exploração: testa míssil (se tiver) e aciona Busca em 'U' antes de desistir
     if (this.progressStallTicks >= 5) {
@@ -2482,21 +2547,21 @@ export class LocalVisionAgent {
         return this.makeMetroidAction('EXPLORE', keys, 130, 'run', motionPct, 'Exploração · Disparando Míssil', 'Testando abertura de porta com míssil', wram);
       }
 
-      if (this.progressStallTicks >= 21 && this.progressStallTicks <= 23 && (wram.itemsMask & 0x0004)) {
+      if (this.progressStallTicks >= 21 && this.progressStallTicks <= 23 && (wram.itemsMask & 0x0004) && isGrounded && !hasSpaceJump) {
         const keys: AIKey[] = ['DOWN', this.moveDir];
         if ((wram.itemsMask & 0x1000) && this.nextShoot(true)) keys.push(shootKey);
         return this.makeMetroidAction('EXPLORE', keys, 145, 'run', motionPct, 'Exploração · Morph Ball', 'Verificando passagem baixa', wram);
       }
 
       if (this.progressStallTicks >= 24) {
-        if (this.activeDoorKey) {
+        if (!isTimedEscape && this.activeDoorKey) {
           const activeDoor = wram.doors.find((d) => d.key === this.activeDoorKey);
           if (activeDoor && Math.hypot(activeDoor.x - wram.samusX, activeDoor.y - wram.samusY) <= 112) {
             const rd = currNode.doors.get(this.activeDoorKey);
             if (rd) rd.locked = true;
           }
         }
-        if (this.uSearch.cooldown === 0) {
+        if (this.uSearch.cooldown === 0 && (!isTimedEscape || isGrounded)) {
           this.startUSearch(wram);
           return this.executeUSearchPattern(motionPct, wram);
         }
@@ -2505,28 +2570,37 @@ export class LocalVisionAgent {
         this.anchorX = wram.samusX;
         this.anchorY = wram.samusY;
         this.progressStallTicks = 0;
-        return this.makeMetroidAction('EXPLORE', [oppDir, dashKey], 170, 'run', motionPct, 'Exploração · Invertendo rota', 'Alternando direção na exploração', wram);
+        const keys: AIKey[] = [oppDir, dashKey];
+        if (hasSpaceJump && this.stepIndex % 2 === 0) keys.push(jumpKey);
+        return this.makeMetroidAction('EXPLORE', keys, 150, 'run', motionPct, isTimedEscape ? 'Fuga · Contornando obstáculo' : 'Exploração · Invertendo rota', 'Desviando de obstáculo na rota de fuga', wram);
       }
 
       const targetDoor = pathStep ? wram.doors.find((d) => d.key === pathStep.goalKey) : null;
       const nearDoor = targetDoor && Math.hypot(targetDoor.x - wram.samusX, targetDoor.y - wram.samusY) <= 44;
       const keys: AIKey[] = [pathStep ? pathStep.dir : this.moveDir, dashKey];
-      if (!nearDoor && this.nextJump(true, 3)) keys.push(jumpKey);
+      if (!nearDoor) {
+        if (hasSpaceJump) {
+          if (isGrounded ? this.nextJump(true, 3) : (this.stepIndex % 2 === 0 || this.samusVy >= 0)) {
+            keys.push(jumpKey);
+          }
+        } else if (this.nextJump(true, 3)) {
+          keys.push(jumpKey);
+        }
+      }
       if (this.nextShoot(true)) keys.push(shootKey);
       return this.makeMetroidAction(
         'EXPLORE',
         keys,
-        130,
+        125,
         'run',
         motionPct,
-        nearDoor ? 'Exploração · Abrindo porta' : 'Exploração · Testando passagem',
-        nearDoor ? 'Disparando na porta para avançar de sala' : 'Saltando e disparando antes de iniciar busca em U',
+        nearDoor ? 'Exploração · Abrindo porta' : isTimedEscape ? 'Fuga · Escalando saída' : 'Exploração · Testando passagem',
+        nearDoor ? 'Disparando na porta para avançar de sala' : 'Saltando e disparando para liberar caminho',
         wram,
       );
     }
 
     // Execução fluida guiada pelo caminho real no mapa de blocos da sala
-    const isGrounded = this.sameYStreak >= 2 && Math.abs(this.samusVy) <= 1;
     if (pathStep) {
       this.moveDir = pathStep.dir;
       const targetDoor = wram.doors.find((d) => d.key === pathStep.goalKey);
@@ -2538,12 +2612,21 @@ export class LocalVisionAgent {
 
       const keys: AIKey[] = nearCenter ? [moveKey] : [moveKey, dashKey];
       const hitSmallStep = isGrounded && Math.abs(this.samusVx) === 0 && this.roomMovedOnce && !pathStep.drop;
-      const wantsJump = !pathStep.drop && !nearDoor && (pathStep.jump || wpY < wram.samusY - 14 || hitSmallStep);
+      const needsAscend = !pathStep.drop && (pathStep.jump || wpY < wram.samusY - 12 || (targetDoor ? targetDoor.y < wram.samusY - 20 : false) || hitSmallStep);
 
-      if (this.nextJump(wantsJump && isGrounded, pathStep.jump ? 4 : 3)) {
+      if (hasSpaceJump && needsAscend && (!nearDoor || (targetDoor && targetDoor.y < wram.samusY - 14))) {
+        if (isGrounded) {
+          if (this.nextJump(true, 3)) keys.push(jumpKey);
+        } else if (this.stepIndex % 2 === 0 || this.samusVy >= 0) {
+          // Pulso limpo para engatar múltiplos Space Jumps / Screw Attack sem travar o botão A pressionado
+          this.jumpHoldRemaining = 0;
+          keys.push(jumpKey);
+        }
+      } else if (this.nextJump(needsAscend && !nearDoor && isGrounded, pathStep.jump ? 4 : 3)) {
         keys.push(jumpKey);
       }
-      if (this.nextShoot(Boolean(nearDoor || pathStep.shoot || pathStep.viaBreakable || this.stepIndex % 5 === 0))) {
+
+      if (this.nextShoot(Boolean(nearDoor || pathStep.shoot || pathStep.viaBreakable || isTimedEscape || this.stepIndex % 5 === 0))) {
         keys.push(shootKey);
       }
 
@@ -2551,7 +2634,7 @@ export class LocalVisionAgent {
       const actionDesc = pathStep.drop
         ? `Descendo poço para ${dirLabel}`
         : pathStep.jump
-          ? `Subindo plataforma para ${dirLabel}`
+          ? (hasSpaceJump ? `Space Jump rumo à ${dirLabel}` : `Subindo plataforma para ${dirLabel}`)
           : nearDoor
             ? `Abrindo porta (${targetDoor!.side})`
             : `Indo para ${dirLabel}`;
@@ -2562,24 +2645,30 @@ export class LocalVisionAgent {
         115,
         'run',
         motionPct,
-        `Exploração · ${pathStep.drop ? 'Descendo' : pathStep.jump ? 'Escalando' : 'Rumo à saída'}`,
+        isTimedEscape ? 'Fuga c/ Temporizador!' : `Exploração · ${pathStep.drop ? 'Descendo' : pathStep.jump ? 'Escalando' : 'Rumo à saída'}`,
         `Sala 0x${wram.roomId.toString(16).toUpperCase()} (${wram.samusX},${wram.samusY}) · ${actionDesc}`,
         wram,
       );
     }
 
-    // Fallback sem portas mapeadas na sala (ex.: elevador central ou área sem saída horizontal)
+    // Fallback sem portas mapeadas na sala (ex.: elevador central ou área vertical)
     const isVerticalShaft = wram.roomHeightPx > wram.roomWidthPx && wram.roomWidthPx <= 512;
     const hitSmallStep = isGrounded && Math.abs(this.samusVx) === 0 && (this.roomMovedOnce || this.roomTicks > 48);
     const jumpInterval = isVerticalShaft ? 5 : 11;
     const shouldJump = hitSmallStep || (isGrounded && this.stepIndex % jumpInterval === 0);
 
     const keys: AIKey[] = [this.moveDir, dashKey];
-    if (this.stepIndex % 18 === 0) keys.push('DOWN');
-    if (this.nextJump(shouldJump, isVerticalShaft ? 4 : 3)) {
+    if (isGrounded && this.stepIndex % 24 === 0 && !hasSpaceJump && !isTimedEscape) {
+      keys.push('DOWN');
+    }
+    if (hasSpaceJump && (isTimedEscape || isVerticalShaft)) {
+      if (isGrounded ? this.nextJump(true, 3) : (this.stepIndex % 2 === 0 || this.samusVy >= 0)) {
+        keys.push(jumpKey);
+      }
+    } else if (this.nextJump(shouldJump, isVerticalShaft ? 4 : 3)) {
       keys.push(jumpKey);
     }
-    if (this.nextShoot(this.stepIndex % 4 === 0)) {
+    if (this.nextShoot(isTimedEscape || this.stepIndex % 4 === 0)) {
       keys.push(shootKey);
     }
     const dirLabel = this.moveDir === 'RIGHT' ? 'direita' : 'esquerda';
@@ -2590,7 +2679,7 @@ export class LocalVisionAgent {
       115,
       'run',
       motionPct,
-      'Exploração ativa',
+      isTimedEscape ? 'Fuga c/ Temporizador!' : 'Exploração ativa',
       `Sala 0x${wram.roomId.toString(16).toUpperCase()} (${wram.samusX},${wram.samusY}) · ${posture}, indo p/ ${dirLabel}`,
       wram,
     );
