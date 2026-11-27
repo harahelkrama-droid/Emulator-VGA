@@ -159,8 +159,57 @@ npm run check:map    # 49 checagens do módulo (portas, tela de mapa pintada, ro
 npm run check:selffix # 43 checagens do laço erro→diagnóstico→parâmetro→reversão
 npm run check:nav    # 59 checagens do agente num mundo de várias salas: mapa, lava e a
                      # autocorreção fechada (paleta desconhecida descoberta apanhando, seção J)
-npm run check:all    # tudo: codex de chefes + mapa + autocorreção + as duas simulações (263)
+npm run check:all    # tudo: codex de chefes + mapa + autocorreção + escolta + as duas simulações (306)
 ```
+
+## Escolta de Metroid (seguir o bicho em vez de brigar com ele)
+
+No Super Metroid — e no hack X-Fusion em particular — o Metroid Grande / Ômega não é um inimigo
+a matar: ele é o **roteiro**. É ele que abre a rota, e é atrás dele que a Samus tem que ir. Os
+prints da corrida mostraram os dois modos de errar isso, e os dois custam o `TIME`:
+
+| erro | o que acontecia | o que vale agora |
+| --- | --- | --- |
+| atirar no bicho | Metroid só morre **congelado + míssil**; sem isso, é tiro no nada com o relógio correndo | `metroidKillReady(beamsMask, missiles)` é a única fonte da verdade: sem Ice Beam + míssil a IA **não** atira nem no ômega nem na escolta |
+| ficar paradinha "no ritmo" | ela entrava na zona do bicho, não precisava andar, e passava segundos ali até perder o tempo | "estar na zona" não é plano: ela avança para a **saída na direção do bicho**, e o objetivo real da sala (item, porta) continua valendo |
+
+A regra fica num módulo puro, `src/lib/metroidEscort.ts` (`decideEscort`), com cinco ações
+(`FOLLOW`, `CHASE_DOOR`, `HOLD`, `FIGHT`, `NONE`):
+
+- **`FOLLOW`** — zona de 56..150 px do bicho, com `ignoreMobs` (mobilha no caminho não puxa a
+  Samus para uma briga que não leva a lugar nenhum) e alinhamento vertical de ±14 px.
+- **`CHASE_DOOR`** — o bicho saiu da tela (ou está encostado no batente): corre para a mesma porta
+  e a memória de 260 ticks segura o rumo entre um quadro e outro.
+- **`HOLD`** — só no prólogo, onde o dreno **resolve** alguma coisa (vida baixa, sem itens do
+  evento, SA-X/contagem ativa): ela deixa drenar, e mesmo assim **chega no contato** (o dreno é
+  por toque), não espera de longe. `HOLD` tem paciência de 420 ticks; passou disso, volta a navegar.
+- **`FIGHT`** — só com gelo + míssil na mão e ele a menos de 96 px.
+
+### O falso-positivo de perigo (por que "sala vermelha" não pode travar a sala)
+
+Um de prints tinha chão **carmim de cenário** — mesma paleta da lava, sem fazer nada. O detector
+de lava é por cor, então vetava o caminho inteiro: a IA dançava na beira com o countdown comendo
+a run. Agora o detector tem contraditório:
+
+1. **testemunha** — cada tick com ela dentro de uma célula marcada sem perder um ponto de vida é
+   prova de que ali não há lago (o dano é lido da variação de HP do próprio tick, antes de ser
+   rotulado, senão um lago verdadeiro seria apagado pela testemunha);
+2. **prova de sala** — 4 células firmes, ou o lago encolher abaixo de 55%, derrubam o veto da sala
+   inteira e registram `HAZARD_FALSE_POSITIVE` no caderno de autocorreção, com o efeito
+   `vetoRoomOff` (a sala sai do veto de forma permanente — mas dano real re-liga o detector: prova
+   positiva tem precedência);
+3. **sonda deliberada** — se o veto a deixa presa mais de 90 ticks sem progresso, ela **atravessa**
+   o chão marcado por até 150 ticks para medir. Errar custa alguns pontos de vida; não arriscar
+   custa a corrida. Se doeu durante a sonda, o veto volta e ela não insiste (2 falhas = trava de
+   900 ticks).
+
+### Verificação
+
+`npm run check:escort` roda o contrato da escolta (25 verificações, sem emulador), e
+`scripts/mapAgentSim.ts` cobre os três cenários de quadro real: `K0` (dreno do prólogo ≠ esperar
+para sempre), `K` (chão carmim que não machuca: o veto cai em segundos e o item é pego) e `L`
+(Metroid atravessando a sala: ela vai atrás dele pela porta, sem gastar munição). Tudo dentro de
+`npm run check:all`.
 
 ## Recursos da IA Local (Sem API)
 
