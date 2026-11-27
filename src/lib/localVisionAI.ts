@@ -288,14 +288,12 @@ export class LocalVisionAgent {
   private lastInteractionTick = -100;
   private roomsWithPowerIssue = new Set<number>(); // salas que precisam de energia auxiliar
   private powerAuxActivated = false; // se a energia auxiliar foi ativada
-  /** Sequência de letras dos terminais que devem ser ativados em ordem (N → A → D → S)
-   *  N = Navigation Room (Adam/comunicação) → A = Auxiliary Power (energia) → D = Data Room (downloads) → S = Save Room (salvar)
+  /** Salas/setores onde o terminal A (Auxiliary Power) já foi ativado.
+   *  O A é o gate do setor: sem ele, não dá para ativar N, D ou S naquele setor.
    */
-  private readonly TERMINAL_LETTER_SEQUENCE: string[] = ['N', 'A', 'D', 'S'];
-  /** índice da próxima letra esperada na sequência */
-  private terminalSequenceIndex = 0;
-  /** terminais já ativados, indexados por letra */
-  private activatedTerminalLetters = new Set<string>();
+  private sectorPowerAuxActivated = new Set<number>();
+  /** Salas/setores onde já foram detectados terminais pendentes */
+  private sectorTerminalsPending = new Map<number, Set<string>>(); // roomId → Set de letras pendentes
   private stuckInRoomTicks = 0;
   private lastRoomEntryTick = 0;
 
@@ -3674,7 +3672,7 @@ export class LocalVisionAgent {
     });
   }
 
-  // Infere a letra do terminal pelo posicionamento no mapa.
+    // Rastreia terminais pendentes por setor (sala)    const roomPending = new Set<string>();    for (const obj of this.interactiveObjects) {      if (!obj.interacted && obj.letter) {        roomPending.add(obj.letter);      }    }    this.sectorTerminalsPending.set(wram.roomId, roomPending);  // Infere a letra do terminal pelo posicionamento no mapa.
   // Cada letra (A, N, D, S) ocupa uma região diferente da sala.
   // Retorna undefined quando não é possível determinar.
   private inferTerminalLetter(
@@ -3706,23 +3704,24 @@ export class LocalVisionAgent {
     }
   }
 
-  // Verifica se o terminal com a letra dada é o próximo da sequência esperada
-  private isNextTerminalInSequence(letter: string | undefined): boolean {
+  // Verifica se o terminal pode ser ativado neste setor.
+  // O A (Auxiliary Power) é o gate do setor: sem ativar o A primeiro,
+  // não dá para ativar N, D ou S naquele setor.
+  private canActivateTerminalInSector(roomId: number, letter: string | undefined): boolean {
     if (!letter) return true; // sem letra conhecida: permite ativar (fallback)
-    const expected = this.TERMINAL_LETTER_SEQUENCE[this.terminalSequenceIndex];
-    return letter === expected;
+    if (letter === 'A') return true; // A é sempre o primeiro a ser ativado no setor
+    // Para N, D, S: só pode se o A já foi ativado neste setor
+    return this.sectorPowerAuxActivated.has(roomId);
   }
 
-  // Avança o índice da sequência após ativar um terminal
-  private advanceTerminalSequence(letter: string | undefined): void {
-    if (!letter) return;
-    const expected = this.TERMINAL_LETTER_SEQUENCE[this.terminalSequenceIndex];
-    if (letter === expected) {
-      this.activatedTerminalLetters.add(letter);
-      this.terminalSequenceIndex += 1;
-      if (this.terminalSequenceIndex >= this.TERMINAL_LETTER_SEQUENCE.length) {
-        this.terminalSequenceIndex = 0; // ciclo completo, reinicia
-      }
+  // Marca que o terminal A (Auxiliary Power) foi ativado neste setor.
+  // Após isso, N, D e S ficam disponíveis no mesmo setor.
+  private markSectorPowerAuxActivated(roomId: number): void {
+    this.sectorPowerAuxActivated.add(roomId);
+    // Remove do pendente se existir
+    const pending = this.sectorTerminalsPending.get(roomId);
+    if (pending) {
+      pending.delete('A');
     }
   }
 
@@ -3916,8 +3915,11 @@ export class LocalVisionAgent {
     ) {
       this.powerAuxActivated = true;
       this.roomsWithPowerIssue.delete(wram.roomId);
-      // Avança a sequência de letras dos terminais (N → A → D → S)
-      this.advanceTerminalSequence(obj.letter);
+      // Se é o terminal A (Auxiliary Power), marca o setor como com energia ativada.
+      // Só após o A é que N, D e S ficam disponíveis neste setor.
+      if (obj.letter === 'A') {
+        this.markSectorPowerAuxActivated(wram.roomId);
+      }
     }
 
     // Tratamento específico por letra do terminal
@@ -4243,13 +4245,14 @@ export class LocalVisionAgent {
     // 6. Chefes — só combate se não houver energia/itens/caminhos secretos pendentes
     // 7. Backtracking — voltar para rotas bloqueadas
     // 8. Exploração — descobrir novas salas
-    // MISSÃO PRINCIPAL: terminais de energia devem ser ativados na sequência de letras (A → N → D → S).
-    // Só ativa o terminal se for o próximo da sequência; caso contrário, segue explorando até encontrar o correto.
+    // MISSÃO PRINCIPAL: em cada setor, o terminal A (Auxiliary Power) deve ser
+    // ativado PRIMEIRO antes de qualquer N, D ou S. Sem o A, é impossível
+    // prosseguir naquele setor (portas, elevadores e sistemas ficam bloqueados).
     const energyAuxPending = this.interactiveObjects.some(
       (o) =>
         (o.type === 'ENERGY_AUX' || o.type === 'POWER_PANEL') &&
         !o.interacted &&
-        this.isNextTerminalInSequence(o.letter),
+        this.canActivateTerminalInSector(wram.roomId, o.letter),
     );
     const itemPending = activeItem && this.itemChaseTicks < 42;
     // Caminho secreto pendente: há bloco falso não testado nesta sala e o jogador tem X-Ray
