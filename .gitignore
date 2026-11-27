@@ -11,3 +11,10 @@ Thumbs.db
 *.gba
 *.sfc
 *.smc
+
+# lixo de calibração de frames/vídeos — análise local, nunca no índice
+.image-analysis/
+analysis-tmp/
+.analysis-tmp/
+video-analysis/
+image-search/

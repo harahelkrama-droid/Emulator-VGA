@@ -16,8 +16,12 @@ import {
   gateForDoor,
   missionComplete,
   openObjectives,
+  lakeTopBlock,
+  MOLTEN_CELL,
+  MOLTEN_COLS,
   planNextTarget,
   readMapScreen,
+  senseMoltenLake,
   reopenBacklog,
   describeChecklistForUi,
   XFUSION_TOTALS,
@@ -416,6 +420,74 @@ const xfFull = buildChecklist({
 }, XFUSION_TOTALS);
 check('com os totais do hack, 47/7 fecha o checklist', missionComplete(xfFull));
 check('o hack tem 7 setores nomeados (SRX … NOC)', XFUSION_SECTORS.length === 7 && XFUSION_SECTORS[0] === 'SRX' && XFUSION_SECTORS[6] === 'NOC');
+
+/* -------------------------------------------- E. lava carmim do X-Fusion (frame real) */
+
+section('E. senseMoltenLake: dois tiers — laranja clássico e carmim do X-Fusion');
+
+// cores MEDIDAS no print do usuário (recorte 256x224 do frame do jogo), não a olho
+const LAVA_XF: RGB = [210, 43, 48]; // #d22b30 — corpo do poço
+const LAVA_XF_FLAT: RGB = [208, 16, 16]; // #d01010 — painel liso sem bolhas
+const PLATFORM_XF: RGB = [177, 16, 20]; // #b11014 — laca quente da plataforma
+const BG_DARK: RGB = [16, 16, 16]; // #101010
+const BUBBLE: RGB = [248, 200, 96]; // #f8c860 — núcleo incandescente
+
+/** poço do print: lava nas linhas 22-27 (cols 12-19), plataforma firme à esquerda (18-23) */
+function moltenRoom(withBubbles = true, lava: RGB = LAVA_XF): Uint8ClampedArray {
+  const { rgba, put } = blank(BG_DARK);
+  rect(put, 0, 144, 95, 191, PLATFORM_XF); // plataforma esquerda, onde a Samus está
+  rect(put, 96, 176, 159, 223, lava); // poço central
+  rect(put, 160, 168, 255, 223, PLATFORM_XF); // ombro direito
+  if (withBubbles) {
+    rect(put, 112, 196, 114, 197, BUBBLE); // duas bolhas: #f8-#e89a6a, 3x2px cada
+    rect(put, 140, 208, 142, 209, BUBBLE);
+  }
+  return rgba;
+}
+
+const redHot = senseMoltenLake(moltenRoom(), W, H);
+check('lago carmim do X-Fusion é detectado (tier red-hot)', redHot?.tier === 'red-hot');
+check('superfície na linha medida do print (22)', redHot?.surfaceRow === 22, `=${redHot?.surfaceRow}`);
+check('dentro do poço (25,14) é lava', redHot ? redHot.mask[25 * MOLTEN_COLS + 14] === 1 : false);
+check('plataforma (23,4) CONTINUA firme — não virou lava', redHot ? redHot.mask[23 * MOLTEN_COLS + 4] === 0 : false);
+check(
+  'lakeTopBlock converte pra bloco do mundo (16px)',
+  !!redHot && lakeTopBlock(redHot, 0) === Math.floor((22 * MOLTEN_CELL) / 16) && lakeTopBlock(redHot, 64) === Math.floor((64 + 22 * MOLTEN_CELL) / 16),
+);
+check(
+  'sem bolhas incandescentes NÃO liga (sala vermelha sem lava)',
+  senseMoltenLake(moltenRoom(false), W, H) === null,
+);
+check(
+  'painel vermelho liso de 2 linhas não vira lago (exige continuidade)',
+  (() => {
+    const { rgba, put } = blank(BG_DARK);
+    rect(put, 64, 176, 200, 191, LAVA_XF_FLAT); // faixa de 2 linhas
+    rect(put, 100, 180, 102, 181, BUBBLE);
+    rect(put, 150, 180, 152, 181, BUBBLE);
+    return senseMoltenLake(rgba, W, H) === null;
+  })(),
+);
+check(
+  'laranja clássico do SM tem prioridade (tier orange)',
+  (() => {
+    const { rgba, put } = blank(BG_DARK);
+    rect(put, 64, 168, 200, 223, [248, 120, 40]); // #f87828
+    return senseMoltenLake(rgba, W, H)?.tier === 'orange';
+  })(),
+);
+check(
+  'anel de fire flea ao redor da porta não a troca por vermelha (rosa continua rosa)',
+  (() => {
+    const { rgba, put } = blank(BG_DARK);
+    rect(put, 112, 92, 128, 108, ROSE);
+    rect(put, 108, 88, 111, 91, BUBBLE); // pulgas nos 4 cantos
+    rect(put, 129, 88, 132, 91, BUBBLE);
+    rect(put, 108, 109, 111, 112, BUBBLE);
+    rect(put, 129, 109, 132, 112, BUBBLE);
+    return classifyDoorColor(rgba, W, H, 120, 100) === 'PINK';
+  })(),
+);
 
 const t0 = Date.now();
 for (let k = 0; k < 2000; k++) {
