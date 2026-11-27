@@ -171,6 +171,8 @@ interface InteractiveObject {
     | 'ITEM';
   interacted: boolean;
   priority: number;
+  /** letra do terminal no mapa (A, N, D, S) para sequência de ativação */
+  letter?: string;
 }
 
 interface USearchState {
@@ -278,12 +280,20 @@ export class LocalVisionAgent {
     type: 'TERMINAL' | 'COMPUTER' | 'POWER_PANEL' | 'ENERGY_AUX' | 'DOOR_CONTROL' | 'SAVE_STATION' | 'ITEM';
     interacted: boolean;
     priority: number;
+    /** letra do terminal no mapa (A, N, D, S ...) para sequência de ativação */
+    letter?: string;
   }> = [];
   private currentInteractionTarget: { bx: number; by: number; x: number; y: number; type: string } | null = null;
   private interactionCooldown = 0;
   private lastInteractionTick = -100;
   private roomsWithPowerIssue = new Set<number>(); // salas que precisam de energia auxiliar
   private powerAuxActivated = false; // se a energia auxiliar foi ativada
+  /** Sequência de letras dos terminais de energia que devem ser ativados em ordem (A → N → D → S) */
+  private readonly TERMINAL_LETTER_SEQUENCE: string[] = ['A', 'N', 'D', 'S'];
+  /** índice da próxima letra esperada na sequência */
+  private terminalSequenceIndex = 0;
+  /** terminais já ativados, indexados por letra */
+  private activatedTerminalLetters = new Set<string>();
   private stuckInRoomTicks = 0;
   private lastRoomEntryTick = 0;
 
@@ -3637,6 +3647,8 @@ export class LocalVisionAgent {
         );
         if (!alreadyExists) {
           const dist = Math.hypot(plm.x - wram.samusX, plm.y - wram.samusY);
+          // Infere a letra do terminal pelo posicionamento no mapa (cada letra ocupa uma região da sala)
+          const terminalLetter = this.inferTerminalLetter(plm.bx, plm.by, wram.roomWidthBlocks, wram.roomHeightBlocks);
           this.interactiveObjects.push({
             bx: plm.bx,
             by: plm.by,
@@ -3645,6 +3657,7 @@ export class LocalVisionAgent {
             type,
             interacted: false,
             priority,
+            letter: terminalLetter,
           });
         }
       }
@@ -3657,6 +3670,48 @@ export class LocalVisionAgent {
       const db = Math.hypot(b.x - wram.samusX, b.y - wram.samusY);
       return da - db;
     });
+  }
+
+  // Infere a letra do terminal pelo posicionamento no mapa.
+  // Cada letra (A, N, D, S) ocupa uma região diferente da sala.
+  // Retorna undefined quando não é possível determinar.
+  private inferTerminalLetter(
+    bx: number,
+    by: number,
+    roomWidthBlocks: number,
+    roomHeightBlocks: number,
+  ): string | undefined {
+    if (!roomWidthBlocks || !roomHeightBlocks) return undefined;
+    const cx = bx / roomWidthBlocks; // 0..1
+    const cy = by / roomHeightBlocks; // 0..1
+    // Heurística simples por quadrante da sala:
+    // A = topo-esquerda, N = topo-direita, D = baixo-esquerda, S = baixo-direita
+    if (cy < 0.4) {
+      if (cx < 0.5) return 'A';
+      return 'N';
+    }
+    if (cx < 0.5) return 'D';
+    return 'S';
+  }
+
+  // Verifica se o terminal com a letra dada é o próximo da sequência esperada
+  private isNextTerminalInSequence(letter: string | undefined): boolean {
+    if (!letter) return true; // sem letra conhecida: permite ativar (fallback)
+    const expected = this.TERMINAL_LETTER_SEQUENCE[this.terminalSequenceIndex];
+    return letter === expected;
+  }
+
+  // Avança o índice da sequência após ativar um terminal
+  private advanceTerminalSequence(letter: string | undefined): void {
+    if (!letter) return;
+    const expected = this.TERMINAL_LETTER_SEQUENCE[this.terminalSequenceIndex];
+    if (letter === expected) {
+      this.activatedTerminalLetters.add(letter);
+      this.terminalSequenceIndex += 1;
+      if (this.terminalSequenceIndex >= this.TERMINAL_LETTER_SEQUENCE.length) {
+        this.terminalSequenceIndex = 0; // ciclo completo, reinicia
+      }
+    }
   }
 
   // =====================================================================
@@ -3840,9 +3895,11 @@ export class LocalVisionAgent {
     );
     if (existing) existing.interacted = true;
 
-    if (obj.type === 'ENERGY_AUX') {
+    if (obj.type === 'ENERGY_AUX' || obj.type === 'POWER_PANEL' || obj.type === 'TERMINAL') {
       this.powerAuxActivated = true;
       this.roomsWithPowerIssue.delete(wram.roomId);
+      // Avança a sequência de letras dos terminais (A → N → D → S)
+      this.advanceTerminalSequence(obj.letter);
     }
 
     return this.makeMetroidAction(
@@ -4151,8 +4208,13 @@ export class LocalVisionAgent {
     // 6. Chefes — só combate se não houver energia/itens/caminhos secretos pendentes
     // 7. Backtracking — voltar para rotas bloqueadas
     // 8. Exploração — descobrir novas salas
+    // MISSÃO PRINCIPAL: terminais de energia devem ser ativados na sequência de letras (A → N → D → S).
+    // Só ativa o terminal se for o próximo da sequência; caso contrário, segue explorando até encontrar o correto.
     const energyAuxPending = this.interactiveObjects.some(
-      (o) => (o.type === 'ENERGY_AUX' || o.type === 'POWER_PANEL') && !o.interacted,
+      (o) =>
+        (o.type === 'ENERGY_AUX' || o.type === 'POWER_PANEL') &&
+        !o.interacted &&
+        this.isNextTerminalInSequence(o.letter),
     );
     const itemPending = activeItem && this.itemChaseTicks < 42;
     // Caminho secreto pendente: há bloco falso não testado nesta sala e o jogador tem X-Ray
