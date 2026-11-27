@@ -2,5 +2,7 @@
   "name": "RetroPlay — Emulador com IA Local",
   "description": "Emulador GBA e SNES responsivo para celular, notebook e PC com IA local integrada sem necessidade de API.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
