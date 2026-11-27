@@ -115,6 +115,23 @@ interface PendingTarget {
   unlockedToRetry: boolean;
 }
 
+interface InteractiveObject {
+  bx: number;
+  by: number;
+  x: number;
+  y: number;
+  type:
+    | 'TERMINAL'
+    | 'COMPUTER'
+    | 'POWER_PANEL'
+    | 'ENERGY_AUX'
+    | 'DOOR_CONTROL'
+    | 'SAVE_STATION'
+    | 'ITEM';
+  interacted: boolean;
+  priority: number;
+}
+
 interface USearchState {
   active: boolean;
   phase: USearchPhase;
@@ -210,6 +227,24 @@ export class LocalVisionAgent {
   // Controle de uso de míssil: só usa míssil em boss, porta bloqueada ou situação especial
   private lastMissileUseTick = -100;
   private missileCooldownTicks = 60; // evita spam de míssil
+
+  // Sistema de interação com objetos/terminal/energia
+  private interactiveObjects: Array<{
+    bx: number;
+    by: number;
+    x: number;
+    y: number;
+    type: 'TERMINAL' | 'COMPUTER' | 'POWER_PANEL' | 'ENERGY_AUX' | 'DOOR_CONTROL' | 'SAVE_STATION' | 'ITEM';
+    interacted: boolean;
+    priority: number;
+  }> = [];
+  private currentInteractionTarget: { bx: number; by: number; x: number; y: number; type: string } | null = null;
+  private interactionCooldown = 0;
+  private lastInteractionTick = -100;
+  private roomsWithPowerIssue = new Set<number>(); // salas que precisam de energia auxiliar
+  private powerAuxActivated = false; // se a energia auxiliar foi ativada
+  private stuckInRoomTicks = 0;
+  private lastRoomEntryTick = 0;
 
   // Padrão de busca em 'U' para contornar bloqueios durante Exploração
   private uSearch: USearchState = {
@@ -347,6 +382,12 @@ export class LocalVisionAgent {
     this.bigMetroidHealedTick = -300;
     this.lastEnergyResetTick = -100;
     this.pendingLearnedKnowledge = [];
+    this.interactiveObjects = [];
+    this.currentInteractionTarget = null;
+    this.interactionCooldown = 0;
+    this.lastInteractionTick = -100;
+    this.stuckInRoomTicks = 0;
+    this.lastRoomEntryTick = this.stepIndex;
   }
 
   private resetUSearch(cooldown = 0): void {
@@ -899,6 +940,29 @@ export class LocalVisionAgent {
             mapFullyExplored: this.mapFullyExplored,
           }
         : undefined,
+      // Sistema de interação com objetos/terminal/energia
+      interaction: wram
+        ? {
+            nearbyObjects: this.interactiveObjects
+              .filter((o) => {
+                const dist = Math.hypot(o.x - wram.samusX, o.y - wram.samusY);
+                return dist < 120;
+              })
+              .map((o) => ({
+                type: o.type,
+                x: o.x,
+                y: o.y,
+                priority: o.priority,
+                interacted: o.interacted,
+              })),
+            currentTarget: this.currentInteractionTarget
+              ? this.currentInteractionTarget.type
+              : null,
+            powerAuxActivated: this.powerAuxActivated,
+            roomsWithPowerIssue: this.roomsWithPowerIssue.size,
+            stuckInRoomTicks: this.stuckInRoomTicks,
+          }
+        : undefined,
     };
   }
 
@@ -1078,6 +1142,9 @@ export class LocalVisionAgent {
           this.lastMapCheckTick = this.stepIndex;
         }
       }
+      // Reset do contador de preso ao entrar em nova sala
+      this.stuckInRoomTicks = 0;
+      this.lastRoomEntryTick = this.stepIndex;
       this.activeDoorKey = null;
       this.entryDoorKey = null;
       this.roomTicks = 0;
@@ -1228,7 +1295,13 @@ export class LocalVisionAgent {
         }
       } else if (this.roomMovedOnce) {
         this.progressStallTicks++;
+        this.stuckInRoomTicks++;
       }
+    }
+
+    // Decrementa cooldown de interação
+    if (this.interactionCooldown > 0) {
+      this.interactionCooldown--;
     }
 
     const hitKnownBlocked =
@@ -2162,6 +2235,111 @@ export class LocalVisionAgent {
     return { omegaIntro, bigMetroid, coreXTarget, saxPursuer, metroidLarva };
   }
 
+  // Detecta objetos interativos na sala (terminais, computadores, painéis de energia, estações de save)
+  private detectInteractiveObjects(wram: MetroidWramSnapshot): void {
+    this.interactiveObjects = [];
+
+    for (const plm of wram.plms) {
+      const id = plm.id;
+      let type: InteractiveObject['type'] | null = null;
+      let priority = 0;
+
+      // PLMs de energia auxiliar / painéis de energia (faixa típica de controle de energia)
+      if (id >= 0xf200 && id <= 0xf2ff) {
+        type = 'POWER_PANEL';
+        priority = 5;
+      } else if (id >= 0xf100 && id <= 0xf1ff) {
+        type = 'ENERGY_AUX';
+        priority = 6; // alta prioridade - precisa ativar energia
+      } else if (id >= 0xf000 && id <= 0xf0ff) {
+        type = 'TERMINAL';
+        priority = 4;
+      } else if (id >= 0xef00 && id <= 0xefff) {
+        type = 'COMPUTER';
+        priority = 4;
+      } else if (id >= 0xee00 && id <= 0xeedf) {
+        type = 'DOOR_CONTROL';
+        priority = 3;
+      } else if (id >= 0xec00 && id <= 0xecff) {
+        type = 'SAVE_STATION';
+        priority = 2;
+      }
+
+      if (type) {
+        const alreadyExists = this.interactiveObjects.some(
+          (o) => o.bx === plm.bx && o.by === plm.by && o.type === type,
+        );
+        if (!alreadyExists) {
+          const dist = Math.hypot(plm.x - wram.samusX, plm.y - wram.samusY);
+          this.interactiveObjects.push({
+            bx: plm.bx,
+            by: plm.by,
+            x: plm.x,
+            y: plm.y,
+            type,
+            interacted: false,
+            priority,
+          });
+        }
+      }
+    }
+
+    // Ordena por prioridade (mais alto primeiro) e depois por distância
+    this.interactiveObjects.sort((a, b) => {
+      if (b.priority !== a.priority) return b.priority - a.priority;
+      const da = Math.hypot(a.x - wram.samusX, a.y - wram.samusY);
+      const db = Math.hypot(b.x - wram.samusX, b.y - wram.samusY);
+      return da - db;
+    });
+  }
+
+  // Verifica se Samus está perto o suficiente para interagir com um objeto
+  private canInteractWithObject(wram: MetroidWramSnapshot, obj: InteractiveObject): boolean {
+    const dist = Math.hypot(obj.x - wram.samusX, obj.y - wram.samusY);
+    return dist < 64; // alcance de interação
+  }
+
+  // Executa interação com objeto (pressione A)
+  private executeInteraction(
+    wram: MetroidWramSnapshot,
+    obj: InteractiveObject,
+    keys: AIKey[],
+    sceneLabel: string,
+    reason: string,
+  ): AIAction {
+    this.currentInteractionTarget = {
+      bx: obj.bx,
+      by: obj.by,
+      x: obj.x,
+      y: obj.y,
+      type: obj.type,
+    };
+    this.interactionCooldown = 20;
+    this.lastInteractionTick = this.stepIndex;
+
+    // Marca como interagido se for um objeto de uso único
+    const existing = this.interactiveObjects.find(
+      (o) => o.bx === obj.bx && o.by === obj.by && o.type === obj.type,
+    );
+    if (existing) existing.interacted = true;
+
+    if (obj.type === 'ENERGY_AUX') {
+      this.powerAuxActivated = true;
+      this.roomsWithPowerIssue.delete(wram.roomId);
+    }
+
+    return this.makeMetroidAction(
+      'COLLECT',
+      [...keys, 'A'],
+      150,
+      'run',
+      0,
+      sceneLabel,
+      reason,
+      wram,
+    );
+  }
+
   private decideMetroidReal(
     m: GridMetrics,
     motionPct: number,
@@ -2207,6 +2385,61 @@ export class LocalVisionAgent {
     const activeItem = wram.roomItems
       .map((it) => ({ ...it, dist: Math.hypot(it.x - wram.samusX, it.y - wram.samusY) }))
       .sort((a, b) => a.dist - b.dist)[0];
+
+    // Detecta objetos interativos (terminais, computadores, painéis de energia, estações de save)
+    this.detectInteractiveObjects(wram);
+
+    // Sistema de interação: se há um objeto interativo perto e não está em cooldown, vai até ele e interage
+    const nearestInteractive = this.interactiveObjects.find(
+      (o) => !o.interacted && this.canInteractWithObject(wram, o),
+    );
+    if (
+      nearestInteractive &&
+      this.interactionCooldown <= 0 &&
+      this.stepIndex - this.lastInteractionTick > 10
+    ) {
+      // Se ainda não chegou no objeto, move em direção a ele
+      const distToObj = Math.hypot(
+        nearestInteractive.x - wram.samusX,
+        nearestInteractive.y - wram.samusY,
+      );
+      if (distToObj > 40) {
+        // Move em direção ao objeto interativo
+        const dirToObj: AIKey =
+          nearestInteractive.x >= wram.samusX ? 'RIGHT' : 'LEFT';
+        const keys: AIKey[] = [dirToObj, 'B']; // B = run
+        if (nearestInteractive.y < wram.samusY - 8) keys.push('UP');
+        if (nearestInteractive.y > wram.samusY + 8) keys.push('DOWN');
+        if (this.nextJump(true, 3)) keys.push(wram.controls.jump);
+        return this.makeMetroidAction(
+          'COLLECT',
+          keys,
+          130,
+          'run',
+          motionPct,
+          `Interação · Indo até ${nearestInteractive.type}`,
+          `Aproximando-se do ${nearestInteractive.type} para interagir`,
+          wram,
+        );
+      }
+      // Está perto o suficiente: interage (pressiona A)
+      return this.executeInteraction(
+        wram,
+        nearestInteractive,
+        [this.moveDir],
+        `Interação · ${nearestInteractive.type}`,
+        `Interagindo com ${nearestInteractive.type} na sala 0x${wram.roomId.toString(16).toUpperCase()}`,
+      );
+    }
+
+    // Atualiza salas com problema de energia (detecta se a sala tem painel de energia não ativado)
+    const hasUnactivatedPower = this.interactiveObjects.some(
+      (o) =>
+        (o.type === 'ENERGY_AUX' || o.type === 'POWER_PANEL') && !o.interacted,
+    );
+    if (hasUnactivatedPower && !this.roomsWithPowerIssue.has(wram.roomId)) {
+      this.roomsWithPowerIssue.add(wram.roomId);
+    }
 
     const nearbyEnemy = activeEnemies
       .map((e) => ({ ...e, dist: Math.hypot(e.x - wram.samusX, e.y - wram.samusY) }))

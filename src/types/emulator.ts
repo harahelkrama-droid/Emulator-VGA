@@ -151,6 +151,20 @@ export interface AIStatusSnapshot {
     roomsExplored: number;
     mapFullyExplored: boolean;
   };
+  // Sistema de interação com objetos/terminal/energia
+  interaction?: {
+    nearbyObjects: Array<{
+      type: string;
+      x: number;
+      y: number;
+      priority: number;
+      interacted: boolean;
+    }>;
+    currentTarget: string | null;
+    powerAuxActivated: boolean;
+    roomsWithPowerIssue: number;
+    stuckInRoomTicks: number;
+  };
 }
 
 export interface AIAction {
