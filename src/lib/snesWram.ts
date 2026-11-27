@@ -553,8 +553,25 @@ export async function readMetroidWram(): Promise<MetroidWramSnapshot | null> {
         }
 
         const tAt = (bx: number, by: number): number => {
-          if (bx < 0 || by < 0 || bx >= roomWidthBlocks || by >= roomHeightBlocks) return 0x8;
-          return blockTypes![by * roomWidthBlocks + bx];
+          let cx = bx;
+          let cy = by;
+          for (let hop = 0; hop < 8; hop++) {
+            if (cx < 0 || cy < 0 || cx >= roomWidthBlocks || cy >= roomHeightBlocks) return 0x8;
+            const idx = cy * roomWidthBlocks + cx;
+            const t = blockTypes![idx];
+            if (t === 0x5) {
+              const raw = btsBytes![idx];
+              cx += raw === 0 ? -1 : raw >= 128 ? raw - 256 : raw;
+              continue;
+            }
+            if (t === 0xd) {
+              const raw = btsBytes![idx];
+              cy += raw === 0 ? -1 : raw >= 128 ? raw - 256 : raw;
+              continue;
+            }
+            return t;
+          }
+          return 0x8;
         };
 
         if (
@@ -672,7 +689,7 @@ export async function readMetroidWram(): Promise<MetroidWramSnapshot | null> {
           for (const adj of shape.adjCells) {
             const adjT = tAt(adj.bx, adj.by);
             if (adjT === 0x8) solidAdj++;
-            if (adjT === 0xc || adjT === 0xd || adjT === 0xf) capCount++;
+            if (adjT === 0xb || adjT === 0xc || adjT === 0xf) capCount++;
           }
           const hasCapPlm = plms.some(
             (p) => Math.abs(p.bx - shape.midBx) <= 3 && Math.abs(p.by - shape.midBy) <= 4 && (p.id < 0xeed0 || p.id > 0xf150),

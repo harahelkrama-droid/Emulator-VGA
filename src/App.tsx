@@ -26,7 +26,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    fetch('/games.json', { cache: 'no-store' })
+    fetch('./games.json', { cache: 'no-store' })
       .then((res) => (res.ok ? res.json() : []))
       .then((data) => {
         if (Array.isArray(data)) {
@@ -92,13 +92,14 @@ export default function App() {
         'service-worker.js',
         'app-icon.svg',
         'games.json',
+        'assets/Super Metroid.png',
       ];
       const entries: ZipFileEntry[] = [
         { name: 'index.html', data: buildStandaloneGitHubHtml() },
       ];
       const fetched = await Promise.all(
         staticFiles.map(async (name) => {
-          const res = await fetch(`/${name}`, { cache: 'no-store' });
+          const res = await fetch(`./${name}`, { cache: 'no-store' });
           if (!res.ok) return null;
           return { name, data: new Uint8Array(await res.arrayBuffer()) };
         }),

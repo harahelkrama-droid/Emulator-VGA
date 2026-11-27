@@ -1,7 +1,8 @@
-const CACHE_NAME = 'retroplay-offline-v3';
+const CACHE_NAME = 'retroplay-offline-v4';
 const APP_SHELL = [
   './',
   './index.html',
+  './standalone.html',
   './atualizacoes.html',
   './games.json',
   './manifest.webmanifest',
@@ -106,7 +107,12 @@ self.addEventListener('fetch', (event) => {
       } catch (_) {
         if (cached) return cached;
         if (req.mode === 'navigate') {
-          return (await cache.match('./index.html')) || (await cache.match('./')) || Response.error();
+          return (
+            (await cache.match('./index.html')) ||
+            (await cache.match('./standalone.html')) ||
+            (await cache.match('./')) ||
+            Response.error()
+          );
         }
         return Response.error();
       }

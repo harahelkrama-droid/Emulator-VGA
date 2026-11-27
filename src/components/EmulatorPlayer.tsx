@@ -186,24 +186,51 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
     void readAIKnowledge(game.file).then(setKnowledgeLog);
 
     if (!mountRef.current) return;
-    const cleanup = mountEmulator({
-      mountElement: mountRef.current,
-      gameUrl: game.isLocalBlob ? game.file : encodeURI(game.file),
-      fileName,
-      onReady: () => {
-        setReady(true);
-        setFootMessage('Pronto · Setas, Z(A), X(B), A(X), S(Y), Enter(Start), V(Select)');
-      },
-      onError: (msg) => {
-        setReady(false);
-        setFootMessage(msg);
-        onNotify(msg);
-      },
-    });
+    let disposed = false;
+    let cleanupEmu: (() => void) | null = null;
+    const targetUrl = game.isLocalBlob ? game.file : encodeURI(game.file);
+
+    const boot = async () => {
+      if (!game.isLocalBlob) {
+        try {
+          const probe = await fetch(targetUrl, { method: 'HEAD', cache: 'no-store' });
+          const ct = (probe.headers.get('content-type') || '').toLowerCase();
+          if (probe.status === 404 || ct.includes('text/html')) {
+            if (!disposed) {
+              const msg = `ROM não encontrada (${game.file}). Envie o arquivo para public/games/ ou clique em "Abrir ROM".`;
+              setReady(false);
+              setFootMessage(msg);
+              onNotify(msg);
+            }
+            return;
+          }
+        } catch {
+          // Segue carregamento normal se HEAD for bloqueado offline/CORS
+        }
+      }
+      if (disposed || !mountRef.current) return;
+      cleanupEmu = mountEmulator({
+        mountElement: mountRef.current,
+        gameUrl: targetUrl,
+        fileName,
+        onReady: () => {
+          setReady(true);
+          setFootMessage('Pronto · Setas, Z(A), X(B), A(X), S(Y), Enter(Start), V(Select)');
+        },
+        onError: (msg) => {
+          setReady(false);
+          setFootMessage(msg);
+          onNotify(msg);
+        },
+      });
+    };
+
+    void boot();
 
     return () => {
+      disposed = true;
       stopAI();
-      cleanup();
+      if (cleanupEmu) cleanupEmu();
     };
   }, [game.file]);
 

@@ -12,16 +12,34 @@
     <meta property="og:description" content="Emulador GBA e SNES responsivo para celular, notebook e PC com IA local integrada sem necessidade de API." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
-    <link rel="manifest" href="/manifest.webmanifest" />
-    <link rel="icon" type="image/svg+xml" href="/app-icon.svg" />
-    <link rel="apple-touch-icon" href="/app-icon.svg" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" type="image/svg+xml" href="./app-icon.svg" />
+    <link rel="apple-touch-icon" href="./app-icon.svg" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   </head>
-  <body>
+  <body style="background:#090e1a;color:#eef3fb">
     <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+    <script type="module" src="/src/main.tsx" onerror="window.__rpMainErr=true"></script>
+    <script>
+      (function () {
+        if (!document.querySelector('script[src="/src/main.tsx"]')) return;
+        function goStandalone() {
+          if (window.__RETROPLAY_VITE_MOUNTED) return;
+          var root = document.getElementById('root');
+          if (root && root.children.length > 0) return;
+          location.replace('./public/standalone.html');
+        }
+        window.addEventListener('error', function (e) {
+          if (e && e.target && e.target.tagName === 'SCRIPT') goStandalone();
+        }, true);
+        setTimeout(function () {
+          if (window.__rpMainErr || location.hostname.endsWith('.github.io')) goStandalone();
+        }, 450);
+        setTimeout(goStandalone, 1800);
+      })();
+    </script>
   </body>
 </html>
 

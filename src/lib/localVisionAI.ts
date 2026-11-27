@@ -98,6 +98,7 @@ interface TilePathStep {
   jump: boolean;
   drop: boolean;
   shoot: boolean;
+  bomb?: boolean;
   wpBx: number;
   wpBy: number;
   goalKey: string;
@@ -239,6 +240,9 @@ export class LocalVisionAgent {
   private activeCoreXStage: CoreXStage | null = null;
   private lastCoreXSeenTick = -200;
   private lastCoreXRoomId = -1;
+  private lastCoreXWasRedTick = -200;
+  private lastCoreXWasRedRoomId = -1;
+  private lastRoomDoorsSnapshot: DoorInfo[] = [];
   private omegaIntroSeenTicks = 0;
   private omegaVanishedDuringTimer = false;
   private bigMetroidDrainSeen = false;
@@ -321,6 +325,9 @@ export class LocalVisionAgent {
     this.activeCoreXStage = null;
     this.lastCoreXSeenTick = -200;
     this.lastCoreXRoomId = -1;
+    this.lastCoreXWasRedTick = -200;
+    this.lastCoreXWasRedRoomId = -1;
+    this.lastRoomDoorsSnapshot = [];
     this.omegaIntroSeenTicks = 0;
     this.omegaVanishedDuringTimer = false;
     this.bigMetroidDrainSeen = false;
@@ -897,9 +904,21 @@ export class LocalVisionAgent {
         prevNode.exits[this.moveDir] = wram.roomId;
         const backDir = this.moveDir === 'RIGHT' ? 'LEFT' : 'RIGHT';
         currNode.exits[backDir] = prevRoomId;
-        if (prevDoorKey) {
-          prevNode.doorLinks.set(prevDoorKey, wram.roomId);
-          const pd = prevNode.doors.get(prevDoorKey);
+
+        const physicalExitedDoor =
+          this.lastRoomDoorsSnapshot.length > 0
+            ? [...this.lastRoomDoorsSnapshot]
+                .filter((d) => Math.hypot(d.x - this.prevSamusX, d.y - this.prevSamusY) <= 104)
+                .sort(
+                  (a, b) =>
+                    Math.hypot(a.x - this.prevSamusX, a.y - this.prevSamusY) -
+                    Math.hypot(b.x - this.prevSamusX, b.y - this.prevSamusY),
+                )[0]
+            : undefined;
+        const linkDoorKey = physicalExitedDoor?.key ?? prevDoorKey;
+        if (linkDoorKey) {
+          prevNode.doorLinks.set(linkDoorKey, wram.roomId);
+          const pd = prevNode.doors.get(linkDoorKey);
           if (pd) {
             pd.targetRoomId = wram.roomId;
             pd.locked = false;
@@ -931,6 +950,8 @@ export class LocalVisionAgent {
       this.activeSpecialEntity = 'NONE';
       this.activeSpecialLabel = '';
       this.activeCoreXStage = null;
+      this.lastCoreXWasRedTick = -200;
+      this.lastCoreXWasRedRoomId = -1;
       this.resetUSearch();
 
       const currNode = this.getOrCreateRoom(wram.roomId);
@@ -985,6 +1006,7 @@ export class LocalVisionAgent {
         }
       }
     }
+    this.lastRoomDoorsSnapshot = wram.doors;
 
     this.roomTicks++;
     if (!this.roomMovedOnce && Math.hypot(wram.samusX - this.roomSpawnX, wram.samusY - this.roomSpawnY) >= 3) {
@@ -1064,6 +1086,33 @@ export class LocalVisionAgent {
     return { unlockedLabel, hitKnownBlocked };
   }
 
+  private resolveBlockType(wram: MetroidWramSnapshot, bx: number, by: number): number {
+    const bt = wram.blockTypes;
+    const bts = wram.btsBytes;
+    const rw = wram.roomWidthBlocks;
+    const rh = wram.roomHeightBlocks;
+    if (!bt || rw <= 0 || rh <= 0) return 0x8;
+    let cx = bx;
+    let cy = by;
+    for (let hop = 0; hop < 8; hop++) {
+      if (cx < 0 || cy < 0 || cx >= rw || cy >= rh) return 0x8;
+      const idx = cy * rw + cx;
+      const t = bt[idx];
+      if (t === 0x5) {
+        const raw = bts ? bts[idx] : 0xff;
+        cx += raw === 0 ? -1 : raw >= 128 ? raw - 256 : raw;
+        continue;
+      }
+      if (t === 0xd) {
+        const raw = bts ? bts[idx] : 0xff;
+        cy += raw === 0 ? -1 : raw >= 128 ? raw - 256 : raw;
+        continue;
+      }
+      return t;
+    }
+    return 0x8;
+  }
+
   private planPathInRoom(
     wram: MetroidWramSnapshot,
     targets: Array<{ key: string; bx: number; by: number; priority: number }>,
@@ -1073,14 +1122,11 @@ export class LocalVisionAgent {
     const rh = wram.roomHeightBlocks;
     if (!bt || rw <= 0 || rh <= 0 || targets.length === 0) return null;
 
-    const tAt = (bx: number, by: number): number => {
-      if (bx < 0 || by < 0 || bx >= rw || by >= rh) return 0x8;
-      let t = bt[by * rw + bx];
-      if (t === 0x5 && bx > 0) t = bt[by * rw + bx - 1];
-      return t;
-    };
+    const tAt = (bx: number, by: number): number => this.resolveBlockType(wram, bx, by);
 
     const hasMorph = (wram.itemsMask & 0x0004) !== 0;
+    const hasBombs = (wram.itemsMask & 0x1000) !== 0;
+    const hasBombBreak = (hasMorph && hasBombs) || wram.powerBombs > 0;
     const hasHiJump = (wram.itemsMask & 0x0100) !== 0;
     const hasSpaceJump = (wram.itemsMask & 0x0200) !== 0;
     const maxJumpH = hasSpaceJump ? 14 : hasHiJump ? 7 : 5;
@@ -1088,8 +1134,11 @@ export class LocalVisionAgent {
     const isCellAir = (bx: number, by: number, allowBreakable: boolean): boolean => {
       if (bx < 0 || by < 0 || bx >= rw || by >= rh) return false;
       const t = tAt(bx, by);
-      if (t === 0x8 || t === 0xa || t === 0xe || t === 0xf) return false;
-      if (t === 0xc || t === 0xd) {
+      if (t === 0x8 || t === 0xa || t === 0xe) return false;
+      if (t === 0xf) {
+        return allowBreakable && hasBombBreak && !this.unbreakableGates.has(`${wram.roomId}:${bx},${by}`);
+      }
+      if (t === 0xc) {
         return allowBreakable && !this.unbreakableGates.has(`${wram.roomId}:${bx},${by}`);
       }
       return true;
@@ -1104,18 +1153,49 @@ export class LocalVisionAgent {
     const isFloorTile = (bx: number, by: number): boolean => {
       if (bx < 0 || by < 0 || bx >= rw || by >= rh) return true;
       const t = tAt(bx, by);
-      return t === 0x8 || t === 0xa || t === 0x1 || t === 0xc || t === 0xd || t === 0xe || t === 0xf;
+      return (
+        t === 0x8 ||
+        t === 0xa ||
+        t === 0x1 ||
+        t === 0xb ||
+        t === 0xc ||
+        t === 0xe ||
+        t === 0xf ||
+        (t === 0x9 && by === rh - 1)
+      );
     };
 
     const isStandable = (bx: number, by: number, allowBreakable: boolean): boolean =>
-      isBodyFree(bx, by, allowBreakable) && isFloorTile(bx, by + 1);
+      isBodyFree(bx, by, allowBreakable) && isFloorTile(bx, by + 1) && tAt(bx, by + 1) !== 0xa;
+
+    const isHazardCeiling = (bx: number, by: number): boolean =>
+      tAt(bx, by - 1) === 0xa || tAt(bx, by - 2) === 0xa;
+
+    const hasVertClear = (bx: number, fromBy: number, toBy: number, allowBreakable: boolean): boolean => {
+      for (let cy = fromBy; cy >= toBy; cy--) {
+        if (!isBodyFree(bx, cy, allowBreakable)) return false;
+      }
+      return true;
+    };
+
+    const hasDirectTargetSight = (cx: number, cy: number, tx: number, ty: number): boolean => {
+      const sySign = ty === cy ? 0 : ty > cy ? 1 : -1;
+      for (let y = cy; y !== ty; y += sySign) {
+        if (y !== cy && !isCellAir(cx, y, false)) return false;
+      }
+      const sxSign = tx === cx ? 0 : tx > cx ? 1 : -1;
+      for (let x = cx; x !== tx; x += sxSign) {
+        if (x !== cx && !isCellAir(x, ty, false)) return false;
+      }
+      return true;
+    };
 
     let startBx = Math.max(0, Math.min(rw - 1, Math.floor(wram.samusX / 16)));
     let startBy = Math.max(1, Math.min(rh - 2, Math.floor(wram.samusY / 16)));
+    const wasAirborne = !isStandable(startBx, startBy, true) && isBodyFree(startBx, startBy, true);
 
-    if (!isStandable(startBx, startBy, true) && !(hasSpaceJump && isBodyFree(startBx, startBy, true))) {
+    if (!wasAirborne && !isStandable(startBx, startBy, true)) {
       let found = false;
-      // Primeiro procura o piso diretamente abaixo da posição horizontal atual
       for (let dy = 0; dy <= 16; dy++) {
         if (isStandable(startBx, startBy + dy, true)) {
           startBy += dy;
@@ -1123,7 +1203,6 @@ export class LocalVisionAgent {
           break;
         }
       }
-      // Só desvia ±1 bloco se não houver chão logo abaixo (ex.: sobre poço)
       if (!found) {
         for (let dy = 0; dy <= 16 && !found; dy++) {
           for (const dx of [-1, 1]) {
@@ -1157,6 +1236,7 @@ export class LocalVisionAgent {
       jump: boolean;
       drop: boolean;
       shoot: boolean;
+      bomb: boolean;
       wpBx: number;
       wpBy: number;
       viaBreakable: boolean;
@@ -1211,6 +1291,9 @@ export class LocalVisionAgent {
       drop: boolean,
       shoot: boolean,
       viaBreakable: boolean,
+      bomb = false,
+      wpOverrideBx?: number,
+      wpOverrideBy?: number,
     ) => {
       if (nx < 0 || ny < 1 || nx >= rw || ny >= rh - 1) return;
       const nIdx = ny * rw + nx;
@@ -1219,13 +1302,22 @@ export class LocalVisionAgent {
       if (nextCost < dist[nIdx]) {
         dist[nIdx] = nextCost;
         parent[nIdx] = fromIdx;
-        stepMeta[nIdx] = { dir, jump, drop, shoot, wpBx: nx, wpBy: ny, viaBreakable };
+        stepMeta[nIdx] = {
+          dir,
+          jump,
+          drop,
+          shoot,
+          bomb,
+          wpBx: wpOverrideBx ?? nx,
+          wpBy: wpOverrideBy ?? ny,
+          viaBreakable,
+        };
         heapPush(nIdx);
       }
     };
 
     let expanded = 0;
-    const maxExpand = Math.min(total, 4200);
+    const maxExpand = Math.min(total, 4800);
     while (heap.length > 0 && expanded < maxExpand) {
       const idx = heapPop();
       if (closed[idx]) continue;
@@ -1234,8 +1326,57 @@ export class LocalVisionAgent {
 
       const bx = idx % rw;
       const by = Math.floor(idx / rw);
+      const isStartAirborne = idx === startIdx && wasAirborne;
 
-      // 1) Caminhada horizontal, rampas e degraus de 1 bloco
+      // 0) Se iniciou no ar (pulo em curva sobre saliências ou queda livre em direção a poços/eixos)
+      if (isStartAirborne && !hasSpaceJump) {
+        for (let fall = 0; fall <= rh - 2 - by; fall++) {
+          const fy = by + fall;
+          if (!isBodyFree(bx, fy, true)) break;
+          for (const drift of [0, -1, 1, -2, 2]) {
+            const fx = bx + drift;
+            if (fx < 0 || fx >= rw) continue;
+            const sgn = drift > 0 ? 1 : -1;
+            let driftClear = true;
+            for (let sx = 0; sx !== drift; sx += sgn) {
+              if (!isBodyFree(bx + sx + sgn, Math.max(1, fy - 1), true)) {
+                driftClear = false;
+                break;
+              }
+            }
+            if (!driftClear) continue;
+            if (isStandable(fx, fy, true)) {
+              const airDir: 'LEFT' | 'RIGHT' =
+                drift !== 0 ? (drift > 0 ? 'RIGHT' : 'LEFT') : bx >= rw / 2 ? 'LEFT' : 'RIGHT';
+              relaxEdge(idx, fx, fy, 1 + Math.abs(drift) + Math.floor(fall / 2), airDir, false, true, false, false);
+            }
+          }
+        }
+        for (let dy = -1; dy >= -4; dy--) {
+          const ny = by + dy;
+          if (ny < 1) break;
+          if (!hasVertClear(bx, by, ny, false)) break;
+          for (let dx = -3; dx <= 3; dx++) {
+            const tx = bx + dx;
+            if (tx < 0 || tx >= rw || !isStandable(tx, ny, true)) continue;
+            if (isHazardCeiling(tx, ny)) continue;
+            const stepSign = dx >= 0 ? 1 : -1;
+            let clear = true;
+            for (let cx = 0; Math.abs(cx) <= Math.abs(dx); cx += stepSign) {
+              if (!isBodyFree(bx + cx, ny, true)) {
+                clear = false;
+                break;
+              }
+            }
+            if (!clear) continue;
+            const airDir: 'LEFT' | 'RIGHT' =
+              dx !== 0 ? (dx > 0 ? 'RIGHT' : 'LEFT') : bx >= rw / 2 ? 'LEFT' : 'RIGHT';
+            relaxEdge(idx, tx, ny, 1 + Math.abs(dx) + Math.abs(dy), airDir, true, false, false, false);
+          }
+        }
+      }
+
+      // 1) Caminhada horizontal, rampas, escadas diagonais e degraus de 1 bloco
       for (const dx of [-1, 1] as const) {
         const dir: 'LEFT' | 'RIGHT' = dx > 0 ? 'RIGHT' : 'LEFT';
         const nx = bx + dx;
@@ -1245,16 +1386,20 @@ export class LocalVisionAgent {
           const ny = by + dy;
           if (ny < 1 || ny >= rh - 1) continue;
           const tileT = tAt(nx, ny);
-          const isGate = tileT === 0xc || tileT === 0xd;
+          const isBombTile = tileT === 0xf;
+          const isShotGate = tileT === 0xc;
+          const isGate = isShotGate || isBombTile;
           if (isStandable(nx, ny, true)) {
-            if (dy === -1 && !isBodyFree(bx, by - 1, true)) continue;
-            const needJump = dy === -1 && tAt(nx, ny + 1) !== 0x1;
-            const cost = (needJump ? 2 : 1) + (isGate ? 2 : 0);
-            relaxEdge(idx, nx, ny, cost, dir, needJump, false, isGate, isGate);
+            if (dy === -1 && !isCellAir(bx, by - 1, true)) continue;
+            if (dy === 1 && !isCellAir(nx, by, true)) continue;
+            const needJump = dy === -1 && tAt(nx, ny + 1) !== 0x1 && !isHazardCeiling(nx, ny);
+            const hazardPen = dy < 0 && isHazardCeiling(nx, ny) ? 4 : 0;
+            const cost = (needJump ? 2 : 1) + (isGate ? 3 : 0) + hazardPen;
+            relaxEdge(idx, nx, ny, cost, dir, needJump, false, isGate, isGate, isBombTile);
           }
         }
 
-        // 2) Queda livre de plataformas/bordas para descer poços
+        // 2) Queda livre de plataformas/bordas com curvatura lateral no ar (Imagens 1 e 7)
         if (isBodyFree(nx, by, true) && !isFloorTile(nx, by + 1)) {
           for (let fall = 1; fall <= rh - 2 - by; fall++) {
             const fy = by + fall;
@@ -1263,46 +1408,155 @@ export class LocalVisionAgent {
               relaxEdge(idx, nx, fy, 1 + Math.floor(fall / 2), dir, false, true, false, false);
               break;
             }
-            for (const drift of [dx, -dx]) {
+            const driftList = fall >= 3 ? [dx, -dx, -2 * dx] : [dx, -dx];
+            for (const drift of driftList) {
               const fx = nx + drift;
-              if (isBodyFree(fx, fy, true) && isStandable(fx, fy, true)) {
-                relaxEdge(idx, fx, fy, 2 + Math.floor(fall / 2), dir, false, true, false, false);
+              if (fx < 0 || fx >= rw) continue;
+              const sgn = drift > 0 ? 1 : -1;
+              let driftClear = true;
+              for (let sx = sgn; Math.abs(sx) <= Math.abs(drift); sx += sgn) {
+                if (!isBodyFree(nx + sx, Math.max(1, fy - 1), true)) {
+                  driftClear = false;
+                  break;
+                }
+              }
+              if (driftClear && isStandable(fx, fy, true)) {
+                relaxEdge(
+                  idx,
+                  fx,
+                  fy,
+                  2 + Math.abs(drift) + Math.floor(fall / 2),
+                  dir,
+                  false,
+                  true,
+                  false,
+                  false,
+                  false,
+                  nx,
+                  fy,
+                );
               }
             }
           }
         }
       }
 
-      // 3) Saltos para plataformas acima ou vãos horizontais (custo proporcional ao salto)
+      // 2b) Quebra/queda através do piso abaixo (0xB crumble, 0xC tiro p/ baixo, 0xF bomba p/ baixo - Imagem 7)
+      if (!isStartAirborne && by + 2 < rh - 1) {
+        const floorT = tAt(bx, by + 1);
+        const canBreakFloor =
+          floorT === 0xb ||
+          ((floorT === 0xc || (floorT === 0xf && hasBombBreak)) &&
+            !this.unbreakableGates.has(`${wram.roomId}:${bx},${by + 1}`));
+        if (canBreakFloor && isCellAir(bx, by + 2, true)) {
+          for (let fall = 2; fall <= rh - 2 - by; fall++) {
+            const fy = by + fall;
+            if (!isBodyFree(bx, fy, true)) break;
+            const dropDir: 'LEFT' | 'RIGHT' = bx >= rw / 2 ? 'LEFT' : 'RIGHT';
+            if (isStandable(bx, fy, true)) {
+              relaxEdge(
+                idx,
+                bx,
+                fy,
+                (floorT === 0xb ? 1 : 3) + Math.floor(fall / 2),
+                dropDir,
+                false,
+                true,
+                floorT === 0xc,
+                floorT === 0xc || floorT === 0xf,
+                floorT === 0xf,
+                bx,
+                by + 1,
+              );
+              break;
+            }
+            for (const drift of [-1, 1]) {
+              const fx = bx + drift;
+              if (isBodyFree(fx, fy, true) && isStandable(fx, fy, true)) {
+                relaxEdge(
+                  idx,
+                  fx,
+                  fy,
+                  (floorT === 0xb ? 2 : 4) + Math.floor(fall / 2),
+                  drift > 0 ? 'RIGHT' : 'LEFT',
+                  false,
+                  true,
+                  floorT === 0xc,
+                  floorT === 0xc || floorT === 0xf,
+                  floorT === 0xf,
+                  bx,
+                  by + 1,
+                );
+              }
+            }
+          }
+        }
+      }
+
+      // 3) Saltos em arco (respeita teto/saliências e contorna pilares antes de subir - Imagens 4, 5 e 6)
       for (let dy = -1; dy >= -maxJumpH; dy--) {
         const ny = by + dy;
         if (ny < 1) break;
-        const straightHeadClear = isBodyFree(bx, ny, false);
+        const straightHeadClear = hasVertClear(bx, by - 1, ny, false);
 
         for (let dx = -4; dx <= 4; dx++) {
           if (dx === 0) continue;
           const tx = bx + dx;
           if (tx < 0 || tx >= rw) continue;
           if (!isStandable(tx, ny, true)) continue;
+          if (isHazardCeiling(tx, ny) && tAt(tx, ny - 1) === 0xa) continue;
 
-          const dir: 'LEFT' | 'RIGHT' = dx > 0 ? 'RIGHT' : 'LEFT';
-          const sideStepClear =
-            isBodyFree(bx + (dx > 0 ? 1 : -1), by, false) && isBodyFree(bx + (dx > 0 ? 1 : -1), ny, false);
-          if (!straightHeadClear && !sideStepClear) continue;
-
+          const tGate = tAt(tx, ny) === 0xc || tAt(tx, ny) === 0xf;
+          const isBombTile = tAt(tx, ny) === 0xf;
+          const hazardPen = isHazardCeiling(tx, ny) ? 4 : 0;
           const stepSign = dx > 0 ? 1 : -1;
-          let pathClear = true;
-          for (let sx = stepSign; Math.abs(sx) <= Math.abs(dx); sx += stepSign) {
-            if (!isBodyFree(bx + sx, ny, true)) {
-              pathClear = false;
+          const adjacentWallBlocksJump = dy <= -3 && !isCellAir(bx + stepSign, by - 1, false);
+
+          if (straightHeadClear && !adjacentWallBlocksJump) {
+            let pathClear = true;
+            for (let sx = stepSign; Math.abs(sx) <= Math.abs(dx); sx += stepSign) {
+              if (!isBodyFree(bx + sx, ny, true)) {
+                pathClear = false;
+                break;
+              }
+            }
+            if (!pathClear) continue;
+            const dir: 'LEFT' | 'RIGHT' = dx > 0 ? 'RIGHT' : 'LEFT';
+            const jumpCost = 2 + Math.abs(dx) + Math.abs(dy) + (tGate ? 3 : 0) + hazardPen;
+            relaxEdge(idx, tx, ny, jumpCost, dir, true, false, tGate, tGate, isBombTile);
+          } else {
+            // Saliência/pilar bloqueia subida direta: primeiro recua 1-2 blocos para espaço aberto, depois sobe em arco
+            for (const stepOut of [-1, 1, -2, 2]) {
+              const ox = bx + stepOut;
+              if (ox < 0 || ox >= rw) continue;
+              const sgnOut = stepOut > 0 ? 1 : -1;
+              let stepClear = true;
+              for (let sx = sgnOut; Math.abs(sx) <= Math.abs(stepOut); sx += sgnOut) {
+                if (!isBodyFree(bx + sx, by, false)) {
+                  stepClear = false;
+                  break;
+                }
+              }
+              if (!stepClear) continue;
+              if (!hasVertClear(ox, by - 1, ny, false)) continue;
+
+              const sgnToTx = tx >= ox ? 1 : -1;
+              let topClear = true;
+              for (let cx = ox; cx !== tx + sgnToTx; cx += sgnToTx) {
+                if (!isBodyFree(cx, ny, true)) {
+                  topClear = false;
+                  break;
+                }
+              }
+              if (!topClear) continue;
+
+              const outDir: 'LEFT' | 'RIGHT' = stepOut > 0 ? 'RIGHT' : 'LEFT';
+              const stepIsFloor = isStandable(ox, by, false);
+              const arcCost = 4 + Math.abs(stepOut) + Math.abs(tx - ox) + Math.abs(dy) + (tGate ? 3 : 0) + hazardPen;
+              relaxEdge(idx, tx, ny, arcCost, outDir, !stepIsFloor, false, tGate, tGate, isBombTile, ox, by);
               break;
             }
           }
-          if (!pathClear) continue;
-
-          const tGate = tAt(tx, ny) === 0xc || tAt(tx, ny) === 0xd;
-          const jumpCost = 2 + Math.abs(dx) + Math.abs(dy) + (tGate ? 2 : 0);
-          relaxEdge(idx, tx, ny, jumpCost, dir, true, false, tGate, tGate);
         }
       }
 
@@ -1315,19 +1569,21 @@ export class LocalVisionAgent {
             const ny = by + dy;
             if (!isBodyFree(nx, ny, true)) continue;
             const tt = tAt(nx, ny);
-            const isGate = tt === 0xc || tt === 0xd;
+            const isBombTile = tt === 0xf;
+            const isGate = tt === 0xc || isBombTile;
             const moveDir: 'LEFT' | 'RIGHT' =
               dx !== 0 ? (dx > 0 ? 'RIGHT' : 'LEFT') : bx >= rw / 2 ? 'LEFT' : 'RIGHT';
-            const needJump = dy < 0 || !isFloorTile(nx, ny + 1);
+            const needJump = (dy < 0 || !isFloorTile(nx, ny + 1)) && !isHazardCeiling(nx, ny);
             const needDrop = dy > 0 && !isFloorTile(nx, ny + 1);
-            const flyCost = (dy <= 0 ? 2 : 1) + (dx === 0 ? 1 : 0) + (isGate ? 2 : 0);
-            relaxEdge(idx, nx, ny, flyCost, moveDir, needJump, needDrop, isGate, isGate);
+            const hazardPen = isHazardCeiling(nx, ny) ? 4 : 0;
+            const flyCost = (dy <= 0 ? 2 : 1) + (dx === 0 ? 1 : 0) + (isGate ? 3 : 0) + hazardPen;
+            relaxEdge(idx, nx, ny, flyCost, moveDir, needJump, needDrop, isGate, isGate, isBombTile);
           }
         }
       }
     }
 
-    // Seleciona o alvo alcançável com melhor prioridade e menor custo real
+    // Seleciona o alvo alcançável com melhor prioridade e menor custo real (com linha desobstruída até o alvo)
     let bestTarget: { key: string; idx: number; score: number } | null = null;
     for (const target of targets) {
       let bestNodeForTarget = -1;
@@ -1337,7 +1593,7 @@ export class LocalVisionAgent {
           const cx = Math.max(0, Math.min(rw - 1, target.bx + dx));
           const cy = Math.max(1, Math.min(rh - 2, target.by + dy));
           const cIdx = cy * rw + cx;
-          if (dist[cIdx] < 0x3f3f3f3f) {
+          if (dist[cIdx] < 0x3f3f3f3f && hasDirectTargetSight(cx, cy, target.bx, target.by)) {
             const c = dist[cIdx] + Math.abs(dx) + Math.abs(dy);
             if (c < bestNodeCost) {
               bestNodeCost = c;
@@ -1366,6 +1622,7 @@ export class LocalVisionAgent {
         jump: t.by < startBy - 1,
         drop: t.by > startBy + 1,
         shoot: true,
+        bomb: false,
         wpBx: t.bx,
         wpBy: t.by,
         goalKey: t.key,
@@ -1389,6 +1646,7 @@ export class LocalVisionAgent {
       jump: meta.jump,
       drop: meta.drop,
       shoot: meta.shoot,
+      bomb: meta.bomb,
       wpBx: meta.wpBx,
       wpBy: meta.wpBy,
       goalKey: bestTarget.key,
@@ -1512,9 +1770,26 @@ export class LocalVisionAgent {
         continue;
       }
 
-      // 3) Core-X em 4 fases visuais: Normal (prata) -> Amarelado -> Vermelho -> Poder Exposto (Imagens 4-7)
+      // 3) Core-X em 4 fases visuais: Normal (prata) -> Amarelado -> Vermelho -> Poder Exposto (Imagens 4-7 + Imagem 2 coleta)
+      const sawRedCoreXInRoom =
+        this.lastCoreXWasRedTick > 0 &&
+        this.stepIndex - this.lastCoreXWasRedTick <= 260 &&
+        this.lastCoreXWasRedRoomId === wram.roomId;
+      const sawAnyCoreXInRoom =
+        this.lastCoreXSeenTick > 0 &&
+        this.stepIndex - this.lastCoreXSeenTick <= 260 &&
+        this.lastCoreXRoomId === wram.roomId;
+      const looksGlowingNakedOrb = Boolean(
+        colors && colors.silverCyanRatio >= 0.11 && colors.goldRatio >= 0.03 && colors.redRatio < 0.08,
+      );
+
       let detectedCoreStage: CoreXStage | null = null;
-      if (colors && e.hp > 0 && e.hp < 450 && (e.xRadius >= 12 || track?.isCoreX)) {
+      if (
+        colors &&
+        e.hp > 0 &&
+        e.hp < 450 &&
+        (e.xRadius >= 12 || track?.isCoreX || (e.xRadius >= 6 && (sawAnyCoreXInRoom || looksGlowingNakedOrb)))
+      ) {
         const hasCoreGold = colors.goldRatio >= 0.025;
         if (colors.redRatio >= 0.11 && hasCoreGold) {
           detectedCoreStage = 'VERMELHO';
@@ -1522,24 +1797,25 @@ export class LocalVisionAgent {
           colors.yellowGreenRatio >= 0.11 &&
           hasCoreGold &&
           colors.redRatio < 0.09 &&
-          colors.silverCyanRatio < 0.09
+          colors.silverCyanRatio < 0.09 &&
+          !sawRedCoreXInRoom
         ) {
           detectedCoreStage = 'AMARELO';
         } else if (
-          colors.silverCyanRatio >= 0.12 &&
-          hasCoreGold &&
-          colors.redRatio < 0.06 &&
-          colors.yellowGreenRatio < 0.08 &&
-          (track?.seenRedStage || e.hp <= 45)
+          (colors.silverCyanRatio >= 0.07 &&
+            hasCoreGold &&
+            colors.redRatio < 0.08 &&
+            (track?.seenRedStage || sawRedCoreXInRoom || e.hp <= 45)) ||
+          (colors.silverCyanRatio >= 0.13 && colors.goldRatio >= 0.04 && colors.redRatio < 0.07)
         ) {
           detectedCoreStage = 'PODER_EXPOSTO';
         } else if (
           (colors.silverCyanRatio >= 0.10 && hasCoreGold && colors.redRatio < 0.09) ||
-          (track?.isCoreX && !track.seenRedStage)
+          (track?.isCoreX && !track.seenRedStage && !sawRedCoreXInRoom)
         ) {
           detectedCoreStage = 'NORMAL';
         }
-      } else if (track?.isCoreX && track.seenRedStage) {
+      } else if (track?.isCoreX && (track.seenRedStage || sawRedCoreXInRoom)) {
         detectedCoreStage = 'PODER_EXPOSTO';
       }
 
@@ -1547,7 +1823,11 @@ export class LocalVisionAgent {
         if (track) {
           track.isCoreX = true;
           track.coreXStage = detectedCoreStage;
-          if (detectedCoreStage === 'VERMELHO') track.seenRedStage = true;
+          if (detectedCoreStage === 'VERMELHO') {
+            track.seenRedStage = true;
+            this.lastCoreXWasRedTick = this.stepIndex;
+            this.lastCoreXWasRedRoomId = wram.roomId;
+          }
           track.specialType =
             detectedCoreStage === 'PODER_EXPOSTO'
               ? 'CORE_X_NAKED'
@@ -1557,7 +1837,11 @@ export class LocalVisionAgent {
                   ? 'CORE_X_YELLOW'
                   : 'CORE_X_SILVER';
         }
-        if (!coreXTarget || dist < coreXTarget.dist) {
+        if (detectedCoreStage === 'VERMELHO') {
+          this.lastCoreXWasRedTick = this.stepIndex;
+          this.lastCoreXWasRedRoomId = wram.roomId;
+        }
+        if (!coreXTarget || detectedCoreStage === 'PODER_EXPOSTO' || dist < coreXTarget.dist) {
           coreXTarget = { ...e, dist, stage: detectedCoreStage };
         }
         continue;
@@ -1781,14 +2065,17 @@ export class LocalVisionAgent {
     }
 
     if (coreXTarget && coreXTarget.stage === 'PODER_EXPOSTO') {
-      // Imagem 7: núcleo Core-X exposto pode tentar fugir — perseguir e absorver!
+      // Imagem 7 + Imagem 2: núcleo Core-X exposto — perseguir diretamente sem desviar para a parede!
       this.resetUSearch();
       const { jump: jumpKey, run: dashKey, cancel: cancelKey } = wram.controls;
       const chaseDir: 'LEFT' | 'RIGHT' = coreXTarget.x >= wram.samusX ? 'RIGHT' : 'LEFT';
       this.moveDir = chaseDir;
       const keys: AIKey[] = [chaseDir, dashKey];
       if (wram.selectedHudItem !== 0) keys.push(cancelKey);
-      if (this.nextJump(coreXTarget.y < wram.samusY - 12 || this.stepIndex % 6 === 0, 3)) {
+      const jumpForOrb =
+        coreXTarget.y < wram.samusY - 8 ||
+        (Math.abs(coreXTarget.x - wram.samusX) < 40 && coreXTarget.y < wram.samusY + 4);
+      if (this.nextJump(jumpForOrb, 3)) {
         keys.push(jumpKey);
       }
       return this.makeMetroidAction(
@@ -1798,7 +2085,7 @@ export class LocalVisionAgent {
         'run',
         motionPct,
         'Core-X · Coletando Poder!',
-        `Acompanhando núcleo de poder Core-X (${Math.round(coreXTarget.dist)} px) para absorver habilidade`,
+        `Perseguindo núcleo de poder Core-X (${Math.round(coreXTarget.dist)} px) para absorver habilidade`,
         wram,
       );
     }
@@ -2527,6 +2814,17 @@ export class LocalVisionAgent {
 
     const hasSpaceJump = (wram.itemsMask & 0x0200) !== 0;
     const isGrounded = this.sameYStreak >= 2 && Math.abs(this.samusVy) <= 1;
+    const samusBx = Math.max(0, Math.min(wram.roomWidthBlocks - 1, Math.floor(wram.samusX / 16)));
+    const samusBy = Math.max(1, Math.min(wram.roomHeightBlocks - 2, Math.floor(wram.samusY / 16)));
+    const tileAbove1 = this.resolveBlockType(wram, samusBx, samusBy - 1);
+    const tileAbove2 = this.resolveBlockType(wram, samusBx, samusBy - 2);
+    const isSolidHead = (t: number) => t === 0x8 || t === 0xa || t === 0xe || t === 0xf;
+    const spikeNearHead =
+      tileAbove1 === 0xa ||
+      tileAbove2 === 0xa ||
+      this.resolveBlockType(wram, samusBx - 1, samusBy - 2) === 0xa ||
+      this.resolveBlockType(wram, samusBx + 1, samusBy - 2) === 0xa;
+    const ceilingLow = isSolidHead(tileAbove1) || isSolidHead(tileAbove2) || spikeNearHead;
 
     // Bloqueio detectado em Exploração: testa míssil (se tiver) e aciona Busca em 'U' antes de desistir
     if (this.progressStallTicks >= 5) {
@@ -2571,14 +2869,14 @@ export class LocalVisionAgent {
         this.anchorY = wram.samusY;
         this.progressStallTicks = 0;
         const keys: AIKey[] = [oppDir, dashKey];
-        if (hasSpaceJump && this.stepIndex % 2 === 0) keys.push(jumpKey);
+        if (hasSpaceJump && !ceilingLow && this.stepIndex % 2 === 0) keys.push(jumpKey);
         return this.makeMetroidAction('EXPLORE', keys, 150, 'run', motionPct, isTimedEscape ? 'Fuga · Contornando obstáculo' : 'Exploração · Invertendo rota', 'Desviando de obstáculo na rota de fuga', wram);
       }
 
       const targetDoor = pathStep ? wram.doors.find((d) => d.key === pathStep.goalKey) : null;
       const nearDoor = targetDoor && Math.hypot(targetDoor.x - wram.samusX, targetDoor.y - wram.samusY) <= 44;
       const keys: AIKey[] = [pathStep ? pathStep.dir : this.moveDir, dashKey];
-      if (!nearDoor) {
+      if (!nearDoor && !ceilingLow) {
         if (hasSpaceJump) {
           if (isGrounded ? this.nextJump(true, 3) : (this.stepIndex % 2 === 0 || this.samusVy >= 0)) {
             keys.push(jumpKey);
@@ -2586,6 +2884,8 @@ export class LocalVisionAgent {
         } else if (this.nextJump(true, 3)) {
           keys.push(jumpKey);
         }
+      } else if (ceilingLow && (wram.itemsMask & 0x0004) && isGrounded) {
+        keys.push('DOWN');
       }
       if (this.nextShoot(true)) keys.push(shootKey);
       return this.makeMetroidAction(
@@ -2594,8 +2894,8 @@ export class LocalVisionAgent {
         125,
         'run',
         motionPct,
-        nearDoor ? 'Exploração · Abrindo porta' : isTimedEscape ? 'Fuga · Escalando saída' : 'Exploração · Testando passagem',
-        nearDoor ? 'Disparando na porta para avançar de sala' : 'Saltando e disparando para liberar caminho',
+        nearDoor ? 'Exploração · Abrindo porta' : isTimedEscape ? 'Fuga · Contornando teto' : 'Exploração · Testando passagem',
+        nearDoor ? 'Disparando na porta para avançar de sala' : 'Contornando obstáculo com segurança',
         wram,
       );
     }
@@ -2607,18 +2907,41 @@ export class LocalVisionAgent {
       const wpX = pathStep.wpBx * 16 + 8;
       const wpY = pathStep.wpBy * 16 + 8;
       const nearDoor = targetDoor && Math.hypot(targetDoor.x - wram.samusX, targetDoor.y - wram.samusY) <= 56;
+      const floorBelowT = this.resolveBlockType(wram, samusBx, samusBy + 1);
+      const bombFloorUnderFoot =
+        (pathStep.bomb || (pathStep.drop && floorBelowT === 0xf)) &&
+        Math.abs(wram.samusX - wpX) <= 14 &&
+        (isGrounded || (this.sameYStreak >= 1 && Math.abs(this.samusVy) <= 1)) &&
+        (wram.itemsMask & 0x1004) === 0x1004;
+
+      if (bombFloorUnderFoot) {
+        const bKeys: AIKey[] = ['DOWN'];
+        if (this.nextShoot(true)) bKeys.push(shootKey);
+        return this.makeMetroidAction(
+          'EXPLORE',
+          bKeys,
+          120,
+          'run',
+          motionPct,
+          'Exploração · Bomba no piso',
+          `Sala 0x${wram.roomId.toString(16).toUpperCase()} (${wram.samusX},${wram.samusY}) · plantando bomba para descer`,
+          wram,
+        );
+      }
+
       const nearCenter = Math.abs(wram.samusX - wpX) < 10 && pathStep.drop;
       const moveKey: AIKey = pathStep.dir;
-
       const keys: AIKey[] = nearCenter ? [moveKey] : [moveKey, dashKey];
-      const hitSmallStep = isGrounded && Math.abs(this.samusVx) === 0 && this.roomMovedOnce && !pathStep.drop;
-      const needsAscend = !pathStep.drop && (pathStep.jump || wpY < wram.samusY - 12 || (targetDoor ? targetDoor.y < wram.samusY - 20 : false) || hitSmallStep);
+      const hitSmallStep = isGrounded && Math.abs(this.samusVx) === 0 && this.roomMovedOnce && !pathStep.drop && !ceilingLow;
+      const needsAscend =
+        !pathStep.drop &&
+        !(ceilingLow && !pathStep.jump) &&
+        (pathStep.jump || (!ceilingLow && wpY < wram.samusY - 12) || hitSmallStep);
 
       if (hasSpaceJump && needsAscend && (!nearDoor || (targetDoor && targetDoor.y < wram.samusY - 14))) {
         if (isGrounded) {
           if (this.nextJump(true, 3)) keys.push(jumpKey);
         } else if (this.stepIndex % 2 === 0 || this.samusVy >= 0) {
-          // Pulso limpo para engatar múltiplos Space Jumps / Screw Attack sem travar o botão A pressionado
           this.jumpHoldRemaining = 0;
           keys.push(jumpKey);
         }
@@ -2634,10 +2957,12 @@ export class LocalVisionAgent {
       const actionDesc = pathStep.drop
         ? `Descendo poço para ${dirLabel}`
         : pathStep.jump
-          ? (hasSpaceJump ? `Space Jump rumo à ${dirLabel}` : `Subindo plataforma para ${dirLabel}`)
+          ? (hasSpaceJump ? `Space Jump rumo à ${dirLabel}` : `Contornando/subindo para ${dirLabel}`)
           : nearDoor
             ? `Abrindo porta (${targetDoor!.side})`
-            : `Indo para ${dirLabel}`;
+            : ceilingLow
+              ? `Passando sob teto para ${dirLabel}`
+              : `Indo para ${dirLabel}`;
 
       return this.makeMetroidAction(
         'EXPLORE',
@@ -2653,15 +2978,15 @@ export class LocalVisionAgent {
 
     // Fallback sem portas mapeadas na sala (ex.: elevador central ou área vertical)
     const isVerticalShaft = wram.roomHeightPx > wram.roomWidthPx && wram.roomWidthPx <= 512;
-    const hitSmallStep = isGrounded && Math.abs(this.samusVx) === 0 && (this.roomMovedOnce || this.roomTicks > 48);
+    const hitSmallStep = isGrounded && Math.abs(this.samusVx) === 0 && (this.roomMovedOnce || this.roomTicks > 48) && !ceilingLow;
     const jumpInterval = isVerticalShaft ? 5 : 11;
-    const shouldJump = hitSmallStep || (isGrounded && this.stepIndex % jumpInterval === 0);
+    const shouldJump = !ceilingLow && (hitSmallStep || (isGrounded && this.stepIndex % jumpInterval === 0));
 
     const keys: AIKey[] = [this.moveDir, dashKey];
     if (isGrounded && this.stepIndex % 24 === 0 && !hasSpaceJump && !isTimedEscape) {
       keys.push('DOWN');
     }
-    if (hasSpaceJump && (isTimedEscape || isVerticalShaft)) {
+    if (hasSpaceJump && !ceilingLow && (isTimedEscape || isVerticalShaft)) {
       if (isGrounded ? this.nextJump(true, 3) : (this.stepIndex % 2 === 0 || this.samusVy >= 0)) {
         keys.push(jumpKey);
       }
