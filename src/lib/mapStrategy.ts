@@ -168,6 +168,9 @@ export function classifyDoorColor(
       const b = rgba[i + 2] ?? 0;
       const lum = (r + g + b) / 3;
       if (lum < 34) continue; // fundo/fenda escura não conta
+      // anel de fire fleas (Norfair/X-Fusion): pontinhos laranja AO REDOR da porta — sem
+      // este filtro a moldura rosa é lida como "comporta vermelha de 5 mísseis"
+      if (isIncandescentPixel(r, g, b)) continue;
       n += 1;
       red += r;
       green += g;
@@ -1054,10 +1057,30 @@ export interface MoltenLake {
   col1: number;
   /** quantas células marcadas (fração do chão) */
   cells: number;
+  /** 'orange' = lava clássica do SM; 'red-hot' = paleta carmim do X-Fusion (Norfair) */
+  tier: 'orange' | 'red-hot';
 }
 
 function isMolten(r: number, g: number, b: number): boolean {
   return r > 150 && g >= 55 && g <= 180 && b < 100 && r - b > 80;
+}
+
+/**
+ * Núcleo incandescente da lava (bolha/clareio do lago). Medido no frame REAL do print
+ * do usuário (Norfair X-Fusion, células de 8px): jato #f8c860. É a EVIDÊNCIA de lago —
+ * sem nenhum pixel destes a camada red-hot não liga, o que protege salas vermelhas sem lava.
+ */
+export function isIncandescentPixel(r: number, g: number, b: number): boolean {
+  return r > 195 && g >= 110 && g <= 215 && b >= 70 && b <= 170 && r - b > 85;
+}
+
+/**
+ * Corpo da lava carmim do X-Fusion. Calibrado contra o mesmo frame: lava #d22b30/#d01010
+ * (r≈208-210) vs o tijolo quente da plataforma #b11014 (r=177) e a sombra #930409 — o
+ * corte r>185 separa os dois com folga; g/b baixos separam do laranja clássico.
+ */
+export function isRedHotLavaPixel(r: number, g: number, b: number): boolean {
+  return r > 185 && g < 80 && b < 95 && r - g > 105 && r - b > 95;
 }
 
 export function senseMoltenLake(
@@ -1108,9 +1131,124 @@ export function senseMoltenLake(
     }
     let cells = 0;
     for (let i = 0; i < mask.length; i++) cells += mask[i]!;
-    return { mask, surfaceRow: cr, col0: run.from, col1: run.to, cells };
+    return { mask, surfaceRow: cr, col0: run.from, col1: run.to, cells, tier: 'orange' };
   }
-  return null;
+  return senseRedHotLake(rgba, frameW, frameH, sx, sy);
+}
+
+/**
+ * Camada 2 — lago vermelho-incandescente do X-Fusion. O print real do usuário provou por
+ * que o tier laranja não basta: a lava aqui é #d01010/#d22b30 (g≈16-43) e a varredura
+ * laranja não vê NADA — o agente tratava o fundo do poço como chão e travava na margem.
+ *
+ * Calibração medida NO FRAME (não a olho): por célula de 8px compara-se a MÉDIA dos
+ * pixels — lava do poço #d22b30 (r≈210) vs tijolo quente da plataforma #b11014 (r≈177)
+ * vs painel de fundo #d01010. Fração por pixel falhou (trincas do tijolo escurecem a
+ * lava clara; painéis lisos acendem), a média separou limpo. A partir daí vale a mesma
+ * filosofia do tier laranja: superfície = linha com corrida ≥10 de células quentes, e
+ * PREENCHE-SE o retângulo abaixo dela (dentro das colárias quentes daquela linha), com
+ * a prova das bolhas incandescentes como gatilho — sem ≥2 pixels #f8c8xx, nada liga.
+ */
+function senseRedHotLake(
+  rgba: Uint8ClampedArray | Uint8Array,
+  frameW: number,
+  frameH: number,
+  sx: number,
+  sy: number,
+): MoltenLake | null {
+  const hot = new Uint8Array(MOLTEN_COLS * (MOLTEN_ROWS - 18));
+  let incandescents = 0;
+  for (let cr = 18; cr < MOLTEN_ROWS; cr++) {
+    for (let cc = 0; cc < MOLTEN_COLS; cc++) {
+      const px0 = Math.floor(cc * MOLTEN_CELL * sx);
+      const px1 = Math.floor((cc + 1) * MOLTEN_CELL * sx) - 1;
+      const py0 = Math.floor(cr * MOLTEN_CELL * sy);
+      const py1 = Math.floor((cr + 1) * MOLTEN_CELL * sy) - 1;
+      // média de TODA a célula (passo 1): a calibração no frame real mostrou que
+      // amostra esparsa demais (o passo 2 do tier laranja) não reproduz a média do
+      // bloco — em textura de tijolo a diferença inverte o sinal.
+      let rs = 0;
+      let gs = 0;
+      let bs = 0;
+      let n = 0;
+      for (let py = py0; py <= py1; py += 1) {
+        const row = py * frameW;
+        for (let px = px0; px <= px1; px += 1) {
+          const i = (row + px) * 4;
+          const rr = rgba[i] ?? 0;
+          const gg = rgba[i + 1] ?? 0;
+          const bb = rgba[i + 2] ?? 0;
+          rs += rr;
+          gs += gg;
+          bs += bb;
+          n++;
+          if (isIncandescentPixel(rr, gg, bb)) incandescents++;
+        }
+      }
+      if (n === 0) continue;
+      hot[(cr - 18) * MOLTEN_COLS + cc] = isRedHotLavaPixel(rs / n, gs / n, bs / n) ? 1 : 0;
+    }
+  }
+  if (incandescents < 2) return null;
+  let totalHot = 0;
+  for (let i = 0; i < hot.length; i++) totalHot += hot[i]!;
+  if (totalHot < 12) return null; // um par de reflexos pontuais não é lago
+  let surfaceRow = -1;
+  let col0 = 0;
+  let col1 = 0;
+  for (let r = 0; r < MOLTEN_ROWS - 18; r++) {
+    let best = 0;
+    let cur = 0;
+    let bf = 0;
+    let bl = 0;
+    let f = -1;
+    for (let c = 0; c <= MOLTEN_COLS; c++) {
+      const on = c < MOLTEN_COLS && hot[r * MOLTEN_COLS + c] === 1;
+      if (on) {
+        if (f < 0) f = c;
+        cur++;
+      } else {
+        if (cur > best) {
+          best = cur;
+          bf = f;
+          bl = c - 1;
+        }
+        cur = 0;
+        f = -1;
+      }
+    }
+    // 8 células = 64px: o poço do print tem a superfície APERTADA entre plataformas
+    // (corridas de 12px+ só existiriam num lago aberto) — 10 como no laranja matava o
+    // caso real; a segurança extra vem da continuidade abaixo + das bolhas.
+    if (best < 8) continue;
+    // A corrida precisa ter PROFUNDIDADE: painel/faixa decorativa morre em 1-2 linhas, lago
+    // desce até o fim da banda. Medido no print: as 8 colunas do poço têm profundidade 5-6;
+    // a faixa sintética de 2 linhas tem 1. Exige 60% das colunas com ≥3 linhas seguidas.
+    let deep = 0;
+    for (let c = bf; c <= bl; c++) {
+      let d = 0;
+      for (let rr = r; rr < MOLTEN_ROWS - 18; rr++) {
+        if (hot[rr * MOLTEN_COLS + c] !== 1) break;
+        d++;
+      }
+      if (d >= 3) deep++;
+    }
+    if (deep < best * 0.6) continue;
+    surfaceRow = r + 18;
+    col0 = bf;
+    col1 = bl;
+    break;
+  }
+  if (surfaceRow < 0) return null;
+  const mask = new Uint8Array(MOLTEN_COLS * MOLTEN_ROWS);
+  let cells = 0;
+  for (let r = surfaceRow; r < MOLTEN_ROWS; r++) {
+    for (let c = col0; c <= col1; c++) {
+      mask[r * MOLTEN_COLS + c] = 1;
+      cells++;
+    }
+  }
+  return { mask, surfaceRow, col0, col1, cells, tier: 'red-hot' };
 }
 
 function longestRun(mask: Uint8Array, row: number): { len: number; from: number; to: number } {

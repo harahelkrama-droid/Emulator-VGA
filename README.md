@@ -101,6 +101,16 @@ sala da sessão — não é só uma mudança de rótulo.
 Sala com lava (o print clássico de Norfair): no Super Metroid a lava **não é um tipo de bloco**
 — o mapa de sala mostra "chão sólido" — então a superfície é detectada pela **cor do pixel**
 (`senseMoltenLake`) e vira veto de piso, com varredura de queda e commit de rota pela beirada.
+**Dois tiers de cor**, porque o hack não usa a paleta do vanilla: o `orange` (#f87828, o lago
+clássico) é o primeiro; se ele não vê nada, o `red-hot` varre a banda inferior procurando a lava
+carmim do X-Fusion, medida frame a frame no print real do usuário: corpo `#d22b30`/`#d01010`
+(r≈210, g≈16-43) e bolha incandescente `#f8c860`. Os dois cortes que separaram a lava da
+plataforma foram `r > 185` (a laca quente do tijolo é `#b11014`, r=177) e exigir **≥2 pixels
+incandescentes** + **≥3 linhas de profundidade** — assim painel vermelho decorativo não vira lago
+e sala de Norfair sem lava continua andando no chão. O `red-hot` marca célula a célula e preenche
+só dentro da corrida da superfície: a plataforma onde a Samus está continua firme (no print,
+superfície na linha 22, colunas 12-19, plataforma (23,4) intacta).
+
 Se a saída é uma comporta fechada no teto, a jogada é a humana: andar até embaixo, SELECT no
 míssil, **atirar para cima e pular**. Com **Gravity Suit**, a lava deixa de vetar e a travessia
 usa os pulos em cadeia do Space Jump. O menu/mapa obedece ao relógio da sessão: abre **3
@@ -119,7 +129,10 @@ a cor reconhecida, o backlog ("voltar quando tiver o item") e o que falta do che
 
 Para calibrar os detectores com material real, `scripts/videoFrames.py` amostra um vídeo de
 gameplay (frame a cada N segundos) e imprime as paletas dominantes do chão/HUD — é como se
-confere, por exemplo, se a lava do hack bate com o threshold do `senseMoltenLake`:
+confere, por exemplo, se a lava do hack bate com os thresholds do `senseMoltenLake`. A mesma
+receita vale para um print/PDF: recortar o canvas 256×224 e rodar `senseMoltenLake` no frame —
+é assim que o tier `red-hot` foi calibrado e é assim que ele é regressado em
+`npm run check:map` (seção E):
 
 ```bash
 python3 -m venv /tmp/vid && /tmp/vid/bin/pip install av pillow numpy
@@ -127,7 +140,7 @@ python3 -m venv /tmp/vid && /tmp/vid/bin/pip install av pillow numpy
 ```
 
 ```bash
-npm run check:map    # 40 checagens do módulo (portas, tela de mapa pintada, rota, backlog, checklist)
+npm run check:map    # 49 checagens do módulo (portas, tela de mapa pintada, rota, backlog, checklist)
 npm run check:nav    # 50 checagens do agente num mundo de várias salas: mapa real + salas com lava
 npm run check:all    # tudo: codex de chefes + mapa + as duas simulações de agente
 ```
