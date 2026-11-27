@@ -246,6 +246,34 @@ export class LocalVisionAgent {
   private stuckInRoomTicks = 0;
   private lastRoomEntryTick = 0;
 
+  // Sistema de análise inicial: abrir mapa para verificar habilidades e decidir direção
+  private mapAnalyzed = false;
+  private mapAnalysisTick = 0;
+  private preferredDirection: 'LEFT' | 'RIGHT' | null = null;
+  private initialLoadoutAnalyzed = false;
+  private abilitiesSummary: string[] = [];
+
+  // Sistema de priorização de objetivos: qual objetivo perseguir primeiro
+  private currentObjective: {
+    type: 'ITEM' | 'DOOR' | 'BOSS' | 'SAVE_STATION' | 'ENERGY_AUX' | 'EXPLORE';
+    x: number;
+    y: number;
+    priority: number;
+    reason: string;
+  } | null = null;
+  private objectiveTick = 0;
+
+  // Detecção de loop com escape forçado
+  private loopDetected = false;
+  private forcedEscapeTick = 0;
+  private forcedEscapeDir: 'LEFT' | 'RIGHT' | null = null;
+  private lastRoomPositions: Array<{ x: number; y: number; tick: number }> = [];
+
+  // Evasão inteligente da SA-X: considera bloqueio de rota
+  private saxBlocksRoute = false;
+  private saxBlockRouteTick = 0;
+  private alternateEscapeDir: 'LEFT' | 'RIGHT' | null = null;
+
   // Padrão de busca em 'U' para contornar bloqueios durante Exploração
   private uSearch: USearchState = {
     active: false,
@@ -388,6 +416,20 @@ export class LocalVisionAgent {
     this.lastInteractionTick = -100;
     this.stuckInRoomTicks = 0;
     this.lastRoomEntryTick = this.stepIndex;
+    this.mapAnalyzed = false;
+    this.mapAnalysisTick = 0;
+    this.preferredDirection = null;
+    this.initialLoadoutAnalyzed = false;
+    this.abilitiesSummary = [];
+    this.currentObjective = null;
+    this.objectiveTick = 0;
+    this.loopDetected = false;
+    this.forcedEscapeTick = 0;
+    this.forcedEscapeDir = null;
+    this.lastRoomPositions = [];
+    this.saxBlocksRoute = false;
+    this.saxBlockRouteTick = 0;
+    this.alternateEscapeDir = null;
   }
 
   private resetUSearch(cooldown = 0): void {
@@ -888,6 +930,262 @@ export class LocalVisionAgent {
   private registerMissileUse(): void {
     this.lastMissileUseTick = this.stepIndex;
     this.missileProbeCount++;
+  }
+
+  // Abre o mapa no início do jogo para analisar habilidades e decidir direção
+  private openMapAndAnalyze(
+    wram: MetroidWramSnapshot,
+    keys: AIKey[],
+    motionPct: number,
+  ): AIAction | null {
+    if (this.mapAnalyzed || wram.gameState !== 8) return null;
+
+    const mapKey: AIKey = 'SELECT';
+
+    if (this.stepIndex - this.mapAnalysisTick > 60) {
+      this.mapAnalysisTick = this.stepIndex;
+      return this.makeMetroidAction(
+        'MENU',
+        [mapKey],
+        200,
+        'run',
+        motionPct,
+        'Abertura do Mapa · Analisando Habilidades',
+        'Abrindo mapa para verificar habilidades, armadura e decidir direção de exploração',
+        wram,
+      );
+    }
+
+    return this.makeMetroidAction(
+      'MENU',
+      [mapKey],
+      150,
+      'run',
+      motionPct,
+      'Abertura do Mapa · Aguardando',
+      'Aguardando abertura do mapa para analisar habilidades',
+      wram,
+    );
+  }
+
+  // Analisa o loadout completo e define direção preferida de exploração
+  private analyzeInitialLoadout(wram: MetroidWramSnapshot): void {
+    if (this.initialLoadoutAnalyzed) return;
+
+    const loadout = this.getAgentLoadout(wram);
+
+    const skills: string[] = [];
+    if (loadout.hasVaria) skills.push('Varia Suit');
+    if (loadout.hasGravity) skills.push('Gravity Suit');
+    if (loadout.hasMorphBall) skills.push('Morph Ball');
+    if (loadout.hasBombs) skills.push('Bombas');
+    if (loadout.hasSpaceJump) skills.push('Space Jump');
+    if (loadout.hasScrewAttack) skills.push('Screw Attack');
+    if (loadout.hasIceBeam) skills.push('Ice Beam');
+    if (loadout.hasMissiles) skills.push('Mísseis');
+    if (loadout.hasSupers) skills.push('Super Mísseis');
+
+    this.abilitiesSummary = skills;
+    this.initialLoadoutAnalyzed = true;
+
+    if (loadout.hasSpaceJump && !loadout.hasMorphBall) {
+      this.preferredDirection = 'LEFT';
+    } else if (loadout.hasMorphBall && loadout.hasBombs) {
+      this.preferredDirection = 'RIGHT';
+    } else {
+      this.preferredDirection = 'RIGHT';
+    }
+
+    this.mapAnalyzed = true;
+  }
+
+  // Sistema de priorização de objetivos: decide qual objetivo perseguir primeiro
+  private updateObjective(
+    wram: MetroidWramSnapshot,
+    activeItem: { x: number; y: number; dist: number } | null,
+    nearbyEnemy: { x: number; y: number; dist: number; hp: number } | null,
+    saxPursuer: { x: number; y: number; dist: number } | null,
+    hasSaveStation: boolean,
+    hasEnergyAux: boolean,
+  ): void {
+    if (saxPursuer && saxPursuer.dist < 200) {
+      this.currentObjective = {
+        type: 'EXPLORE',
+        x: saxPursuer.x >= wram.samusX ? 0 : wram.roomWidthPx || 256,
+        y: wram.samusY,
+        priority: 10,
+        reason: 'Fugindo da SA-X',
+      };
+      this.objectiveTick = this.stepIndex;
+      return;
+    }
+
+    if (wram.maxHealth > 0 && wram.health < wram.maxHealth * 0.25 && hasSaveStation) {
+      this.currentObjective = {
+        type: 'SAVE_STATION',
+        x: wram.samusX,
+        y: wram.samusY,
+        priority: 9,
+        reason: 'Vida crítica · indo para estação de save',
+      };
+      this.objectiveTick = this.stepIndex;
+      return;
+    }
+
+    if (hasEnergyAux && !this.powerAuxActivated) {
+      this.currentObjective = {
+        type: 'ENERGY_AUX',
+        x: wram.samusX,
+        y: wram.samusY,
+        priority: 8,
+        reason: 'Ativando energia auxiliar',
+      };
+      this.objectiveTick = this.stepIndex;
+      return;
+    }
+
+    if (activeItem && activeItem.dist < 150) {
+      const loadout = this.getAgentLoadout(wram);
+      const canReach = loadout.hasMorphBall || loadout.hasSpaceJump || loadout.hasHiJump;
+
+      if (canReach || activeItem.dist < 60) {
+        this.currentObjective = {
+          type: 'ITEM',
+          x: activeItem.x,
+          y: activeItem.y,
+          priority: 5,
+          reason: `Coletando item (${Math.round(activeItem.dist)}px)`,
+        };
+        this.objectiveTick = this.stepIndex;
+        return;
+      }
+    }
+
+    if (nearbyEnemy && nearbyEnemy.hp >= 450 && this.isReadyToFightSAX(wram)) {
+      this.currentObjective = {
+        type: 'BOSS',
+        x: nearbyEnemy.x,
+        y: nearbyEnemy.y,
+        priority: 7,
+        reason: `Enfrentando chefe (HP ${nearbyEnemy.hp})`,
+      };
+      this.objectiveTick = this.stepIndex;
+      return;
+    }
+
+    const dir = this.preferredDirection ?? 'RIGHT';
+    this.currentObjective = {
+      type: 'EXPLORE',
+      x: dir === 'RIGHT' ? (wram.roomWidthPx || 256) : 0,
+      y: wram.samusY,
+      priority: 1,
+      reason: `Explorando para ${dir === 'RIGHT' ? 'direita' : 'esquerda'}`,
+    };
+    this.objectiveTick = this.stepIndex;
+  }
+
+  // Detecção de loop com escape forçado
+  private checkForcedEscape(wram: MetroidWramSnapshot): boolean {
+    this.lastRoomPositions.push({
+      x: wram.samusX,
+      y: wram.samusY,
+      tick: this.stepIndex,
+    });
+
+    if (this.lastRoomPositions.length > 30) {
+      this.lastRoomPositions.shift();
+    }
+
+    if (this.stuckInRoomTicks > 100 && !this.loopDetected) {
+      this.loopDetected = true;
+      this.forcedEscapeTick = this.stepIndex;
+
+      const lastPos = this.lastRoomPositions[this.lastRoomPositions.length - 1];
+      const firstPos = this.lastRoomPositions[0];
+      const netMovement = lastPos.x - firstPos.x;
+
+      if (Math.abs(netMovement) < 10) {
+        this.forcedEscapeDir =
+          this.preferredDirection === 'RIGHT' ? 'LEFT' : 'RIGHT';
+      } else {
+        this.forcedEscapeDir = netMovement > 0 ? 'LEFT' : 'RIGHT';
+      }
+
+      return true;
+    }
+
+    if (this.loopDetected) {
+      const escapeDuration = this.stepIndex - this.forcedEscapeTick;
+      if (escapeDuration > 60) {
+        this.loopDetected = false;
+        this.forcedEscapeDir = null;
+        this.stuckInRoomTicks = 0;
+        this.lastRoomPositions = [];
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  // Evasão inteligente da SA-X: considera se a SA-X está bloqueando a rota
+  private improvedEvadeSax(
+    motionPct: number,
+    wram: MetroidWramSnapshot,
+    pursuer: { x: number; y: number; dist: number; saxKind?: string },
+    doors: Array<{ key: string; x: number; y: number; blockedByWall: boolean }>,
+  ): { keys: AIKey[]; dir: 'LEFT' | 'RIGHT'; reason: string } | null {
+    if (!pursuer) return null;
+
+    const { shoot: shootKey, jump: jumpKey, run: dashKey } = wram.controls;
+    const safeDist = pursuer.saxKind === 'SAX_MONSTER' ? 88 : 64;
+    const tooClose = pursuer.dist < safeDist;
+
+    const saxBlockedRoute = doors.some((d) => {
+      const distFromSaxToDoor = Math.hypot(d.x - pursuer.x, d.y - pursuer.y);
+      const distFromSamusToDoor = Math.hypot(d.x - wram.samusX, d.y - wram.samusY);
+      return !d.blockedByWall && distFromSaxToDoor < 120 && distFromSaxToDoor < distFromSamusToDoor + 40;
+    });
+
+    if (saxBlockedRoute && !this.saxBlocksRoute) {
+      this.saxBlocksRoute = true;
+      this.saxBlockRouteTick = this.stepIndex;
+      this.alternateEscapeDir = pursuer.x >= wram.samusX ? 'LEFT' : 'RIGHT';
+    }
+
+    if (this.saxBlocksRoute && this.stepIndex - this.saxBlockRouteTick < 30) {
+      const escapeDir = this.alternateEscapeDir ?? (pursuer.x >= wram.samusX ? 'LEFT' : 'RIGHT');
+      const keys: AIKey[] = [escapeDir, dashKey];
+      if (this.nextJump(true, 3)) keys.push(jumpKey);
+      if (this.nextShoot(true)) keys.push(shootKey);
+      return {
+        keys,
+        dir: escapeDir,
+        reason: 'SA-X bloqueando rota · usando caminho alternativo',
+      };
+    }
+
+    if (this.saxBlocksRoute && this.stepIndex - this.saxBlockRouteTick >= 30) {
+      this.saxBlocksRoute = false;
+      this.alternateEscapeDir = null;
+    }
+
+    const fleeDir: AIKey = tooClose
+      ? (pursuer.x >= wram.samusX ? 'LEFT' : 'RIGHT')
+      : pursuer.x >= wram.samusX
+        ? 'LEFT'
+        : 'RIGHT';
+
+    const keys: AIKey[] = [fleeDir, dashKey];
+    const wantsJump = tooClose || Math.abs(pursuer.y - wram.samusY) < 28 || this.stepIndex % 4 === 0;
+    if (this.nextJump(wantsJump, 3)) keys.push(jumpKey);
+    if (this.nextShoot(true)) keys.push(shootKey);
+
+    return {
+      keys,
+      dir: fleeDir,
+      reason: `Fugindo da SA-X (${Math.round(pursuer.dist)}px)`,
+    };
   }
 
   private buildSnapshot(
@@ -2373,6 +2671,13 @@ export class LocalVisionAgent {
     }
     this.cutsceneHoldTicks = 0;
 
+    // 0) Abre o mapa no início e analisa habilidades/atributos
+    const menuAction = this.openMapAndAnalyze(wram, [], motionPct);
+    if (menuAction) return menuAction;
+
+    // Após o mapa estar aberto, analisa o loadout inicial e define direção
+    this.analyzeInitialLoadout(wram);
+
     // Atualiza grafo de salas, progresso real e detecção de bloqueio
     const { unlockedLabel, hitKnownBlocked } = this.syncRoomAndProgress(wram);
 
@@ -2552,6 +2857,44 @@ export class LocalVisionAgent {
     }
 
     const isEscapeCountdown = wram.countdownActive && !omegaIntro;
+    // Atualiza sistema de priorização de objetivos
+    const hasSaveStation = this.interactiveObjects.some(
+      (o) => o.type === 'SAVE_STATION' && !o.interacted,
+    );
+    const hasEnergyAux = this.interactiveObjects.some(
+      (o) => (o.type === 'ENERGY_AUX' || o.type === 'POWER_PANEL') && !o.interacted,
+    );
+
+    this.updateObjective(
+      wram,
+      activeItem ?? null,
+      nearbyEnemy ?? null,
+      saxPursuer ?? null,
+      hasSaveStation,
+      hasEnergyAux,
+    );
+
+    // Detecção de loop com escape forçado
+    const forcedEscape = this.checkForcedEscape(wram);
+    if (forcedEscape && this.loopDetected && this.forcedEscapeDir) {
+      const { jump: jumpKey, run: dashKey, shoot: shootKey } = wram.controls;
+      const escapeDir: AIKey = this.forcedEscapeDir;
+      const keys: AIKey[] = [escapeDir, dashKey];
+      if (this.nextJump(true, 3)) keys.push(jumpKey);
+      if (this.nextShoot(true)) keys.push(shootKey);
+      this.stuckInRoomTicks++;
+      return this.makeMetroidAction(
+        'EXPLORE',
+        keys,
+        160,
+        'run',
+        motionPct,
+        'Escape Forçado · Loop Detectado',
+        `Forçando saída da sala (stuck=${this.stuckInRoomTicks} ticks, dir=${this.forcedEscapeDir})`,
+        wram,
+      );
+    }
+
     let resolvedMode: AgentBehaviorMode = 'EXPLORE';
     if (saxPursuer && !this.omegaVanishedDuringTimer && !isEscapeCountdown) {
       const saxDisabledByMetroid =
@@ -2577,9 +2920,33 @@ export class LocalVisionAgent {
       resolvedMode = 'EXPLORE';
     }
 
+    // Coleta portas para usar na evasão inteligente da SA-X
+    const doorsForSax: Array<{ key: string; x: number; y: number; blockedByWall: boolean }> =
+      (wram as any).doors?.map((d: any) => ({
+        key: d.key || '',
+        x: d.x ?? 0,
+        y: d.y ?? 0,
+        blockedByWall: d.blockedByWall ?? false,
+      })) || [];
+
     switch (resolvedMode) {
       case 'EVADE_SAX':
         this.resetUSearch();
+        // Usa evasão inteligente que considera bloqueio de rota da SA-X
+        const saxEvade = this.improvedEvadeSax(motionPct, wram, saxPursuer!, doorsForSax);
+        if (saxEvade) {
+          const keys: AIKey[] = saxEvade.keys;
+          return this.makeMetroidAction(
+            'EVADE_SAX',
+            keys,
+            170,
+            'run',
+            motionPct,
+            'Evasão SA-X · ' + saxEvade.reason,
+            saxEvade.reason,
+            wram,
+          );
+        }
         return this.executeEvadeSaxState(motionPct, wram, saxPursuer!);
       case 'COMBAT':
         this.resetUSearch();
