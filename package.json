@@ -10,7 +10,9 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "check:bosses": "tsx scripts/bossCodexCheck.ts",
-    "check:agent": "tsx scripts/bossAgentSim.ts"
+    "check:agent": "tsx scripts/bossAgentSim.ts",
+    "check:map": "tsx scripts/mapCheck.ts",
+    "check:nav": "tsx scripts/mapAgentSim.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

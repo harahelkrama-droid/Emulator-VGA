@@ -12,6 +12,30 @@ import type {
 } from '../types/emulator';
 import type { DoorInfo, EnemyInfo, MetroidWramSnapshot, RoomItemTarget } from './snesWram';
 import {
+  buildChecklist,
+  checkGate,
+  classifyDoorColor,
+  detectLost,
+  directionForDoor,
+  gateForDoor,
+  missionComplete,
+  planNextTarget,
+  readMapScreen,
+  reopenBacklog,
+  describeChecklistForUi,
+  describeNavForUi,
+  type ChecklistItem,
+  type LostVerdict,
+  type MapHintDir,
+  type MapReading,
+  type NavBacklogEntry,
+  type NavDoor,
+  type NavGraph,
+  type NavRoom,
+  type NavTarget,
+  type DoorColor,
+} from './mapStrategy';
+import {
   planBossFight,
   describeDirectiveForUi,
   type BossDirective,
@@ -254,21 +278,13 @@ export class LocalVisionAgent {
   private stuckInRoomTicks = 0;
   private lastRoomEntryTick = 0;
 
-  // Sistema de análise periódica do menu do jogo:
-  // espera 3 min → abre menu → analisa 3 min → fecha menu → espera 10 min → repete
-  private mapAnalyzed = false;
-  private mapAnalysisTick = 0;
-  // Fluxo de menu: esperar → abrir → analisar → fechar → esperar → repetir
-  private menuPhase: 'NONE' | 'OPENING' | 'ANALYZING' | 'CLOSING' | 'DONE' = 'NONE';
-  private menuCloseTick = 0;
-  private menuCheckedAbilities = false;
+  // Preferência de direção da exploração (o mapa lido pode sobrescrevê-la)
   private preferredDirection: 'LEFT' | 'RIGHT' | null = null;
-  // Tempos exatos (ticks @ ~125ms por tick):
-  // 3 min = 1440 ticks, 10 min = 4800 ticks
-  private lastMenuCloseTick = 0;
-  private readonly MENU_WAIT_BEFORE_OPEN_TICKS = 1440;    // 3 min esperando antes de abrir o menu
-  private readonly MENU_OPEN_INTERVAL_TICKS = 4800;      // 10 min entre aberturas do menu
-  private readonly MENU_ANALYSIS_DURATION_TICKS = 1440;   // 3 min de análise com menu aberto
+  // Consulta de mapa: no Super Metroid é START (o SELECT só cicla item especial — manual,
+  // seções 1 e 6). O ciclo antigo segurava SELECT por "3 minutos de análise", o que na
+  // prática só trocava de arma repetidamente. Agora a leitura é curta e tem gatilho.
+  private readonly MAP_CONSULT_INTERVAL_TICKS = 1800;     // reavalia o mapa a cada ~3 min
+  private readonly MAP_CONSULT_MAX_TICKS = 14;            // no ar, no máximo ~1,5 s
   private initialLoadoutAnalyzed = false;
   private abilitiesSummary: string[] = [];
 
@@ -369,6 +385,33 @@ export class LocalVisionAgent {
   /** Aproximação das torres de energia do Draygon (pré-requisito do grapple). */
   private stationSpots = new Map<number, { ticks: number; goneTicks: number; destroyed: boolean }>();
   private stationRoomId = -1;
+
+  // ----------------------------------------------------------- navegação/mapa
+  /** cor classificada por porta: `${roomId}:${doorKey}` → cor do batente no frame */
+  private navDoorColors = new Map<string, DoorColor>();
+  /** itens pendentes / painéis / perigo por sala (o grafo do agente só guarda portas) */
+  private navExtras = new Map<number, { itemsPending: number; itemsSeen: number; terminalsPending: number; seen: boolean; danger: number; areaIndex: number; bossName?: string }>();
+  private roomTrail: number[] = [];
+  private navPrevItemCount = 0;
+  private lastNewRoomTick = 0;
+  private lastNavProgressTick = 0;
+  private navLost: LostVerdict = { lost: false, cause: null, severity: 0, note: 'navegação ainda não avaliada' };
+  private navBacklog: NavBacklogEntry[] = [];
+  private navTarget: NavTarget | null = null;
+  private navPlanTick = -9999;
+  private navChecklist: ChecklistItem[] = [];
+  private mapReading: MapReading | null = null;
+  private mapHint: { dir: MapHintDir; score: number } | null = null;
+  private mapHintTick = -9999;
+  private mapConsultPhase: 'IDLE' | 'OPEN' | 'READ' | 'CLOSE' = 'IDLE';
+  private mapConsultTick = 0;
+  private lastMapReadTick = -9999;
+  private mapReadFailedTick = -9999;
+  /** linha de base do início da sessão, para contar expansões coletadas pela IA */
+  private baseMaxHealth = 0;
+  private baseMaxMissiles = 0;
+  private baseMaxSupers = 0;
+  private baseMaxBombs = 0;
   private stationsDestroyedCount = 0;
 
   reset(): void {
@@ -468,6 +511,23 @@ export class LocalVisionAgent {
     this.cutsceneRoomId = -1;
     this.stationSpots.clear();
     this.stationRoomId = -1;
+    this.navDoorColors.clear();
+    this.navExtras.clear();
+    this.roomTrail = [];
+    this.navPrevItemCount = 0;
+    this.lastNewRoomTick = 0;
+    this.lastNavProgressTick = 0;
+    this.navLost = { lost: false, cause: null, severity: 0, note: 'reset' };
+    this.navBacklog = [];
+    this.navTarget = null;
+    this.navPlanTick = -9999;
+    this.navChecklist = [];
+    this.mapReading = null;
+    this.mapHint = null;
+    this.mapHintTick = -9999;
+    this.mapConsultPhase = 'IDLE';
+    this.lastMapReadTick = -9999;
+    this.mapReadFailedTick = -9999;
     this.stationsDestroyedCount = 0;
     this.interactiveObjects = [];
     this.currentInteractionTarget = null;
@@ -475,12 +535,6 @@ export class LocalVisionAgent {
     this.lastInteractionTick = -100;
     this.stuckInRoomTicks = 0;
     this.lastRoomEntryTick = this.stepIndex;
-    this.mapAnalyzed = false;
-    this.mapAnalysisTick = 0;
-    this.menuPhase = 'NONE';
-    this.menuCloseTick = 0;
-    this.lastMenuCloseTick = 0;
-    this.menuCheckedAbilities = false;
     this.preferredDirection = null;
     this.initialLoadoutAnalyzed = false;
     this.abilitiesSummary = [];
@@ -995,162 +1049,399 @@ export class LocalVisionAgent {
     this.missileProbeCount++;
   }
 
-  // Fluxo de menu periódico: ABRIR → verificar tudo (3 min) → FECHAR → jogar (10 min) → repetir
-  private openMapAndAnalyze(
+
+  // ===================================================== NAVEGAÇÃO COM O MAPA DO JOGO
+
+  /** Registros por sala que o grafo do agente não guarda (itens, painéis, perigo, chefe). */
+  private navRoomExtra(roomId: number, areaIndex: number) {
+    let rec = this.navExtras.get(roomId);
+    if (!rec) {
+      rec = { itemsPending: 0, itemsSeen: 0, terminalsPending: 0, seen: false, danger: 0, areaIndex };
+      this.navExtras.set(roomId, rec);
+    }
+    return rec;
+  }
+
+  private navLoadoutView(wram: MetroidWramSnapshot) {
+    const lo = this.getAgentLoadout(wram);
+    return {
+      hasMissileLauncher: lo.hasMissiles,
+      hasSuperMissiles: lo.hasSupers,
+      hasPowerBombs: lo.hasPowerBombs,
+      hasBombs: lo.hasBombs,
+      hasMorphBall: lo.hasMorphBall,
+      missiles: lo.missileCount,
+      supers: lo.superCount,
+      powerBombs: lo.powerBombCount,
+    };
+  }
+
+  /** Monta o grafo nav a partir das estruturas que o agente já mantém (sem duplicar estado). */
+  private buildNavGraph(wram: MetroidWramSnapshot): NavGraph {
+    const rooms = new Map<number, NavRoom>();
+    const ensure = (id: number): NavRoom => {
+      let r = rooms.get(id);
+      if (!r) {
+        const extra = this.navExtras.get(id);
+        const node = this.roomGraph.get(id);
+        const doors: NavDoor[] = [];
+        if (node) {
+          for (const [key, rec] of node.doors) {
+            const color = this.navDoorColors.get(`${id}:${key}`) ?? 'UNKNOWN';
+            const linked = rec.targetRoomId ?? node.doorLinks.get(key) ?? node.exits[key as 'LEFT' | 'RIGHT'];
+            doors.push({
+              key,
+              color,
+              blockedByWall: rec.locked,
+              targetRoomId: linked,
+              unknownColor: color === 'UNKNOWN',
+            });
+          }
+          // portas descobertas só pelos exits (LEFT/RIGHT)
+          for (const dir of ['LEFT', 'RIGHT'] as const) {
+            const via = node.exits[dir];
+            if (via === undefined) continue;
+            if (!doors.some((d) => d.key === dir)) doors.push({ key: dir, color: 'PINK', blockedByWall: false, targetRoomId: via });
+          }
+        }
+        r = {
+          id,
+          areaIndex: extra?.areaIndex ?? 0,
+          visited: this.roomsExplored.has(id),
+          itemsPending: extra?.itemsPending ?? 0,
+          bossName: extra?.bossName,
+          bossDefeated: this.bossRoomBindings.has(id),
+          terminalsPending: extra?.terminalsPending ?? 0,
+          doors,
+          danger: extra?.danger ?? 0,
+        };
+        rooms.set(id, r);
+      }
+      return r;
+    };
+    ensure(wram.roomId);
+    for (const id of this.roomGraph.keys()) ensure(id);
+    for (const t of this.pendingTargets) ensure(t.roomId);
+    return { current: wram.roomId, rooms };
+  }
+
+  /**
+   * Percepção de navegação: cores de porta amostradas do frame, itens/painéis pendentes,
+   * trilha de salas, medidor de "perdido" e o plano do próximo alvo.
+   */
+  private navPerceive(wram: MetroidWramSnapshot, bossEngaged: boolean): void {
+    if (wram.gameState !== 8 || wram.roomId <= 0) return;
+    const extra = this.navRoomExtra(wram.roomId, wram.areaIndex);
+    const firstSight = !extra.seen;
+    if (firstSight) {
+      extra.seen = true;
+      this.lastNewRoomTick = this.stepIndex;
+      this.lastNavProgressTick = this.stepIndex;
+    }
+    if (this.roomTrail[this.roomTrail.length - 1] !== wram.roomId) {
+      this.roomTrail.push(wram.roomId);
+      if (this.roomTrail.length > 40) this.roomTrail.shift();
+    }
+
+    // (a) cor do batente de cada porta da sala, direto do frame
+    const frame = this.lastCapturedFrame;
+    const rgba = frame?.rgba as unknown as Uint8ClampedArray | undefined;
+    if (rgba && frame && frame.width > 0 && wram.doors.length > 0) {
+      for (const d of wram.doors) {
+        const key = `${wram.roomId}:${d.key}`;
+        if (this.navDoorColors.get(key) === 'PINK' || this.navDoorColors.get(key) === 'CORRODED') continue; // já resolvidas
+        const sx = d.x - wram.cameraX;
+        const sy = d.y - wram.cameraY;
+        if (sx < 6 || sy < 6 || sx > frame.width - 6 || sy > frame.height - 6) continue;
+        const c = classifyDoorColor(rgba, frame.width, frame.height, sx, sy);
+        if (c) this.navDoorColors.set(key, c);
+      }
+    }
+
+    // (b) itens: conta atual vale até sair da sala; o máximo já visto evita "sumir item" falso
+    const itemsNow = wram.roomItems.length;
+    extra.itemsSeen = Math.max(extra.itemsSeen, itemsNow);
+    extra.itemsPending = itemsNow;
+
+    // (c) painéis/terminais não acionados nesta sala
+    const panels = this.interactiveObjects.filter(
+      (o) => !o.interacted && (o.type === 'POWER_PANEL' || o.type === 'ENERGY_AUX' || o.type === 'TERMINAL'),
+    ).length;
+    extra.terminalsPending = panels;
+
+    // (d) perigo: dano pesado sofrido aqui (o agente já mantém dangerCells por sala)
+    if (this.samusDamagedThisTick) extra.danger = Math.min(4, extra.danger + 1);
+
+    // (e) chefe da sala (nome vem do codex quando ele reconheceu o alvo)
+    if (bossEngaged && !extra.bossName) {
+      extra.bossName = this.bossDirective?.bossName ?? 'não catalogado';
+    }
+
+    // (f) progresso = coletou item, ganhou habilidade/capacidade, acionou painel, feriu chefe.
+    // Os prev* ainda são os do tick anterior (são atualizados depois, em syncRoomAndProgress),
+    // então a comparação é exatamente "mudou desde o último tick".
+    const gained =
+      wram.itemsMask !== this.prevItemsMask
+      || wram.beamsMask !== this.prevBeamsMask
+      || wram.maxHealth !== this.prevMaxHealth
+      || wram.maxMissiles !== this.prevMaxMissiles
+      || wram.maxSupers !== this.prevMaxSupers
+      || wram.maxPowerBombs !== this.prevMaxPbs;
+    const collected = this.navPrevItemCount > itemsNow;
+    const fought = (this.bossDirective?.damageDealt ?? 0) > 0;
+    if (gained || collected || fought || this.lastInteractionTick > this.lastNavProgressTick) {
+      this.lastNavProgressTick = this.stepIndex;
+    }
+    this.navPrevItemCount = itemsNow;
+
+    // (g) linha de base da sessão (para o checklist contar o que a IA coletou)
+    if (this.baseMaxHealth === 0) {
+      this.baseMaxHealth = wram.maxHealth;
+      this.baseMaxMissiles = wram.maxMissiles;
+      this.baseMaxSupers = wram.maxSupers;
+      this.baseMaxBombs = wram.maxPowerBombs;
+    }
+
+    // (h) estou perdido?
+    this.navLost = detectLost({
+      ticksSinceNewRoom: this.stepIndex - this.lastNewRoomTick,
+      ticksSinceProgress: this.stepIndex - this.lastNavProgressTick,
+      roomTrail: this.roomTrail,
+      positionStallTicks: this.progressStallTicks,
+      bossEngaged,
+      inCombat: this.currentMode === 'COMBAT',
+      busy: this.mapConsultPhase !== 'IDLE',
+    });
+
+    // (i) checklist
+    this.navChecklist = buildChecklist(this.navProgressInput(wram));
+
+    // (j) replaneja quando muda de sala, quando algo muda no estado ou a cada ~40 ticks
+    if (this.stepIndex - this.navPlanTick > 40 || firstSight || this.navTarget === null) {
+      this.replan(wram);
+    }
+  }
+
+  private navProgressInput(wram: MetroidWramSnapshot) {
+    const lo = this.getAgentLoadout(wram);
+    let unvisited = 0;
+    const seenTargets = new Set<number>();
+    for (const node of this.roomGraph.values()) {
+      for (const [, link] of node.doorLinks) {
+        if (!this.roomsExplored.has(link) && !seenTargets.has(link)) {
+          seenTargets.add(link);
+          unvisited += 1;
+        }
+      }
+    }
+    let terminalsDone = 0;
+    let terminalsKnown = 0;
+    for (const o of this.interactiveObjects) {
+      if (o.type === 'POWER_PANEL' || o.type === 'ENERGY_AUX' || o.type === 'TERMINAL') {
+        terminalsKnown += 1;
+        if (o.interacted) terminalsDone += 1;
+      }
+    }
+    let bossesKnown = 0;
+    for (const rec of this.navExtras.values()) if (rec.bossName) bossesKnown += 1;
+    return {
+      maxHealth: wram.maxHealth,
+      maxReserve: wram.reserveMax,
+      maxMissiles: wram.maxMissiles,
+      maxSupers: wram.maxSupers,
+      maxPowerBombs: wram.maxPowerBombs,
+      abilities: {
+        MORPH_BALL: lo.hasMorphBall,
+        BOMBS: lo.hasBombs,
+        HI_JUMP: lo.hasHiJump,
+        SPACE_JUMP: lo.hasSpaceJump,
+        SPRING_BALL: lo.hasSpringBall,
+        VARIA: lo.hasVaria,
+        GRAVITY: lo.hasGravity,
+        SCREW: lo.hasScrewAttack,
+        GRAPPLE: lo.hasGrapple,
+        XRAY: lo.hasXRay,
+        CHARGE: lo.hasChargeBeam,
+        ICE: lo.hasIceBeam,
+        WAVE: lo.hasWaveBeam,
+        SPAZER: lo.hasSpazer,
+      },
+      bossesDefeated: this.bossRoomBindings.size,
+      bossesKnown: Math.max(bossesKnown, this.bossRoomBindings.size),
+      terminalsDone,
+      terminalsKnown,
+      roomsUnvisited: unvisited,
+    };
+  }
+
+  private replan(wram: MetroidWramSnapshot): void {
+    this.navPlanTick = this.stepIndex;
+    const graph = this.buildNavGraph(wram);
+    const plan = planNextTarget({
+      graph,
+      loadout: this.navLoadoutView(wram),
+      hint: this.stepIndex - this.mapHintTick > 900 ? null : this.mapHint,
+      bossRooms: new Map<number, { name: string; defeated: boolean }>(
+        [...this.bossRoomBindings.entries()].map(([roomId, strategyId]) => [roomId, { name: strategyId, defeated: true }]),
+      ),
+      everythingDone: missionComplete(this.navChecklist),
+      backlogKeys: new Set(this.navBacklog.map((b) => `${b.roomId}`)),
+    });
+    this.navTarget = plan.target;
+    // mescla: mantém entradas antigas que o plano de agora não conseguiu reavaliar
+    const fresh = plan.backlog;
+    const keep = this.navBacklog.filter(
+      (old) => !fresh.some((f) => f.roomId === old.roomId && f.doorKey === old.doorKey)
+        && !this.roomGraph.get(old.roomId)?.doors.get(old.doorKey)?.targetRoomId,
+    );
+    this.navBacklog = [...fresh, ...keep].slice(0, 12);
+  }
+
+  /** Item chegou: reabre as portas que estavam no backlog e devolve a sala para pendingTargets. */
+  private reopenNavBacklog(wram: MetroidWramSnapshot): void {
+    if (this.navBacklog.length === 0) return;
+    const lo = this.getAgentLoadout(wram);
+    const { keep, reopened } = reopenBacklog(this.navBacklog, {
+      MISSILES: lo.hasMissiles,
+      SUPERS: lo.hasSupers,
+      POWER_BOMBS: lo.hasPowerBombs,
+      BOMBS: lo.hasBombs,
+      MORPH_BALL: lo.hasMorphBall,
+    });
+    if (reopened.length === 0) return;
+    this.navBacklog = keep;
+    for (const e of reopened) {
+      const node = this.roomGraph.get(e.roomId);
+      const targetRoom = node?.doorLinks.get(e.doorKey);
+      const door = wram.doors.find((d) => d.key === e.doorKey);
+      this.addPendingTarget({
+        roomId: targetRoom ?? e.roomId,
+        x: door?.x ?? wram.samusX,
+        y: door?.y ?? wram.samusY,
+        dir: directionForDoor(e.doorKey) === 'LEFT' ? 'LEFT' : 'RIGHT',
+        note: `backlog reaberto · ${e.note}`,
+      });
+      if (targetRoom === undefined) {
+        const rec = node?.doors.get(e.doorKey);
+        if (rec) rec.locked = false; // a parede não é mais o problema: agora temos o item
+      }
+      this.lastNavProgressTick = this.stepIndex;
+    }
+    this.replan(wram);
+  }
+
+  /**
+   * Consulta o mapa do jogo (START): abre, lê a tela, fecha. Orçamento curto e fixo — o
+   * objetivo é referência espacial, não passar minutos parado. Enquanto o mapa está na
+   * tela o jogo pausa, então isso só roda em sala limpa e fora de luta de chefe.
+   */
+  private mapConsultStep(
     wram: MetroidWramSnapshot,
-    keys: AIKey[],
+    bossEngaged: boolean,
     motionPct: number,
   ): AIAction | null {
-    if (wram.gameState !== 8) return null;
+    const phase = this.mapConsultPhase;
+    if (phase === 'IDLE') {
+      const periodic = this.stepIndex - this.lastMapReadTick >= this.MAP_CONSULT_INTERVAL_TICKS;
+      const severe = this.navLost.severity >= 3;
+      const lost = this.navLost.lost && (this.stepIndex - this.mapReadFailedTick > 240 || severe);
+      if (!lost && !periodic) return null;
+      if (wram.enemies.some((e) => e.hp > 0) || bossEngaged) return null;
+      if (wram.gameState !== 8) return null;
+      this.mapConsultPhase = 'OPEN';
+      this.mapConsultTick = this.stepIndex;
+      return this.makeMetroidAction(
+        'MENU',
+        ['START'],
+        120,
+        'menu',
+        motionPct,
+        'Mapa · abrindo (START)',
+        `Consultando o mapa do jogo · ${this.navLost.note}`,
+        wram,
+      );
+    }
 
-    const mapKey: AIKey = 'SELECT';
+    const elapsed = this.stepIndex - this.mapConsultTick;
 
-    // Fase DONE: menu fechado, esperando 10 minutos antes de abrir novamente
-    if (this.menuPhase === 'DONE') {
-      const ticksSinceClose = this.stepIndex - this.lastMenuCloseTick;
-      if (ticksSinceClose >= this.MENU_OPEN_INTERVAL_TICKS) {
-        // 10 minutos passaram — inicia novo ciclo: espera 3 min antes de abrir
-        this.menuPhase = 'NONE';
-        this.mapAnalyzed = false;
-        this.menuCheckedAbilities = false;
-        this.mapAnalysisTick = this.stepIndex;
-      } else {
-        // Ainda faltam minutos para a próxima abertura — segue jogando normalmente
-        const remainingMin = Math.round((this.MENU_OPEN_INTERVAL_TICKS - ticksSinceClose) / 60);
+    if (phase === 'OPEN') {
+      // O mapa do SM pausa o jogo (gameState sai de 8) e/ou preenche menuScreen.
+      const mapLikelyUp = wram.gameState !== 8 || wram.menuScreen !== 0;
+      const reading = readMapScreen(
+        (this.lastCapturedFrame?.rgba ?? new Uint8ClampedArray(0)) as unknown as Uint8ClampedArray,
+        this.lastCapturedFrame?.width ?? 0,
+        this.lastCapturedFrame?.height ?? 0,
+      );
+      if (reading.ok && (mapLikelyUp || reading.coveragePct > 0)) {
+        this.mapReading = reading;
+        if (reading.hint) {
+          this.mapHint = { dir: reading.hint.dir, score: reading.hint.score };
+          this.mapHintTick = this.stepIndex;
+          // viés horizontal: metade da heurística de exploração trabalha só com LEFT/RIGHT
+          if (reading.hint.dir === 'LEFT' || reading.hint.dir === 'RIGHT') {
+            this.preferredDirection = reading.hint.dir;
+          }
+        }
+        if (reading.coveragePct >= 92) this.mapFullyExplored = true;
+        this.mapConsultPhase = 'CLOSE';
+        this.mapConsultTick = this.stepIndex;
+        this.replan(wram);
+        return this.makeMetroidAction('MENU', ['START'], 120, 'menu', motionPct, 'Mapa · lido', reading.note, wram);
+      }
+      if (elapsed >= this.MAP_CONSULT_MAX_TICKS) {
+        // não reconhecemos a tela: fecha e volta muito tempo depois, sem ficar insistindo
+        this.mapReadFailedTick = this.stepIndex;
+        this.mapConsultPhase = 'CLOSE';
+        this.mapConsultTick = this.stepIndex;
         return this.makeMetroidAction(
-          'EXPLORE',
-          [this.moveDir],
+          'MENU',
+          ['START'],
           120,
-          'run',
+          'menu',
           motionPct,
-          `Jogatina · Próxima conferência em ${remainingMin} min`,
-          'Menu fechado · explorando e coletando itens até a próxima verificação',
+          'Mapa · leitura falhou',
+          'Não confirmei a tela de mapa · fechando e voltando às heurísticas',
           wram,
         );
       }
+      return this.makeMetroidAction('MENU', [], 90, 'menu', motionPct, 'Mapa · aguardando abrir', 'Esperando a tela do mapa aparecer', wram);
     }
 
-    // Fase NONE: esperando 3 minutos antes de abrir o menu do jogo
-    if (this.menuPhase === 'NONE') {
-      const waitElapsed = this.stepIndex - this.mapAnalysisTick;
-      if (waitElapsed < this.MENU_WAIT_BEFORE_OPEN_TICKS) {
-        // Ainda está esperando os 3 minutos antes de abrir — segue jogando
-        const remainingMin = Math.round((this.MENU_WAIT_BEFORE_OPEN_TICKS - waitElapsed) / 60);
-        return this.makeMetroidAction(
-          'EXPLORE',
-          [this.moveDir],
-          120,
-          'run',
-          motionPct,
-          `Jogatina · Abrindo menu em ${remainingMin} min`,
-          'Esperando 3 minutos antes de abrir o menu para conferência',
-          wram,
-        );
+    // CLOSE: um tick parado para o jogo sair do mapa e depois retoma o fluxo normal
+    if (phase === 'CLOSE') {
+      if (elapsed < 2) {
+        return this.makeMetroidAction('MENU', [], 90, 'menu', motionPct, 'Mapa · fechando', 'Fechando o mapa', wram);
       }
-      // 3 minutos de espera passaram — hora de abrir o menu
-      this.menuPhase = 'OPENING';
-      this.mapAnalysisTick = this.stepIndex;
-      return this.makeMetroidAction(
-        'MENU',
-        [mapKey],
-        200,
-        'run',
-        motionPct,
-        'Menu · Abrindo',
-        'Abrindo menu do jogo para verificar habilidades e atributos',
-        wram,
-      );
+      this.mapConsultPhase = 'IDLE';
+      this.lastMapReadTick = this.stepIndex;
+            return this.makeMetroidAction('MENU', ['START'], 120, 'menu', motionPct, 'Mapa · fechado', 'Mapa lido · retomando a exploração', wram);
     }
-
-    // Transição de OPENING para ANALYZING após abrir o menu
-    if (this.menuPhase === 'OPENING') {
-      // Aguarda o menu abrir completamente antes de começar a analisar
-      if (this.stepIndex - this.mapAnalysisTick < 20) {
-        return this.makeMetroidAction(
-          'MENU',
-          [mapKey],
-          150,
-          'run',
-          motionPct,
-          'Menu · Abrindo',
-          'Aguardando abertura completa do menu do jogo',
-          wram,
-        );
-      }
-      this.menuPhase = 'ANALYZING';
-      this.mapAnalysisTick = this.stepIndex;
-    }
-
-    // Fase 2: ANALISANDO — fica com o menu aberto por 3 minutos verificando habilidades/atributos
-    if (this.menuPhase === 'ANALYZING') {
-      const analysisElapsed = this.stepIndex - this.mapAnalysisTick;
-
-      // Ainda está dentro dos 3 minutos de análise
-      if (analysisElapsed < this.MENU_ANALYSIS_DURATION_TICKS) {
-        return this.makeMetroidAction(
-          'MENU',
-          [mapKey],
-          150,
-          'run',
-          motionPct,
-          'Menu · Analisando Habilidades',
-          `Verificando armadura, peças, mísseis, super mísseis e energia (${Math.round(analysisElapsed / 60)}s / 3min)`,
-          wram,
-        );
-      }
-
-      // 3 minutos passaram — analisa o loadout completo e fecha o menu
-      this.analyzeInitialLoadout(wram);
-      this.menuCheckedAbilities = true;
-      this.menuPhase = 'CLOSING';
-      this.menuCloseTick = this.stepIndex;
-
-      return this.makeMetroidAction(
-        'MENU',
-        [mapKey],
-        200,
-        'run',
-        motionPct,
-        'Menu · Fechando',
-        'Análise de 3 min concluída · fechando menu para continuar a jogatina',
-        wram,
-      );
-    }
-
-    // Fase 3: FECHAR o menu/mapa
-    if (this.menuPhase === 'CLOSING') {
-      // Aguarda um pouco antes de fechar para garantir que a análise foi registrada
-      if (this.stepIndex - this.menuCloseTick < 30) {
-        return this.makeMetroidAction(
-          'MENU',
-          [mapKey],
-          150,
-          'run',
-          motionPct,
-          'Menu · Fechando',
-          'Fechando menu · habilidades e atributos confirmados',
-          wram,
-        );
-      }
-
-      // Fecha o menu pressionando SELECT novamente
-      this.menuPhase = 'DONE';
-      this.lastMenuCloseTick = this.stepIndex;
-      return this.makeMetroidAction(
-        'MENU',
-        [mapKey],
-        200,
-        'run',
-        motionPct,
-        'Menu · Fechado · Iniciando Jogatina',
-        'Menu fechado · agente pronto para explorar, coletar itens e combater',
-        wram,
-      );
-    }
-
     return null;
   }
 
+  /** Aplica o plano de navegação às prioridades de porta dentro da sala. */
+  private applyNavBiasToDoorTargets(
+    wram: MetroidWramSnapshot,
+    targets: Array<{ key: string; bx: number; by: number; priority: number }>,
+  ): void {
+    const target = this.navTarget;
+    const loadout = this.navLoadoutView(wram);
+    for (const t of targets) {
+      const color = this.navDoorColors.get(`${wram.roomId}:${t.key}`) ?? 'UNKNOWN';
+      const gate = gateForDoor(color, false);
+      const chk = checkGate(gate, loadout);
+      if (!chk.openableNow) t.priority = Math.max(t.priority, 6); // não abre agora: deixa de lado
+      if (target && target.firstDoor === t.key) {
+        t.priority = Math.min(t.priority, -2); // rota escolhida pelo plano: seguir
+      } else if (this.mapHint) {
+        const dir = directionForDoor(t.key);
+        if (dir === this.mapHint.dir) t.priority = Math.min(t.priority, 0);
+      }
+      if (target && target.roomId === wram.roomId && target.route.length === 0) {
+        t.priority = Math.max(t.priority, 4); // já estamos no alvo: não sair correndo
+      }
+    }
+  }
   // Analisa o loadout completo e define direção preferida de exploração
   private analyzeInitialLoadout(wram: MetroidWramSnapshot): void {
     if (this.initialLoadoutAnalyzed) return;
@@ -1179,7 +1470,6 @@ export class LocalVisionAgent {
       this.preferredDirection = 'RIGHT';
     }
 
-    this.mapAnalyzed = true;
   }
 
   // Sistema de priorização de objetivos: decide qual objetivo perseguir primeiro
@@ -1450,6 +1740,48 @@ export class LocalVisionAgent {
         ? {
             roomsExplored: this.roomsExplored.size,
             mapFullyExplored: this.mapFullyExplored,
+            lost: this.navLost.lost,
+            lostCause: this.navLost.cause,
+            lostNote: this.navLost.note,
+            lostSeverity: this.navLost.severity,
+            mapRead: this.mapReading
+              ? {
+                  ok: this.mapReading.ok,
+                  coveragePct: this.mapReading.coveragePct,
+                  hint: this.mapReading.hint?.label ?? null,
+                  hintDir: this.mapReading.hint?.dir ?? null,
+                  note: this.mapReading.note,
+                  ageTicks: this.stepIndex - this.mapHintTick,
+                }
+              : null,
+            target: this.navTarget
+              ? {
+                  kind: this.navTarget.kind,
+                  label: this.navTarget.label,
+                  reason: this.navTarget.reason,
+                  route: this.navTarget.route,
+                  firstDoor: this.navTarget.firstDoor,
+                  roomId: this.navTarget.roomId,
+                }
+              : null,
+            backlog: this.navBacklog.map((b) => ({
+              roomId: b.roomId,
+              doorKey: b.doorKey,
+              need: b.need,
+              missing: b.missing,
+            })),
+            checklist: this.navChecklist.map((c) => ({
+              id: c.id,
+              label: c.label,
+              kind: c.kind,
+              have: c.have,
+              total: c.total,
+              done: c.done,
+              note: c.note,
+            })),
+            checklistSummary: describeChecklistForUi(this.navChecklist),
+            navSummary: describeNavForUi(this.navTarget, this.navBacklog, this.mapReading),
+            preferredDirection: this.preferredDirection,
           }
         : undefined,
       // Sistema de interação com objetos/terminal/energia
@@ -2873,6 +3205,14 @@ export class LocalVisionAgent {
     // inimigos, e a conferência de menu passaria na frente roubando o registro.
     this.reapBossFights(wram);
 
+    // Navegação e mapa vêm antes do dispatch de gameState: com o mapa na tela o jogo pausa
+    // (gameState sai de 8) e cair no executeMenuState nos deixaria presos ali.
+    const bossEngaged = this.bossInRoom(wram);
+    this.bossEngagedThisTick = bossEngaged;
+    this.navPerceive(wram, bossEngaged);
+    const mapAction = this.mapConsultStep(wram, bossEngaged, motionPct);
+    if (mapAction) return mapAction;
+
     // 1) Estados de Menu / Pausa / Transição de Porta / Cutscene
     if ((wram.gameState <= 4 && wram.roomId === 0) || wram.gameState === 0x0c) {
       this.resetUSearch();
@@ -2900,43 +3240,18 @@ export class LocalVisionAgent {
     }
     this.cutsceneHoldTicks = 0;
 
-    // 0) Fluxo de menu: ABRIR → verificar habilidades/atributos → FECHAR → jogar.
-    // Com chefe na sala a conferência é adiada: sem este gate o agente passava os 3 minutos
-    // de espera andando para o lado em vez de lutar, e a luta nunca começava.
-    const bossEngaged = this.bossInRoom(wram);
-    this.bossEngagedThisTick = bossEngaged;
-    // A conferência de inventário só acontece em sala limpa: abrir o menu com um inimigo vivo
-    // na tela (chefe, Core-X, Metroid) travava a reação do agente por vários minutos.
-    const liveThreatInRoom = wram.enemies.some((e) => e.hp > 0);
-    const deferConference = bossEngaged || liveThreatInRoom;
-    if (deferConference) {
-      this.mapAnalyzed = true;
-      if (this.menuPhase === 'OPENING' || this.menuPhase === 'ANALYZING') this.menuPhase = 'CLOSING';
-    }
-    const menuAction = deferConference ? null : this.openMapAndAnalyze(wram, [], motionPct);
-    if (menuAction) return menuAction;
-
-    // Se o menu ainda não fechou (fase DONE não alcançada), aguarda antes de jogar
-    if (!this.mapAnalyzed) {
-      return this.makeMetroidAction(
-        'MENU',
-        [],
-        100,
-        'run',
-        motionPct,
-        'Menu · Aguardando conclusão',
-        'Menu ainda aberto · finalizando análise antes de iniciar a jogatina',
-        wram,
-      );
-    }
-
-    // Após o menu fechar, analisa o loadout (se não foi feito no fluxo) e define direção
+    // 0) O loadout vem da memória, não do menu: analisa uma vez e segue.
     if (!this.initialLoadoutAnalyzed) {
       this.analyzeInitialLoadout(wram);
     }
+    // reafirma o gate do codex depois das transições de estado
+    this.bossEngagedThisTick = bossEngaged;
 
     // Atualiza grafo de salas, progresso real e detecção de bloqueio
     const { unlockedLabel, hitKnownBlocked } = this.syncRoomAndProgress(wram);
+
+    // "depois volta quando tiver a habilidade": item novo reabre as portas guardadas no backlog
+    if (unlockedLabel) this.reopenNavBacklog(wram);
 
     // Identifica alvos REAIS no ambiente (ignorando elementos estáticos/visuais do cenário)
     const activeEnemies = wram.enemies.filter((e) => !this.enemyTracks.get(e.slot)?.ignoredAsStatic);
@@ -4433,6 +4748,9 @@ export class LocalVisionAgent {
         doorTargets.push({ key: d.key, bx: d.bx, by: d.by, priority: d.key === this.entryDoorKey ? 2 : 0 });
       }
     }
+    // rota vinda do grafo + da leitura do mapa: porta do plano tem prioridade máxima,
+    // porta que não abre agora (cor/munição) sai do caminho
+    this.applyNavBiasToDoorTargets(wram, doorTargets);
 
     const pathStep = this.planPathInRoom(wram, doorTargets);
     if (pathStep) {

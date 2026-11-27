@@ -184,6 +184,45 @@ export interface AIStatusSnapshot {
   mapExploration?: {
     roomsExplored: number;
     mapFullyExplored: boolean;
+    /** veredicto do detector de "estou perdido" */
+    lost: boolean;
+    lostCause: string | null;
+    lostNote: string;
+    /** 0..3 — 2+ dispara a consulta do mapa do jogo (START) */
+    lostSeverity: number;
+    /** última leitura da tela de mapa */
+    mapRead: {
+      ok: boolean;
+      coveragePct: number;
+      hint: string | null;
+      hintDir: string | null;
+      note: string;
+      ageTicks: number;
+    } | null;
+    /** próximo alvo escolhido no grafo de salas */
+    target: {
+      kind: string;
+      label: string;
+      reason: string;
+      route: string[];
+      firstDoor: string | null;
+      roomId: number;
+    } | null;
+    /** portas que faltam habilidade/munição — o "volta depois" */
+    backlog: Array<{ roomId: number; doorKey: string; need: string; missing: string }>;
+    /** checklist do objetivo (tanques, expansões, chefes, terminais) */
+    checklist: Array<{
+      id: string;
+      label: string;
+      kind: string;
+      have: number;
+      total: number;
+      done: boolean;
+      note: string;
+    }>;
+    checklistSummary: string;
+    navSummary: string;
+    preferredDirection: string | null;
   };
   // Sistema de interação com objetos/terminal/energia
   interaction?: {
