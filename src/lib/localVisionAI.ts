@@ -11,6 +11,14 @@ import type {
   USearchPhase,
 } from '../types/emulator';
 import type { DoorInfo, EnemyInfo, MetroidWramSnapshot, RoomItemTarget } from './snesWram';
+import {
+  planBossFight,
+  describeDirectiveForUi,
+  type BossDirective,
+  type BossObservation,
+  type BossFightMemory,
+  type LoadoutView,
+} from './bossCodex';
 
 interface GridMetrics {
   avgLum: number;
@@ -338,6 +346,31 @@ export class LocalVisionAgent {
     Omit<EncounterKnowledgeRecord, 'id' | 'game' | 'defeatedCount' | 'observedAt'>
   > = [];
 
+  // ---------------------------------------------------------------------
+  // Codex de Chefes (guia estratégico consultável)
+  // ---------------------------------------------------------------------
+  /** Memória de luta por alvo (`slot|enemyId`), devolvida pura pelo codex. */
+  private bossFightMemory = new Map<string, BossFightMemory>();
+  /** Estratégia que resolveu uma sala antes: ao voltar, ela é aplicada direto. */
+  private bossRoomBindings = new Map<number, string>();
+  private bossMemoryRoomId = -1;
+  /** Diretiva do tick atual (lida pelo snapshot e pelo combate). */
+  private bossDirective: BossDirective | null = null;
+  private bossSelectTicks = 0;
+  private bossSlotGaveUp = false;
+  private bossChargeHold = 0;
+  /** true no tick em que há chefe na sala (trava o modo combate e preserva a munição). */
+  private bossEngagedThisTick = false;
+  /** Sala onde uma luta de chefe está em andamento (HP do chefe cai e o limiar fixo sumiria). */
+  private bossEngagedRoomId = -1;
+  private samusDamagedThisTick = false;
+  private lastCutsceneTick = -1000;
+  private cutsceneRoomId = -1;
+  /** Aproximação das torres de energia do Draygon (pré-requisito do grapple). */
+  private stationSpots = new Map<number, { ticks: number; goneTicks: number; destroyed: boolean }>();
+  private stationRoomId = -1;
+  private stationsDestroyedCount = 0;
+
   reset(): void {
     this.prevLums = null;
     this.stagnantCount = 0;
@@ -421,6 +454,21 @@ export class LocalVisionAgent {
     this.bigMetroidHealedTick = -300;
     this.lastEnergyResetTick = -100;
     this.pendingLearnedKnowledge = [];
+    this.bossFightMemory.clear();
+    this.bossRoomBindings.clear();
+    this.bossMemoryRoomId = -1;
+    this.bossDirective = null;
+    this.bossSelectTicks = 0;
+    this.bossSlotGaveUp = false;
+    this.bossChargeHold = 0;
+    this.bossEngagedThisTick = false;
+    this.bossEngagedRoomId = -1;
+    this.samusDamagedThisTick = false;
+    this.lastCutsceneTick = -1000;
+    this.cutsceneRoomId = -1;
+    this.stationSpots.clear();
+    this.stationRoomId = -1;
+    this.stationsDestroyedCount = 0;
     this.interactiveObjects = [];
     this.currentInteractionTarget = null;
     this.interactionCooldown = 0;
@@ -1364,6 +1412,37 @@ export class LocalVisionAgent {
       countdownActive: wram?.countdownActive,
       countdownSeconds: wram?.countdownSeconds,
       energyResetDetected: this.lastEnergyResetTick === this.stepIndex,
+      // Estado da luta contra chefe conforme o Codex de Chefes
+      bossFight:
+        this.bossDirective && wram
+          ? {
+              strategyId: this.bossDirective.strategyId,
+              bossName: this.bossDirective.bossName,
+              encounter: this.bossDirective.encounter,
+              phaseLabel: this.bossDirective.phaseLabel,
+              weakPoint: this.bossDirective.weakPoint,
+              ammo: this.bossDirective.ammo,
+              ammoLabel: this.bossDirective.ammoLabel,
+              role: this.bossDirective.role,
+              movement: this.bossDirective.movement,
+              aim: this.bossDirective.aim,
+              windowOpen: this.bossDirective.windowOpen,
+              windowLabel: this.bossDirective.windowLabel,
+              mayFire: this.bossDirective.mayFire,
+              distance: this.bossDirective.distance,
+              rangeState: this.bossDirective.rangeState,
+              hpPct: this.bossDirective.hpPct,
+              damageDealt: this.bossDirective.damageDealt,
+              hits: this.bossDirective.hits,
+              rotated: this.bossDirective.rotated,
+              rotationNote: this.bossDirective.rotationNote,
+              probeMode: this.bossDirective.probeMode,
+              collectWhenExposed: this.bossDirective.collectWhenExposed,
+              note: this.bossDirective.note,
+              source: this.bossDirective.source,
+              summary: describeDirectiveForUi(this.bossDirective),
+            }
+          : undefined,
       // Sistema de loadout: mostra quais habilidades/armadura/ferramentas o agente tem
       agentLoadout: wram ? this.getAgentLoadout(wram) : undefined,
       // Sistema de exploração do mapa
@@ -1686,6 +1765,8 @@ export class LocalVisionAgent {
       }
     }
     this.prevHealth = wram.health;
+    // Usado pelo codex para reconhecer "agarrada" (Draygon) e dano sofrido no tick.
+    this.samusDamagedThisTick = samusDamagedThisTick;
 
     if (samusBigHealThisTick) {
       this.bigMetroidHealedTick = this.stepIndex;
@@ -2493,10 +2574,15 @@ export class LocalVisionAgent {
       );
 
       let detectedCoreStage: CoreXStage | null = null;
+      // A casca do Core-X é metálica/prateada e luminosa: sem esse brilho no sprite, um
+      // vermelho qualquer (boca do Kraid, núcleo do Spore Spawn, peito dos Torizo) era
+      // classificado como Core-X VERMELHO e o agente largava o plano certo do chefe.
+      const hasMetallicShell = colors ? colors.silverCyanRatio >= 0.06 : false;
       if (
         colors &&
         e.hp > 0 &&
         e.hp < 450 &&
+        hasMetallicShell &&
         (e.xRadius >= 12 || track?.isCoreX || (e.xRadius >= 6 && (sawAnyCoreXInRoom || looksGlowingNakedOrb)))
       ) {
         const hasCoreGold = colors.goldRatio >= 0.025;
@@ -2779,6 +2865,14 @@ export class LocalVisionAgent {
     targetDifficulty: string,
     wram: MetroidWramSnapshot,
   ): AIAction {
+    // A diretiva do codex só vale dentro do tick em que foi calculada.
+    this.bossDirective = null;
+
+    // Primeiro, fecha as lutas cujo alvo sumiu (morrer limpa o slot do inimigo). Isso tem
+    // que rodar antes de qualquer retorno antecipado: na hora da vitória a sala fica sem
+    // inimigos, e a conferência de menu passaria na frente roubando o registro.
+    this.reapBossFights(wram);
+
     // 1) Estados de Menu / Pausa / Transição de Porta / Cutscene
     if ((wram.gameState <= 4 && wram.roomId === 0) || wram.gameState === 0x0c) {
       this.resetUSearch();
@@ -2806,8 +2900,20 @@ export class LocalVisionAgent {
     }
     this.cutsceneHoldTicks = 0;
 
-    // 0) Fluxo de menu: ABRIR → verificar habilidades/atributos → FECHAR → jogar
-    const menuAction = this.openMapAndAnalyze(wram, [], motionPct);
+    // 0) Fluxo de menu: ABRIR → verificar habilidades/atributos → FECHAR → jogar.
+    // Com chefe na sala a conferência é adiada: sem este gate o agente passava os 3 minutos
+    // de espera andando para o lado em vez de lutar, e a luta nunca começava.
+    const bossEngaged = this.bossInRoom(wram);
+    this.bossEngagedThisTick = bossEngaged;
+    // A conferência de inventário só acontece em sala limpa: abrir o menu com um inimigo vivo
+    // na tela (chefe, Core-X, Metroid) travava a reação do agente por vários minutos.
+    const liveThreatInRoom = wram.enemies.some((e) => e.hp > 0);
+    const deferConference = bossEngaged || liveThreatInRoom;
+    if (deferConference) {
+      this.mapAnalyzed = true;
+      if (this.menuPhase === 'OPENING' || this.menuPhase === 'ANALYZING') this.menuPhase = 'CLOSING';
+    }
+    const menuAction = deferConference ? null : this.openMapAndAnalyze(wram, [], motionPct);
     if (menuAction) return menuAction;
 
     // Se o menu ainda não fechou (fase DONE não alcançada), aguarda antes de jogar
@@ -2901,7 +3007,9 @@ export class LocalVisionAgent {
       .map((e) => ({ ...e, dist: Math.hypot(e.x - wram.samusX, e.y - wram.samusY) }))
       .filter((e) => {
         if (e.hp <= 0) return false;
-        const isRegularBoss = e.hp >= 450;
+        // Um chefe em luta acompanhada pelo codex nunca é rebaixado a "cenário estático":
+        // o filtro de hostilidade existia para ignorar decoração, não para largar um chefe.
+        const isRegularBoss = e.hp >= 450 || this.isTrackedBoss(e);
         if (isRegularBoss) {
           return e.dist < 300;
         }
@@ -2942,6 +3050,7 @@ export class LocalVisionAgent {
       // Imagem 9: deixar o Metroid Grande drenar vida/habilidades sem fugir da sala (mesmo com SA-X presente)
       this.bigMetroidDrainSeen = true;
       this.resetUSearch();
+      this.planBossFor(wram, bigMetroid, null);
       const approachDir: AIKey = bigMetroid.x >= wram.samusX ? 'RIGHT' : 'LEFT';
       const keys: AIKey[] = bigMetroid.dist > 44 ? [approachDir] : ['NONE'];
       return this.makeMetroidAction(
@@ -2959,6 +3068,9 @@ export class LocalVisionAgent {
     if (coreXTarget && coreXTarget.stage === 'PODER_EXPOSTO') {
       // Imagem 7 + Imagem 2: núcleo Core-X exposto — perseguir diretamente sem desviar para a parede!
       this.resetUSearch();
+      // Mantém o estado do codex vivo neste ramo (é assim que a sala é vinculada à estratégia
+      // no momento em que o núcleo é absorvido e o slot do inimigo é limpo).
+      this.planBossFor(wram, coreXTarget, 'PODER_EXPOSTO');
       const { jump: jumpKey, run: dashKey, cancel: cancelKey } = wram.controls;
       const chaseDir: 'LEFT' | 'RIGHT' = coreXTarget.x >= wram.samusX ? 'RIGHT' : 'LEFT';
       this.moveDir = chaseDir;
@@ -3061,11 +3173,12 @@ export class LocalVisionAgent {
       resolvedMode = 'BACKTRACK';
     } else if (
       (metroidLarva || nearbyEnemy) &&
-      !this.uSearch.active &&
-      this.progressStallTicks < 12 &&
+      (bossEngaged || (!this.uSearch.active && this.progressStallTicks < 12)) &&
       !this.omegaVanishedDuringTimer &&
       (!isEscapeCountdown || Boolean(nearbyEnemy && nearbyEnemy.hp >= 450))
     ) {
+      // Com chefe na sala a decisão é sua, não da exploração: sem este gate, ficar parado
+      // mirando o ponto fraco contava como "sem progresso" e o agente trocava para EXPLORE.
       resolvedMode = 'COMBAT';
     } else {
       resolvedMode = 'EXPLORE';
@@ -3216,6 +3329,9 @@ export class LocalVisionAgent {
 
   private executeCutsceneState(motionPct: number, wram: MetroidWramSnapshot): AIAction {
     this.cutsceneHoldTicks++;
+    // O codex usa isto para detectar "luta retomada depois da cena" (Mother Brain fase 3).
+    this.lastCutsceneTick = this.stepIndex;
+    this.cutsceneRoomId = wram.roomId;
     const k: AIKey = this.cutsceneHoldTicks % 5 === 0 ? 'A' : 'NONE';
     return this.makeMetroidAction('CUTSCENE', [k], 125, 'run', motionPct, 'Cena / Briefing (PT)', 'Avançando diálogo inicial da missão', wram);
   }
@@ -3260,6 +3376,390 @@ export class LocalVisionAgent {
     );
   }
 
+  // =========================================================================
+  // CODEX DE CHEFES — observação, plano e tradução da diretiva em teclas
+  // =========================================================================
+
+  /**
+   * Confirma chefes derrotados (alvo ausente da sala após levar dano), vincula a estratégia
+   * vitoriosa à sala e emite o registro de conhecimento persistente.
+   */
+  private reapBossFights(wram: MetroidWramSnapshot): void {
+    if (this.bossFightMemory.size === 0) return;
+    const alive = new Set(wram.enemies.map((e) => `${e.slot}|${e.id}`));
+    for (const [key, mem] of this.bossFightMemory) {
+      if (alive.has(key)) {
+        mem.goneTicks = 0;
+        continue;
+      }
+      mem.goneTicks += 1;
+      if (mem.goneTicks < 4) continue;
+      this.bossFightMemory.delete(key);
+      if (mem.roomId !== wram.roomId || mem.ticksInFight < 8) continue;
+      const wounded = mem.totalDamageDealt > 0 || mem.lastHp <= mem.peakHp * 0.5;
+      if (!wounded) continue;
+      if (!this.bossRoomBindings.has(mem.roomId)) {
+        this.bossRoomBindings.set(mem.roomId, mem.strategyId);
+      }
+      this.pendingLearnedKnowledge.push({
+        entityType: mem.entityType as never,
+        entityLabel: mem.bossName,
+        powerId: mem.strategyId,
+        powerName: `${mem.bossName} · ${mem.phaseLabel}`,
+        powerEffect: mem.note,
+        roomId: mem.roomId,
+      });
+    }
+  }
+
+  /** Luta que o codex já está acompanhando neste alvo (slot + tipo de inimigo). */
+  private isTrackedBoss(e: EnemyInfo): boolean {
+    return this.bossFightMemory.has(`${e.slot}|${e.id}`);
+  }
+
+  /**
+   * true quando há chefe na sala: a "conferência de menu" nunca pode interromper a luta.
+   * O engajamento é pegajoso por sala — o HP do chefe cai durante o combate, e um limiar
+   * fixo faria a IA desligar exatamente no meio da briga (o erro que isto corrige).
+   */
+  private bossInRoom(wram: MetroidWramSnapshot): boolean {
+    if (wram.enemies.some((e) => e.hp >= 450 || this.isTrackedBoss(e))) {
+      this.bossEngagedRoomId = wram.roomId;
+      return true;
+    }
+    if (this.bossEngagedRoomId !== wram.roomId) return false;
+    if (!wram.enemies.some((e) => e.hp > 0)) {
+      this.bossEngagedRoomId = -1;
+      return false;
+    }
+    return true;
+  }
+
+  private bossLoadoutView(wram: MetroidWramSnapshot): LoadoutView {
+    const l = this.getAgentLoadout(wram);
+    return {
+      hasMissiles: l.hasMissiles,
+      missileCount: l.missileCount,
+      hasSupers: l.hasSupers,
+      superCount: l.superCount,
+      hasPowerBombs: l.hasPowerBombs,
+      powerBombCount: l.powerBombCount,
+      hasChargeBeam: l.hasChargeBeam,
+      hasIceBeam: l.hasIceBeam,
+      hasWaveBeam: l.hasWaveBeam,
+      hasSpazerBeam: l.hasSpazer,
+      hasPlasmaBeam: l.hasPlasmaBeam,
+      beamsEquippedMask: wram.beamsEquipped,
+      hasGrapple: l.hasGrapple,
+      hasSpaceJump: l.hasSpaceJump,
+      hasScrewAttack: l.hasScrewAttack,
+      hasVaria: l.hasVaria,
+      hasGravity: l.hasGravity,
+    };
+  }
+
+  /**
+   * Aproximação das "torres de energia" da arena do Draygon: alvos pequenos, parados,
+   * encostados nas paredes e destrutíveis. Quando uma dessas some depois de a Samus
+   * atirar por perto, contamos como torre derrubada — pré-requisito da finalização secreta.
+   * É heurística deliberada: o codex só tenta o grapple com ≥1 torre caída e Samus agarrada.
+   */
+  private countDestroyedStations(wram: MetroidWramSnapshot): number {
+    if (this.stationRoomId !== wram.roomId) {
+      this.stationRoomId = wram.roomId;
+      this.stationSpots.clear();
+      this.stationsDestroyedCount = 0;
+    }
+    const seen = new Set<number>();
+    for (const e of wram.enemies) {
+      const nearWall = e.x < 60 || e.x > wram.roomWidthPx - 60;
+      const smallAndHittable = e.xRadius <= 14 && e.yRadius <= 16 && e.hp > 0 && e.hp < 450;
+      if (!nearWall || !smallAndHittable) continue;
+      seen.add(e.slot);
+      const rec = this.stationSpots.get(e.slot);
+      if (rec) {
+        rec.ticks += 1;
+        rec.goneTicks = 0;
+      } else {
+        this.stationSpots.set(e.slot, { ticks: 1, goneTicks: 0, destroyed: false });
+      }
+    }
+    for (const [slot, rec] of this.stationSpots) {
+      if (seen.has(slot)) continue;
+      rec.goneTicks += 1;
+      if (!rec.destroyed && rec.ticks >= 3 && rec.goneTicks >= 4) {
+        rec.destroyed = true;
+        this.stationsDestroyedCount = Math.min(4, this.stationsDestroyedCount + 1);
+      }
+      if (rec.goneTicks > 40) this.stationSpots.delete(slot);
+    }
+    return this.stationsDestroyedCount;
+  }
+
+  /** Reconhece o alvo, consulta o codex e guarda a diretiva do tick. */
+  private planBossFor(
+    wram: MetroidWramSnapshot,
+    target: (EnemyInfo & { dist: number }) | null,
+    coreXStage: CoreXStage | null,
+  ): BossDirective | null {
+    this.bossDirective = null;
+    if (!target) return null;
+
+    // Mob comum não passa pelo codex: a heurística de sempre é mais barata e mais adequada.
+    // Mas uma luta já em acompanhamento continua no codex mesmo com o HP do chefe baixo.
+    const specialActive = this.activeSpecialEntity !== 'NONE';
+    if (target.hp < 450 && !specialActive && !this.isTrackedBoss(target)) return null;
+
+    if (this.bossMemoryRoomId !== wram.roomId) {
+      this.bossMemoryRoomId = wram.roomId;
+      this.bossFightMemory.clear();
+      this.bossSelectTicks = 0;
+      this.bossChargeHold = 0;
+      this.bossSlotGaveUp = false;
+    }
+
+    const profile = this.sampleEnemyVisuals(wram, target);
+    const track = this.enemyTracks.get(target.slot);
+    const isSaxChase =
+      this.activeSpecialEntity === 'SAX_VARIA' || this.activeSpecialEntity === 'SAX_GRAVITY';
+    const saxDisabledByMetroid =
+      this.bigMetroidHealedTick > 0 && this.stepIndex - this.bigMetroidHealedTick < 320;
+    const observation: BossObservation = {
+      hp: target.hp,
+      spanX: target.xRadius * 2,
+      spanY: target.yRadius * 2,
+      movedPx: track?.totalMoved ?? 0,
+      colors: profile
+        ? {
+            red: profile.redRatio,
+            yellowGreen: profile.yellowGreenRatio,
+            silverCyan: profile.silverCyanRatio,
+            gold: profile.goldRatio,
+            purple: profile.purpleRatio,
+            orange: profile.orangeRatio,
+            neonGreen: profile.neonGreenRatio,
+          }
+        : null,
+      entity: specialActive ? this.activeSpecialEntity : undefined,
+      samusHp: wram.health,
+      samusMaxHp: wram.maxHealth,
+      countdownActive: wram.countdownActive,
+      openExits: wram.doors.filter((d) => !d.blockedByWall).length,
+      // Agarrada = leva dano sem sair do lugar (Draygon/hold).
+      grabbedImmobilized:
+        this.samusDamagedThisTick && Math.abs(this.samusVx) < 1.2 && Math.abs(this.samusVy) < 1.2,
+      bossStationary: (track?.totalMoved ?? 0) <= 4,
+      stationsDestroyed: this.countDestroyedStations(wram),
+      resumedAfterCutscene:
+        this.stepIndex - this.lastCutsceneTick <= 90 &&
+        this.cutsceneRoomId === wram.roomId &&
+        this.cutsceneRoomId !== -1,
+      fightable: isSaxChase ? saxDisabledByMetroid || this.isReadyToFightSAX(wram) : true,
+      prologueState: wram.maxHealth <= 199 && (wram.itemsMask & 0x0021) === 0,
+      coreExposed: coreXStage === 'PODER_EXPOSTO',
+    };
+
+    const key = `${target.slot}|${target.id}`;
+    const { directive, memory, finished } = planBossFight({
+      observation,
+      roomId: wram.roomId,
+      entityType: specialActive ? this.activeSpecialEntity : 'NONE',
+      loadout: this.bossLoadoutView(wram),
+      boundStrategyId: this.bossRoomBindings.get(wram.roomId) ?? null,
+      memory: this.bossFightMemory.get(key) ?? null,
+      targetX: target.x,
+      targetY: target.y,
+      samusX: wram.samusX,
+      samusY: wram.samusY,
+    });
+    this.bossFightMemory.set(key, memory);
+    this.bossDirective = directive;
+
+    if (finished) {
+      this.bossFightMemory.delete(key);
+      // Vínculo sala→estratégia: ao voltar nesta sala, aplica direto sem re-reconhecer.
+      if (!this.bossRoomBindings.has(wram.roomId)) {
+        this.bossRoomBindings.set(wram.roomId, directive.strategyId);
+      }
+      this.pendingLearnedKnowledge.push({
+        entityType: this.activeSpecialEntity,
+        entityLabel: directive.bossName,
+        powerId: directive.strategyId,
+        powerName: `${directive.bossName} · ${directive.phaseLabel}`,
+        powerEffect: directive.note,
+        roomId: wram.roomId,
+      });
+    }
+
+    return directive;
+  }
+
+  /**
+   * Traduz a diretiva do codex em teclas reais do SNES.
+   * `null` = o codex não mandou sobrescrever (o chamador mantém a heurística).
+   */
+  private applyBossDirective(
+    wram: MetroidWramSnapshot,
+    d: BossDirective,
+    target: EnemyInfo & { dist: number },
+  ): { keys: AIKey[]; tempo: number; sceneLabel: string; reason: string } | null {
+    const { shoot: shootKey, jump: jumpKey, run: dashKey, cancel: cancelKey, select: selectKey } = wram.controls;
+    const roomWidth = wram.roomWidthPx || 256;
+    const half = roomWidth / 2;
+    const faceTo: 'LEFT' | 'RIGHT' = target.x >= wram.samusX ? 'RIGHT' : 'LEFT';
+    const awayFrom: 'LEFT' | 'RIGHT' = faceTo === 'RIGHT' ? 'LEFT' : 'RIGHT';
+
+    // Vida crítica: nenhum plano de chefe vale apanhar até a morte — recua e dispara para trás.
+    const critical = wram.maxHealth > 0 && wram.health > 0 && wram.health < wram.maxHealth * 0.22;
+
+    // 1) Deixar o item certo selecionado no HUD antes de atirar (míssil ≠ super míssil).
+    const keys: AIKey[] = [];
+    if (d.desiredSlot !== 0 && wram.selectedHudItem !== d.desiredSlot && !this.bossSlotGaveUp) {
+      this.bossSelectTicks += 1;
+      if (this.bossSelectTicks > 4) {
+        // O ciclo de SELECT deu a volta sem achar o índice esperado (HUD customizado):
+        // desiste de uma vez e luta com o item que estiver selecionado, sem pingar.
+        this.bossSlotGaveUp = true;
+        this.bossSelectTicks = 0;
+      } else {
+        keys.push(selectKey);
+        return {
+          keys,
+          tempo: 110,
+          sceneLabel: `Combate · ${d.label}`,
+          reason: `Selecionando ${d.ammoLabel} no HUD (slot ${d.desiredSlot}, atual ${wram.selectedHudItem}) · ${d.windowLabel}`,
+        };
+      }
+    } else if (d.desiredSlot === 0 && wram.selectedHudItem !== 0 && !d.note.includes('torre')) {
+      this.bossSelectTicks = 0;
+      keys.push(cancelKey);
+      return {
+        keys,
+        tempo: 110,
+        sceneLabel: `Combate · ${d.label}`,
+        reason: `Voltando ao feixe principal (${d.ammoLabel})`,
+      };
+    } else {
+      this.bossSelectTicks = 0;
+    }
+
+    // 2) Movimento exigido pela estratégia.
+    let step: AIKey | null = null;
+    let wantJump = false;
+    let jumpHold = 2;
+    let wantDash = false;
+    switch (d.movement) {
+      case 'HOLD_GROUND':
+        break;
+      case 'DO_NOT_CHASE':
+        step = awayFrom;
+        wantDash = true;
+        break;
+      case 'RETREAT_TO_CORNER': {
+        const goLeft = wram.samusX < half;
+        const atCorner = goLeft ? wram.samusX < 28 : wram.samusX > roomWidth - 28;
+        step = atCorner ? null : goLeft ? 'LEFT' : 'RIGHT';
+        break;
+      }
+      case 'PLATFORM_UP':
+        step = d.rangeState === 'TOO_FAR' ? faceTo : null;
+        wantJump = true;
+        jumpHold = 3;
+        break;
+      case 'AIRBORNE':
+        // Space Jump sem dash: correr no ar ligaria o Speed Booster no meio da luta.
+        wantJump = true;
+        jumpHold = 6;
+        break;
+      case 'HOP_DODGE':
+        wantJump = target.dist < 168 && this.stepIndex % 4 === 0;
+        break;
+      case 'CHASE':
+      case 'APPROACH':
+        step = faceTo;
+        wantDash = d.movement === 'CHASE' && target.dist > 90;
+        wantJump = target.y < wram.samusY - 10;
+        break;
+      case 'CENTER':
+        step = wram.samusX < half - 10 ? 'RIGHT' : wram.samusX > half + 10 ? 'LEFT' : null;
+        break;
+      case 'PUSH_EAST':
+        // Ficar sempre a oeste do chefe para que cada acerto o empurre para leste.
+        step = wram.samusX > target.x ? 'LEFT' : d.rangeState === 'TOO_FAR' ? 'RIGHT' : null;
+        break;
+      case 'AMBUSH': {
+        const ax = d.ambush?.active ? d.ambush.x : target.x;
+        const dx = ax - wram.samusX;
+        step = Math.abs(dx) > 26 ? (dx > 0 ? 'RIGHT' : 'LEFT') : null;
+        break;
+      }
+      case 'KEEP_MID_RANGE':
+      default:
+        if (d.rangeState === 'TOO_CLOSE') step = awayFrom;
+        else if (d.rangeState === 'TOO_FAR') step = faceTo;
+        break;
+    }
+    if (critical) {
+      step = awayFrom;
+      wantDash = true;
+    }
+    if (step) keys.push(step);
+    if (wantDash && d.movement !== 'AIRBORNE') keys.push(dashKey);
+
+    // 3) Mira no ponto fraco.
+    if (
+      d.aim === 'UP' ||
+      d.aim === 'DIAGONAL_UP' ||
+      ((d.aim === 'TOWARD_TARGET' || d.farmFallingProjectiles) && target.y < wram.samusY - 20)
+    ) {
+      keys.push('UP');
+    } else if (d.aim === 'DOWN' || (d.aim === 'TOWARD_TARGET' && target.y > wram.samusY + 34 && d.movement === 'CHASE')) {
+      keys.push('DOWN');
+    }
+
+    // 4) Finalização secreta: agarrada + Grapple Beam mirado para cima na eletricidade.
+    if (d.finisher === 'DRAYGON_GRAPPLE') {
+      keys.push('UP');
+      keys.push(shootKey);
+      return {
+        keys,
+        tempo: 120,
+        sceneLabel: `Combate · ${d.label} · FINALIZAÇÃO SECRETA`,
+        reason: 'Torres destruídas e Samus agarrada: puxando pela eletricidade exposta (Grapple Beam)',
+      };
+    }
+
+    // 5) Fogo com cadência própria do plano (carregar o tiro leva ~3 ticks).
+    let wantShoot = d.mayFire && !d.doNotKill;
+    if (d.ammo === 'CHARGE_BEAM' && wantShoot) {
+      if (this.bossChargeHold < 3) {
+        this.bossChargeHold += 1; // segurando o gatilho para carregar
+      } else {
+        this.bossChargeHold = 0;
+        wantShoot = false; // soltar = disparo carregado saindo
+      }
+    } else {
+      this.bossChargeHold = 0;
+    }
+    if (wantShoot && this.nextShoot(true)) keys.push(shootKey);
+    if (this.nextJump(wantJump, jumpHold)) keys.push(jumpKey);
+
+    const roleTag =
+      d.role === 'SETUP'
+        ? 'preparando'
+        : d.role === 'HOLD'
+          ? 'sem atacar (evento)'
+          : d.role === 'FINISHER'
+            ? 'golpe final'
+            : 'atacando';
+    const sceneLabel = `Combate · ${d.label} · ${roleTag}`;
+    const reason = d.rotationNote
+      ? `${d.rotationNote} · ${d.windowLabel}`
+      : `${d.ammoLabel} no ${d.weakPoint === 'ANY' ? 'alvo' : d.weakPoint.toLowerCase()} · ${d.windowLabel} · ${d.distance}px (dano ${d.damageDealt})`;
+
+    return { keys, tempo: d.tempoMs, sceneLabel, reason };
+  }
+
   private executeCombatState(
     motionPct: number,
     wram: MetroidWramSnapshot,
@@ -3269,6 +3769,34 @@ export class LocalVisionAgent {
     isMetroidLarva = false,
   ): AIAction {
     const { shoot: shootKey, jump: jumpKey, select: selectKey, cancel: cancelKey } = wram.controls;
+
+    // Codex de Chefes: reconhece o alvo, aplica o plano do guia e guarda a diretiva do tick.
+    const codexPlan = this.planBossFor(
+      wram,
+      (saxPursuer ?? nearbyEnemy) ?? null,
+      coreXStage,
+    );
+    // SA-X/Core-X/Metroid já têm scripts próprios; o codex entra com munição + janela.
+    const codexMayFire = codexPlan ? codexPlan.mayFire : true;
+
+    if (saxPursuer && codexPlan) {
+      // O plano do codex para a SA-X já decide fugir × lutar, mirar e selecionar míssil.
+      const driven = this.applyBossDirective(wram, codexPlan, saxPursuer);
+      if (driven) {
+        return this.makeMetroidAction(
+          'COMBAT',
+          driven.keys,
+          driven.tempo,
+          'run',
+          motionPct,
+          driven.sceneLabel,
+          driven.reason,
+          wram,
+          true,
+          codexPlan.role !== 'SETUP',
+        );
+      }
+    }
 
     if (saxPursuer) {
       const aimDir: AIKey = saxPursuer.x >= wram.samusX ? 'RIGHT' : 'LEFT';
@@ -3291,10 +3819,10 @@ export class LocalVisionAgent {
       if (shouldFireMissile && needSelectAmmo) {
         keys.push(selectKey);
         this.registerMissileUse();
-      } else if (shouldFireMissile && this.nextShoot(true)) {
+      } else if (shouldFireMissile && this.nextShoot(codexMayFire)) {
         keys.push(shootKey);
         this.registerMissileUse();
-      } else if (this.nextShoot(true)) {
+      } else if (this.nextShoot(codexMayFire)) {
         keys.push(shootKey);
       }
       if (this.nextJump(saxPursuer.y < wram.samusY - 24 || this.stepIndex % 6 === 0, 3)) {
@@ -3354,10 +3882,10 @@ export class LocalVisionAgent {
       if (shouldFireMissile && wram.selectedHudItem === 0) {
         keys.push(selectKey);
         this.registerMissileUse();
-      } else if (shouldFireMissile && this.nextShoot(true)) {
+      } else if (shouldFireMissile && this.nextShoot(codexMayFire)) {
         keys.push(shootKey);
         this.registerMissileUse();
-      } else if (this.nextShoot(true)) {
+      } else if (this.nextShoot(codexMayFire)) {
         keys.push(shootKey);
       }
       if (this.nextJump(target.y < wram.samusY - 24 || target.dist < 48, 3)) {
@@ -3423,6 +3951,28 @@ export class LocalVisionAgent {
           : 'Eliminando Metroid com disparos diretos',
         wram,
       );
+    }
+
+    // ---- Chefe canônico: o Codex de Chefes assume munição, mira, posição e timing ----
+    // Os scripts próprios de Core-X/Metroid seguem valendo (janela e congelar são deles);
+    // para Torizo, Spore Spawn, Kraid, Crocomire, Phantoon, Botwoon, Draygon, Golden Torizo,
+    // Ridley e Mother Brain a diretiva do guia substitui a heurística genérica.
+    if (codexPlan && coreXStage === null && !isMetroidLarva) {
+      const driven = this.applyBossDirective(wram, codexPlan, target);
+      if (driven) {
+        return this.makeMetroidAction(
+          'COMBAT',
+          driven.keys,
+          driven.tempo,
+          'run',
+          motionPct,
+          driven.sceneLabel,
+          driven.reason,
+          wram,
+          saxPursuer !== null,
+          codexPlan.role === 'ATTACK' || codexPlan.role === 'FINISHER',
+        );
+      }
     }
 
     const isBossEnemy = target.hp >= 450;
@@ -3824,8 +4374,11 @@ export class LocalVisionAgent {
       return this.executeUSearchPattern(motionPct, wram);
     }
 
-    // Cancela arma secundária fora da janela de até 2 disparos de teste
+    // Cancela arma secundária fora da janela de até 2 disparos de teste.
+    // Durante uma luta de chefe a munição é do plano do codex: cancelar ali troca de arma
+    // a cada tick e o agente nunca descarrega o Super Míssil na hora certa.
     if (
+      !this.bossEngagedThisTick &&
       wram.selectedHudItem !== 0 &&
       (this.progressStallTicks < 14 || this.progressStallTicks > 20 || this.missileProbeCount >= 2)
     ) {

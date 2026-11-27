@@ -94,7 +94,41 @@ export interface ArmorAnalysis {
   pieces: EquipmentPieceStatus[];
 }
 
+/** Estado da luta contra chefe, conforme o Codex de Chefes (`src/lib/bossCodex.ts`). */
+export interface BossFightStatus {
+  strategyId: string;
+  bossName: string;
+  encounter: string;
+  phaseLabel: string;
+  weakPoint: string;
+  ammo: string;
+  ammoLabel: string;
+  /** SETUP = preparando (farmar/abrir janela) · ATTACK = dano · HOLD = não atacar · FINISHER = golpe secreto. */
+  role: 'SETUP' | 'ATTACK' | 'HOLD' | 'FINISHER';
+  movement: string;
+  aim: string;
+  windowOpen: boolean;
+  windowLabel: string;
+  mayFire: boolean;
+  distance: number;
+  rangeState: 'TOO_CLOSE' | 'IN_RANGE' | 'TOO_FAR';
+  hpPct: number;
+  damageDealt: number;
+  hits: number;
+  /** O prior do guia não estava ferindo e a munição foi trocada por evidência. */
+  rotated: boolean;
+  rotationNote: string | null;
+  /** O plano do guia não estava ferindo e o agente caiu para sondagem de munição. */
+  probeMode: boolean;
+  /** Poder do Core-X exposto: parar de atirar e ir coletar. */
+  collectWhenExposed: boolean;
+  note: string;
+  source: string;
+  summary: string;
+}
+
 export interface AIStatusSnapshot {
+  bossFight?: BossFightStatus;
   mode: AgentBehaviorMode;
   behaviorLabel: string;
   uSearchPhase?: USearchPhase;
