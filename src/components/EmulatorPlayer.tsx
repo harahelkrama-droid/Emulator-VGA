@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronUp, Cpu, Database, Gamepad2, Maximize2, Power, RotateCcw, Save, Shield, Swords, Timer, X } from 'lucide-react';
+import { Check, ChevronDown, ChevronUp, Cpu, Database, Gamepad2, ListChecks, Map as MapIcon, Maximize2, Power, RotateCcw, Save, Shield, Swords, Timer, X } from 'lucide-react';
 import {
   captureGameFrame,
   getEmulatorGameManager,
@@ -849,6 +849,133 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
                   plano do guia não estava ferindo · caçando a munição que funciona
                 </span>
               )}
+            </div>
+          </div>
+        )}
+
+        {snapshot?.mapExploration && (
+          <div className="mt-3.5 rounded-xl border border-[#24314a] bg-[#0d1322]/80 p-3">
+            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+              <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#eef3fb]">
+                <MapIcon className="h-3.5 w-3.5 text-[#60a5fa]" />
+                Mapa &amp; Objetivos
+              </span>
+              <span className="text-[11px] text-[#94a3bf]">
+                {snapshot.mapExploration.roomsExplored} sala(s) · {snapshot.mapExploration.mapFullyExplored ? 'mapa quase todo mapeado' : 'mapeando'}
+              </span>
+              {snapshot.mapExploration.lost && (
+                <span className="ml-auto rounded-md bg-[#fbbf24]/15 px-1.5 py-0.5 text-[10px] font-semibold text-[#fbbf24]">
+                  perdido · {snapshot.mapExploration.lostCause?.toLowerCase() ?? 'sem progresso'} (nível {snapshot.mapExploration.lostSeverity})
+                </span>
+              )}
+            </div>
+
+            <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px] text-[#94a3bf]">
+              <span>
+                Alvo:{' '}
+                <strong className="text-[#eef3fb]">
+                  {snapshot.mapExploration.target
+                    ? `${snapshot.mapExploration.target.kind} · ${snapshot.mapExploration.target.label}`
+                    : 'nenhum no grafo'}
+                </strong>
+              </span>
+              {snapshot.mapExploration.target && snapshot.mapExploration.target.route.length > 0 && (
+                <span className="flex flex-wrap items-center gap-1">
+                  rota:{' '}
+                  {snapshot.mapExploration.target.route.map((d, i) => (
+                    <span key={`${d}-${i}`} className="rounded-md bg-[#172033] px-1.5 py-0.5 font-mono-data text-[10px] text-[#c7d3e6]">
+                      {d.split('@')[0]}
+                    </span>
+                  ))}
+                </span>
+              )}
+            </div>
+
+            {snapshot.mapExploration.target?.reason && (
+              <p className="mt-1 text-[11px] leading-relaxed text-[#c7d3e6]">{snapshot.mapExploration.target.reason}</p>
+            )}
+
+            {snapshot.mapExploration.mapRead && (
+              <div className="mt-2">
+                <div className="flex items-center gap-2">
+                  <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[#172033]">
+                    <div
+                      className="h-full rounded-full bg-[#60a5fa]"
+                      style={{ width: `${Math.max(2, Math.min(100, snapshot.mapExploration.mapRead.coveragePct))}%` }}
+                    />
+                  </div>
+                  <span className="font-mono-data text-[10px] text-[#94a3bf]">{snapshot.mapExploration.mapRead.coveragePct}% coberto</span>
+                </div>
+                <p className="mt-1 text-[10px] leading-relaxed text-[#94a3bf]">
+                  {snapshot.mapExploration.mapRead.hint ?? snapshot.mapExploration.mapRead.note}
+                </p>
+              </div>
+            )}
+
+            {snapshot.mapExploration.currentRoomDoors.length > 0 && (
+              <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px]">
+                <span className="text-[#94a3bf]">portas desta sala:</span>
+                {snapshot.mapExploration.currentRoomDoors.map((d) => (
+                  <span
+                    key={d.key}
+                    className={`rounded-md px-1.5 py-0.5 font-mono-data ${
+                      d.color === 'RED'
+                        ? 'bg-[#f87171]/15 text-[#f87171]'
+                        : d.color === 'GREEN'
+                          ? 'bg-[#6ee7b7]/15 text-[#6ee7b7]'
+                          : d.color === 'YELLOW'
+                            ? 'bg-[#fbbf24]/15 text-[#fbbf24]'
+                            : d.color === 'BLUE'
+                              ? 'bg-[#60a5fa]/15 text-[#60a5fa]'
+                              : 'bg-[#172033] text-[#94a3bf]'
+                    }`}
+                  >
+                    {d.key.split('@')[0]}
+                    {d.closed ? ' · fechada' : ''} · {d.color.toLowerCase()}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {snapshot.mapExploration.backlog.length > 0 && (
+              <div className="mt-2 border-t border-[#24314a] pt-2">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-[#fbbf24]">
+                  voltar quando tiver o item ({snapshot.mapExploration.backlog.length})
+                </div>
+                <ul className="mt-1 space-y-0.5">
+                  {snapshot.mapExploration.backlog.slice(0, 3).map((b) => (
+                    <li key={`${b.roomId}-${b.doorKey}`} className="text-[10px] leading-relaxed text-[#c7d3e6]">
+                      sala 0x{b.roomId.toString(16)} · porta {b.doorKey.split('@')[0]} · {b.missing}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            <div className="mt-2 border-t border-[#24314a] pt-2">
+              <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-[#94a3bf]">
+                <ListChecks className="h-3 w-3" />
+                {snapshot.mapExploration.checklistSummary}
+              </div>
+              <div className="mt-1 flex flex-wrap gap-1">
+                {snapshot.mapExploration.checklist
+                  .filter((c) => !c.done && c.total > 0)
+                  .slice(0, 8)
+                  .map((c) => (
+                    <span
+                      key={c.id}
+                      title={c.note}
+                      className="rounded-md bg-[#172033] px-1.5 py-0.5 text-[10px] text-[#c7d3e6]"
+                    >
+                      {c.label} <span className="font-mono-data">{c.total > 1 ? `${c.have}/${c.total}` : '—'}</span>
+                    </span>
+                  ))}
+                {snapshot.mapExploration.checklist.every((c) => c.done || c.total === 0) && (
+                  <span className="rounded-md bg-[#6ee7b7]/15 px-1.5 py-0.5 text-[10px] text-[#6ee7b7]">
+                    tudo coletado · hora de voltar e fechar o jogo
+                  </span>
+                )}
+              </div>
             </div>
           </div>
         )}

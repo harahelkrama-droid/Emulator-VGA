@@ -223,6 +223,8 @@ export interface AIStatusSnapshot {
     checklistSummary: string;
     navSummary: string;
     preferredDirection: string | null;
+    /** portas da sala atual com a cor reconhecida no frame (base da decisão de abrir/voltar) */
+    currentRoomDoors: Array<{ key: string; color: string; closed: boolean }>;
   };
   // Sistema de interação com objetos/terminal/energia
   interaction?: {

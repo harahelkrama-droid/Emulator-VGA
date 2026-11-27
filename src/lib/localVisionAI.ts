@@ -392,6 +392,7 @@ export class LocalVisionAgent {
   /** itens pendentes / painéis / perigo por sala (o grafo do agente só guarda portas) */
   private navExtras = new Map<number, { itemsPending: number; itemsSeen: number; terminalsPending: number; seen: boolean; danger: number; areaIndex: number; bossName?: string }>();
   private roomTrail: number[] = [];
+  private navStartRoomId = -1;
   private navPrevItemCount = 0;
   private lastNewRoomTick = 0;
   private lastNavProgressTick = 0;
@@ -405,7 +406,10 @@ export class LocalVisionAgent {
   private mapHintTick = -9999;
   private mapConsultPhase: 'IDLE' | 'OPEN' | 'READ' | 'CLOSE' = 'IDLE';
   private mapConsultTick = 0;
-  private lastMapReadTick = -9999;
+  private mapClosePresses = 0;
+  private mapReadRoomCount = -1;
+  private mapReadBackoff = 120;
+  private lastMapReadTick = 0;
   private mapReadFailedTick = -9999;
   /** linha de base do início da sessão, para contar expansões coletadas pela IA */
   private baseMaxHealth = 0;
@@ -514,6 +518,7 @@ export class LocalVisionAgent {
     this.navDoorColors.clear();
     this.navExtras.clear();
     this.roomTrail = [];
+    this.navStartRoomId = -1;
     this.navPrevItemCount = 0;
     this.lastNewRoomTick = 0;
     this.lastNavProgressTick = 0;
@@ -526,7 +531,10 @@ export class LocalVisionAgent {
     this.mapHint = null;
     this.mapHintTick = -9999;
     this.mapConsultPhase = 'IDLE';
-    this.lastMapReadTick = -9999;
+    this.mapClosePresses = 0;
+    this.mapReadRoomCount = -1;
+    this.mapReadBackoff = 120;
+    this.lastMapReadTick = 0;
     this.mapReadFailedTick = -9999;
     this.stationsDestroyedCount = 0;
     this.interactiveObjects = [];
@@ -1133,6 +1141,7 @@ export class LocalVisionAgent {
     if (wram.gameState !== 8 || wram.roomId <= 0) return;
     const extra = this.navRoomExtra(wram.roomId, wram.areaIndex);
     const firstSight = !extra.seen;
+    if (this.navStartRoomId < 0) this.navStartRoomId = wram.roomId;
     if (firstSight) {
       extra.seen = true;
       this.lastNewRoomTick = this.stepIndex;
@@ -1191,6 +1200,8 @@ export class LocalVisionAgent {
     const fought = (this.bossDirective?.damageDealt ?? 0) > 0;
     if (gained || collected || fought || this.lastInteractionTick > this.lastNavProgressTick) {
       this.lastNavProgressTick = this.stepIndex;
+      // aconteceu coisa nova: uma próxima leitura de mapa volta a valer a pena
+      if (this.roomsExplored.size !== this.mapReadRoomCount) this.mapReadBackoff = 120;
     }
     this.navPrevItemCount = itemsNow;
 
@@ -1218,6 +1229,7 @@ export class LocalVisionAgent {
 
     // (j) replaneja quando muda de sala, quando algo muda no estado ou a cada ~40 ticks
     if (this.stepIndex - this.navPlanTick > 40 || firstSight || this.navTarget === null) {
+      this.refreshLockedDoors(wram);
       this.replan(wram);
     }
   }
@@ -1274,6 +1286,27 @@ export class LocalVisionAgent {
     };
   }
 
+  /**
+   * "Volta quando tiver o item": o grafo não pode guardar um "não" para sempre. Uma porta
+   * marcada como trancada volta a ser candidata quando a cor dela diz que é só uma comporta
+   * fechada (vermelha/verde/amarela/azul) e nós temos a munição agora.
+   */
+  private refreshLockedDoors(wram: MetroidWramSnapshot): void {
+    const loadout = this.navLoadoutView(wram);
+    for (const [roomId, node] of this.roomGraph) {
+      for (const [key, rec] of node.doors) {
+        if (!rec.locked) continue;
+        const color = this.navDoorColors.get(`${roomId}:${key}`) ?? 'UNKNOWN';
+        if (color === 'UNKNOWN' || color === 'PINK' || color === 'CORRODED') continue;
+        const chk = checkGate(gateForDoor(color, false), loadout);
+        if (chk.openableNow) {
+          rec.locked = false;
+          rec.missileProbes = 0;
+        }
+      }
+    }
+  }
+
   private replan(wram: MetroidWramSnapshot): void {
     this.navPlanTick = this.stepIndex;
     const graph = this.buildNavGraph(wram);
@@ -1286,6 +1319,7 @@ export class LocalVisionAgent {
       ),
       everythingDone: missionComplete(this.navChecklist),
       backlogKeys: new Set(this.navBacklog.map((b) => `${b.roomId}`)),
+      startRoomId: this.navStartRoomId,
     });
     this.navTarget = plan.target;
     // mescla: mantém entradas antigas que o plano de agora não conseguiu reavaliar
@@ -1342,9 +1376,13 @@ export class LocalVisionAgent {
   ): AIAction | null {
     const phase = this.mapConsultPhase;
     if (phase === 'IDLE') {
-      const periodic = this.stepIndex - this.lastMapReadTick >= this.MAP_CONSULT_INTERVAL_TICKS;
-      const severe = this.navLost.severity >= 3;
-      const lost = this.navLost.lost && (this.stepIndex - this.mapReadFailedTick > 240 || severe);
+      // Refratário: ler o mapa é caro (o jogo pausa). Severidade 3 significa "ler já", não
+      // "reler a cada 2 ticks". E reler o mesmo mapa sem ter descoberto sala nenhuma desde a
+      // última leitura é inútil — cada leitura estéril triplica a espera, até o ciclo periódico.
+      const sinceRead = this.stepIndex - this.lastMapReadTick;
+      if (sinceRead < this.mapReadBackoff) return null;
+      const periodic = sinceRead >= this.MAP_CONSULT_INTERVAL_TICKS;
+      const lost = this.navLost.lost && this.stepIndex - this.mapReadFailedTick > 240;
       if (!lost && !periodic) return null;
       if (wram.enemies.some((e) => e.hp > 0) || bossEngaged) return null;
       if (wram.gameState !== 8) return null;
@@ -1385,8 +1423,11 @@ export class LocalVisionAgent {
         if (reading.coveragePct >= 92) this.mapFullyExplored = true;
         this.mapConsultPhase = 'CLOSE';
         this.mapConsultTick = this.stepIndex;
+        this.mapClosePresses = 0;
         this.replan(wram);
-        return this.makeMetroidAction('MENU', ['START'], 120, 'menu', motionPct, 'Mapa · lido', reading.note, wram);
+        // Só registra a leitura: o START de fechamento é dado UMA vez, na fase CLOSE.
+        // Apertar aqui também deixava o mapa aberto de novo (duplo toggle).
+        return this.makeMetroidAction('MENU', [], 90, 'menu', motionPct, 'Mapa · lido', reading.note, wram);
       }
       if (elapsed >= this.MAP_CONSULT_MAX_TICKS) {
         // não reconhecemos a tela: fecha e volta muito tempo depois, sem ficar insistindo
@@ -1407,16 +1448,45 @@ export class LocalVisionAgent {
       return this.makeMetroidAction('MENU', [], 90, 'menu', motionPct, 'Mapa · aguardando abrir', 'Esperando a tela do mapa aparecer', wram);
     }
 
-    // CLOSE: um tick parado para o jogo sair do mapa e depois retoma o fluxo normal
+    // CLOSE: só apertar START enquanto o mapa ainda estiver na tela, e uma vez por tentativa.
+    // As versões anteriores fechavam com um pressionamento garantido + um extra, o que
+    // reabria o mapa (toggle duplo) e travava o agente em loop de abrir/fechar.
     if (phase === 'CLOSE') {
+      const mapStillUp = wram.gameState !== 8 || wram.menuScreen !== 0;
+      if (!mapStillUp) {
+        this.mapConsultPhase = 'IDLE';
+        this.lastMapReadTick = this.stepIndex;
+        if (this.mapReadRoomCount >= 0 && this.roomsExplored.size === this.mapReadRoomCount) {
+          // nenhuma sala nova desde a última leitura: reler o mesmo mapa não vai ajudar já
+          this.mapReadBackoff = Math.min(this.MAP_CONSULT_INTERVAL_TICKS, this.mapReadBackoff * 3);
+        } else {
+          this.mapReadBackoff = 120;
+        }
+        this.mapReadRoomCount = this.roomsExplored.size;
+        return this.makeMetroidAction('MENU', [], 90, 'menu', motionPct, 'Mapa · fechado', 'Mapa lido · retomando a exploração', wram);
+      }
       if (elapsed < 2) {
         return this.makeMetroidAction('MENU', [], 90, 'menu', motionPct, 'Mapa · fechando', 'Fechando o mapa', wram);
       }
-      this.mapConsultPhase = 'IDLE';
-      this.lastMapReadTick = this.stepIndex;
-            return this.makeMetroidAction('MENU', ['START'], 120, 'menu', motionPct, 'Mapa · fechado', 'Mapa lido · retomando a exploração', wram);
+      if (this.mapClosePresses >= 3) {
+        this.mapConsultPhase = 'IDLE';
+        this.lastMapReadTick = this.stepIndex;
+        this.mapReadFailedTick = this.stepIndex;
+        return this.makeMetroidAction('MENU', [], 90, 'menu', motionPct, 'Mapa · fechado (forçado)', 'Mapa não fechou · voltando às heurísticas', wram);
+      }
+      this.mapClosePresses++;
+      this.mapConsultTick = this.stepIndex;
+      return this.makeMetroidAction('MENU', ['START'], 120, 'menu', motionPct, 'Mapa · fechando', 'Fechando o mapa para voltar a jogar', wram);
     }
     return null;
+  }
+
+  /** A comporta desta sala abre com o que temos agora? (cor lida do frame + munição real) */
+  private navDoorAffordable(wram: MetroidWramSnapshot, doorKey: string): boolean {
+    const color = this.navDoorColors.get(`${wram.roomId}:${doorKey}`) ?? 'UNKNOWN';
+    if (color === 'UNKNOWN') return true; // sem cor lida: deixa a heurística de sonda agir
+    const gate = gateForDoor(color, false);
+    return checkGate(gate, this.navLoadoutView(wram)).openableNow;
   }
 
   /** Aplica o plano de navegação às prioridades de porta dentro da sala. */
@@ -1782,6 +1852,11 @@ export class LocalVisionAgent {
             checklistSummary: describeChecklistForUi(this.navChecklist),
             navSummary: describeNavForUi(this.navTarget, this.navBacklog, this.mapReading),
             preferredDirection: this.preferredDirection,
+            currentRoomDoors: wram.doors.map((d) => ({
+              key: d.key,
+              color: this.navDoorColors.get(`${wram.roomId}:${d.key}`) ?? 'UNKNOWN',
+              closed: d.blockedByWall,
+            })),
           }
         : undefined,
       // Sistema de interação com objetos/terminal/energia
@@ -4781,6 +4856,9 @@ export class LocalVisionAgent {
         // Determina se a porta está bloqueada e precisa de míssil
         const targetDoor = pathStep ? wram.doors.find((d) => d.key === pathStep.goalKey) : null;
         const isBlockedDoor = targetDoor ? targetDoor.blockedByWall : false;
+        // Se a cor da comporta diz que o preço é munição que não temos, nem testar:
+        // isso deixa a sala para o backlog e o agente volta quando tiver o item.
+        const cantPay = targetDoor ? !this.navDoorAffordable(wram, targetDoor.key) : false;
         const useMissile = this.shouldUseMissile(
           wram,
           null,
@@ -4789,7 +4867,7 @@ export class LocalVisionAgent {
           false, // não é entidade especial na exploração
         );
 
-        if (useMissile) {
+        if (useMissile && !cantPay) {
           if (wram.selectedHudItem === 0) {
             return this.makeMetroidAction('EXPLORE', [this.moveDir, selectKey], 130, 'run', motionPct, 'Exploração · Testando Míssil', 'Selecionando míssil para porta bloqueada', wram);
           }

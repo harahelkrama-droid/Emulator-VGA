@@ -46,6 +46,67 @@ npm run check:agent    # 23 checagens do agente inteiro contra uma WRAM sintéti
 
 `check:agent` usa `scripts/bossAgentSim.ts`, que simula a sala (Samus anda/pula, SELECT cicla o item do HUD, o HP do chefe só cai com a janela aberta — cor pintada no frame). Para inspecionar um tick a tick: `DUMP=torizo-kill npx tsx scripts/bossAgentSim.ts` (ou `DUMP=all`).
 
+## Exploração com o mapa do jogo e checklist de objetivo
+
+O pedido do projeto é: **reativar as energias, pegar todos os bônus (mísseis, bombas, tanques de
+energia), derrotar os chefes e depois voltar onde não dava para passar** quando a habilidade
+necessária existir. `src/lib/mapStrategy.ts` (puro) implementa isso em três peças:
+
+**1. Detector de "estou perdido" (`detectLost`).** Não é "ficou parado": são três sinais
+diferentes, cada um com recuperação própria — `OSCILLATION` (vai e volta entre as mesmas salas),
+`STALL` (empurrando a mesma parede), `NO_PROGRESS` (anda, anda e não descobre sala nem item
+novos). Severidade ≥ 2 libera a consulta do mapa; durante luta de chefe ou cutscene, nada
+interrompe (severidade 3 ainda assim espera o refratário).
+
+**2. Ler o mapa do jogo (`readMapScreen`).** No Super Metroid o mapa é **START** (o SELECT só
+cicla item especial — manual, seções 1 e 6), e a tela pinta sala descoberta em rosa, sala
+ainda não mapeada em azul, com o ponto de Samus piscando em branco. O agente abre o mapa, lê a
+tela de verdade e fecha em ~4 ticks (~0,5 s):
+
+- **cobertura** (quanto do que o mapa revela já está rosa) — a partir de 92% o mapa é
+  considerado esgotado e a consulta para de acontecer;
+- **direção do desconhecido**: o centróide da massa azul em relação ao ponto de Samus vira um
+  viés (`RIGHT`/`LEFT` também ajusta `preferredDirection`, porque metade da heurística do
+  agente só pensa em esquerda/direita).
+
+O classificador rejeita tela que não é mapa (pouca tinta ou texto concentrado demais), então
+uma leitura errada não engana o plano — e há refratário adaptativo: se uma leitura não rendeu
+sala nova, a próxima espera 3× mais (até o teto do ciclo periódico), porque reler o mesmo mapa
+sem ter aprendido nada é só tempo parado.
+
+**3. Objetivo e rota (`planNextTarget`, `buildChecklist`).** O grafo de salas ganha valor por
+sala (item pendente, painel de energia a acionar, chefe não vencido, sala nova, perigo já
+sofrido ali) e a rota é BFS **só por portas que dá para abrir agora**. A cor de cada porta é
+reconhecida do frame (`classifyDoorColor`) e mapeada nas regras do manual:
+
+| Cor da porta | Abre com | Falta o quê? |
+|---|---|---|
+| Azul | feixe ou bomba | — |
+| Vermelha | 5 mísseis | Missile Launcher + munição |
+| Verde | 1 super míssil | Super Missiles + munição |
+| Amarela | 1 power bomb | Power Bombs + munição |
+| Rosa | já aberta | — |
+
+Daí o comportamento pedido: com 4 mísseis, a comporta vermelha **não recebe tiro nem tempo** —
+ela entra no backlog com o motivo exato ("faltam 1 míssel(is)") e a sala do outro lado continua
+como alvo futuro. Quando a munição aparece, `reopenBacklog()` reabre a entrada, o grafo
+desmarca a porta como trancada (`refreshLockedDoors`) e o agente volta lá. Sem isso o grafo
+guardaria um "não" para sempre.
+
+O checklist compara com os totais do vanilla (14 tanques de energia, 4 reservas, 46 expansões de
+míssil = 230, 10 de super = 50, 10 de power bomb = 50) mais as 14 habilidades, chefes e
+painéis. Quando nada mais está pendente, entra no modo retorno: rota BFS de volta à primeira
+sala da sessão — não é só uma mudança de rótulo.
+
+O painel **“Mapa & Objetivos”** mostra alvo e rota, barra de cobertura, portas da sala atual com
+a cor reconhecida, o backlog ("voltar quando tiver o item") e o que falta do checklist.
+
+```bash
+npm run check:map    # 36 checagens do módulo (portas, tela de mapa pintada, rota, backlog, checklist)
+npm run check:nav    # 24 checagens do agente num mundo de várias salas, com a tela de mapa real
+npm run check:all    # tudo: codex de chefes + mapa + as duas simulações de agente
+```
+
 ## Recursos da IA Local (Sem API)
 
 - **Visão + WRAM SNES**: captura o quadro real sem tela preta (`preserveDrawingBuffer`) e lê posição, portas, blocos quebráveis, itens, munição e reserva de energia.

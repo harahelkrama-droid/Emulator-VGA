@@ -665,6 +665,8 @@ export interface PlanInput {
   everythingDone: boolean;
   /** salas já registradas como "esperar habilidade" */
   backlogKeys: Set<string>;
+  /** primeira sala descoberta da sessão (onde a nave/rota inicial ficou) */
+  startRoomId?: number;
 }
 
 export interface PlanResult {
@@ -767,7 +769,7 @@ export function planNextTarget(input: PlanInput): PlanResult {
   const backlog: NavBacklogEntry[] = [];
   if (!here) return { target: null, backlog, note: 'sala atual sem registro no grafo' };
 
-  const scoreRoom = (room: NavRoom, route: string[]): RoomScore | null => {
+  const scoreRoom = (room: NavRoom, route: string[], isCurrent = false): RoomScore | null => {
     const dist = route.length;
     let score = -dist * 3 - room.danger * 2;
     let kind: NavTarget['kind'] = 'FRONTIER';
@@ -797,7 +799,7 @@ export function planNextTarget(input: PlanInput): PlanResult {
       if (kind === 'FRONTIER') kind = 'TERMINAL';
       reasons.push('reativar energia');
     }
-    if (!room.visited) {
+    if (!room.visited && !isCurrent) {
       score += 16;
       reasons.push('sala nova');
     }
@@ -823,8 +825,9 @@ export function planNextTarget(input: PlanInput): PlanResult {
     if (unknownDoors > 0) {
       score += 10 + 4 * unknownDoors;
       reasons.push(`${unknownDoors} porta(s) sem mapa`);
-    } else if (reasons.length === 0) {
-      return null; // sala esvaziada: não é alvo
+    } else if (reasons.length === 0 || (isCurrent && room.itemsPending === 0 && room.terminalsPending === 0 && !(room.bossName && !room.bossDefeated))) {
+      // sala atual sem nada a fazer aqui: não serve de alvo (senão o plano diz "fique onde está")
+      return null;
     }
     return { score, kind, label, reason: reasons.join(' · ') };
   };
@@ -833,7 +836,7 @@ export function planNextTarget(input: PlanInput): PlanResult {
   let best: { room: NavRoom; route: string[]; s: RoomScore } | null = null;
   for (const room of graph.rooms.values()) {
     if (room.id === graph.current) {
-      const s = scoreRoom(room, []);
+      const s = scoreRoom(room, [], true);
       if (s && (!best || s.score > best.s.score)) best = { room, route: [], s };
       continue;
     }
@@ -850,18 +853,27 @@ export function planNextTarget(input: PlanInput): PlanResult {
   }
 
   if (everythingDone) {
+    // "e depois volta": o plano precisa de um destino, senão o modo SHIP só muda o rótulo.
+    // Casa = primeira sala da sessão (nave/rota de Tourian); se a rota não é mais conhecida,
+    // seguimos para a fronteira mais próxima em vez de ficar parado.
+    const home = input.startRoomId ?? graph.current;
+    const route = home !== graph.current ? (bfsRoute(graph, graph.current, home, loadout) ?? []) : [];
+    const localDoor = route.length === 0 ? pickUnknownDoor(here, loadout, hint) : null;
+    const door = route[0] ?? localDoor?.key ?? null;
     return {
       target: {
         kind: 'SHIP',
-        roomId: graph.current,
-        route: [],
-        firstDoor: null,
-        label: 'nada pendente',
-        reason: 'checklist completo · procurar a saída / voltar por rota antiga',
+        roomId: route.length > 0 ? home : graph.current,
+        route: route.length > 0 ? route : door ? [door] : [],
+        firstDoor: door,
+        label: route.length > 0 ? `voltar à sala 0x${home.toString(16)}` : 'nada pendente aqui',
+        reason: route.length > 0
+          ? 'checklist completo · voltar pelo caminho conhecido'
+          : 'checklist completo · sem rota para casa: testar a porta que falta',
         score: 100,
       },
       backlog,
-      note: 'checklist completo',
+      note: 'checklist completo · modo retorno',
     };
   }
 

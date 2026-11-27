@@ -312,6 +312,23 @@ check('bfsRoute só passa por porta que abre agora', (() => {
   const noBomb = bfsRoute(g, 1, 2, { ...FULL, hasPowerBombs: false, powerBombs: 0 });
   return withBomb?.join('>') === 'RIGHT' && noBomb === null;
 })());
+check('checklist completo → modo "voltar" com rota de verdade', (() => {
+  const rooms = new Map<number, NavRoom>([
+    [0x01, navRoom(0x01, { doors: [navDoor('RIGHT', 'PINK', 0x02)] })],
+    [0x02, navRoom(0x02, { doors: [navDoor('LEFT', 'PINK', 0x01), navDoor('RIGHT', 'PINK', 0x03)] })],
+    [0x03, navRoom(0x03, { doors: [navDoor('LEFT', 'PINK', 0x02)] })],
+  ]);
+  const p = planNextTarget({
+    graph: { current: 0x03, rooms },
+    loadout: FULL,
+    hint: null,
+    bossRooms: new Map(),
+    everythingDone: true,
+    backlogKeys: new Set(),
+    startRoomId: 0x01,
+  });
+  return p.target?.kind === 'SHIP' && p.target.roomId === 0x01 && p.target.route.length === 2;
+})());
 check('reopenBacklog libera só o que o item destrava', (() => {
   const b = [
     { roomId: 0x12, doorKey: 'RIGHT', need: 'MISSILES' as const, missing: '', unlockBy: 'AMMO' as const, note: '' },

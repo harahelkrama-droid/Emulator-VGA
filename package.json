@@ -12,7 +12,8 @@
     "check:bosses": "tsx scripts/bossCodexCheck.ts",
     "check:agent": "tsx scripts/bossAgentSim.ts",
     "check:map": "tsx scripts/mapCheck.ts",
-    "check:nav": "tsx scripts/mapAgentSim.ts"
+    "check:nav": "tsx scripts/mapAgentSim.ts",
+    "check:all": "tsx scripts/bossCodexCheck.ts && tsx scripts/mapCheck.ts && tsx scripts/bossAgentSim.ts && tsx scripts/mapAgentSim.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
