@@ -288,8 +288,10 @@ export class LocalVisionAgent {
   private lastInteractionTick = -100;
   private roomsWithPowerIssue = new Set<number>(); // salas que precisam de energia auxiliar
   private powerAuxActivated = false; // se a energia auxiliar foi ativada
-  /** Sequência de letras dos terminais de energia que devem ser ativados em ordem (A → N → D → S) */
-  private readonly TERMINAL_LETTER_SEQUENCE: string[] = ['A', 'N', 'D', 'S'];
+  /** Sequência de letras dos terminais que devem ser ativados em ordem (N → A → D → S)
+   *  N = Navigation Room (Adam/comunicação) → A = Auxiliary Power (energia) → D = Data Room (downloads) → S = Save Room (salvar)
+   */
+  private readonly TERMINAL_LETTER_SEQUENCE: string[] = ['N', 'A', 'D', 'S'];
   /** índice da próxima letra esperada na sequência */
   private terminalSequenceIndex = 0;
   /** terminais já ativados, indexados por letra */
@@ -3648,7 +3650,7 @@ export class LocalVisionAgent {
         if (!alreadyExists) {
           const dist = Math.hypot(plm.x - wram.samusX, plm.y - wram.samusY);
           // Infere a letra do terminal pelo posicionamento no mapa (cada letra ocupa uma região da sala)
-          const terminalLetter = this.inferTerminalLetter(plm.bx, plm.by, wram.roomWidthBlocks, wram.roomHeightBlocks);
+          const terminalLetter = this.inferTerminalLetter(type, plm.bx, plm.by, wram.roomWidthBlocks, wram.roomHeightBlocks);
           this.interactiveObjects.push({
             bx: plm.bx,
             by: plm.by,
@@ -3676,22 +3678,32 @@ export class LocalVisionAgent {
   // Cada letra (A, N, D, S) ocupa uma região diferente da sala.
   // Retorna undefined quando não é possível determinar.
   private inferTerminalLetter(
+    type: InteractiveObject['type'],
     bx: number,
     by: number,
     roomWidthBlocks: number,
     roomHeightBlocks: number,
   ): string | undefined {
-    if (!roomWidthBlocks || !roomHeightBlocks) return undefined;
-    const cx = bx / roomWidthBlocks; // 0..1
-    const cy = by / roomHeightBlocks; // 0..1
-    // Heurística simples por quadrante da sala:
-    // A = topo-esquerda, N = topo-direita, D = baixo-esquerda, S = baixo-direita
-    if (cy < 0.4) {
-      if (cx < 0.5) return 'A';
-      return 'N';
+    // Mapeamento direto por tipo de PLM quando possível
+    switch (type) {
+      case 'SAVE_STATION':
+        return 'S';
+      case 'POWER_PANEL':
+      case 'ENERGY_AUX':
+        return 'A';
+      case 'COMPUTER':
+        return 'N';
+      case 'TERMINAL':
+        // Terminais genéricos podem ser D (Data) ou N (Navigation); usa posição como desempate
+        if (!roomWidthBlocks || !roomHeightBlocks) return 'D';
+        const cx = bx / roomWidthBlocks;
+        const cy = by / roomHeightBlocks;
+        return cy < 0.5 && cx > 0.5 ? 'N' : 'D';
+      case 'DOOR_CONTROL':
+        return 'N';
+      default:
+        return undefined;
     }
-    if (cx < 0.5) return 'D';
-    return 'S';
   }
 
   // Verifica se o terminal com a letra dada é o próximo da sequência esperada
@@ -3895,11 +3907,34 @@ export class LocalVisionAgent {
     );
     if (existing) existing.interacted = true;
 
-    if (obj.type === 'ENERGY_AUX' || obj.type === 'POWER_PANEL' || obj.type === 'TERMINAL') {
+    // Ativa energia/terminal se for do tipo relacionado
+    if (
+      obj.type === 'ENERGY_AUX' ||
+      obj.type === 'POWER_PANEL' ||
+      obj.type === 'TERMINAL' ||
+      obj.type === 'SAVE_STATION'
+    ) {
       this.powerAuxActivated = true;
       this.roomsWithPowerIssue.delete(wram.roomId);
-      // Avança a sequência de letras dos terminais (A → N → D → S)
+      // Avança a sequência de letras dos terminais (N → A → D → S)
       this.advanceTerminalSequence(obj.letter);
+    }
+
+    // Tratamento específico por letra do terminal
+    if (obj.letter === 'S') {
+      // Save Room: restaura energia para 100% (missão principal)
+      if (wram.maxHealth > 0) {
+        wram.health = wram.maxHealth;
+      }
+    } else if (obj.letter === 'N') {
+      // Navigation Room: Adam atualiza objetivos — marca para reavaliar mapa
+      this.preferredDirection = null; // forçar releitura do mapa
+    } else if (obj.letter === 'D') {
+      // Data Room: download de equipamentos — marcar itens como disponíveis
+      this.reopenNavBacklog(wram);
+    } else if (obj.letter === 'A') {
+      // Auxiliary Power: energia da área reativada — liberar portas/elevadores
+      this.roomsWithPowerIssue.delete(wram.roomId);
     }
 
     return this.makeMetroidAction(
