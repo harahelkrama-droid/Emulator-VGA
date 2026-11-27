@@ -98,11 +98,36 @@ míssil = 230, 10 de super = 50, 10 de power bomb = 50) mais as 14 habilidades, 
 painéis. Quando nada mais está pendente, entra no modo retorno: rota BFS de volta à primeira
 sala da sessão — não é só uma mudança de rótulo.
 
+Sala com lava (o print clássico de Norfair): no Super Metroid a lava **não é um tipo de bloco**
+— o mapa de sala mostra "chão sólido" — então a superfície é detectada pela **cor do pixel**
+(`senseMoltenLake`) e vira veto de piso, com varredura de queda e commit de rota pela beirada.
+Se a saída é uma comporta fechada no teto, a jogada é a humana: andar até embaixo, SELECT no
+míssil, **atirar para cima e pular**. Com **Gravity Suit**, a lava deixa de vetar e a travessia
+usa os pulos em cadeia do Space Jump. O menu/mapa obedece ao relógio da sessão: abre **3
+minutos depois do load** (reancora ao voltar do título) ou **logo após carregar um save-state**,
+e com o mapa na tela um toque para a direita e dois para a esquerda varrem as áreas vizinhas
+procurando a sala da habilidade pendente.
+
+Perfil da ROM: o header é farejado ao montar (`SNESFOREVER.COM.BR` = X-Fusion) e aí o checklist
+troca os totais vanilla pelos do hack — **47 mísseis e 7 Reserve-X em 7 setores** (SRX/MDK/TRO/
+PYR/AQA/ARC/NOC, conferidos no zerado 100% do GebirgeBR, youtube.com/watch?v=7I3R3Rfv-3k) —, o
+espinho passa a custar o dobro no pathfinding ("dano desgraçado, não tome dano de espinho não")
+e cutscene longa é pulada com X, como o hack manda.
+
 O painel **“Mapa & Objetivos”** mostra alvo e rota, barra de cobertura, portas da sala atual com
 a cor reconhecida, o backlog ("voltar quando tiver o item") e o que falta do checklist.
 
+Para calibrar os detectores com material real, `scripts/videoFrames.py` amostra um vídeo de
+gameplay (frame a cada N segundos) e imprime as paletas dominantes do chão/HUD — é como se
+confere, por exemplo, se a lava do hack bate com o threshold do `senseMoltenLake`:
+
 ```bash
-npm run check:map    # 36 checagens do módulo (portas, tela de mapa pintada, rota, backlog, checklist)
+python3 -m venv /tmp/vid && /tmp/vid/bin/pip install av pillow numpy
+/tmp/vid/bin/python scripts/videoFrames.py gameplay.mp4 --every 1 --out video-analysis
+```
+
+```bash
+npm run check:map    # 40 checagens do módulo (portas, tela de mapa pintada, rota, backlog, checklist)
 npm run check:nav    # 50 checagens do agente num mundo de várias salas: mapa real + salas com lava
 npm run check:all    # tudo: codex de chefes + mapa + as duas simulações de agente
 ```

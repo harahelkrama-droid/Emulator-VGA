@@ -38,8 +38,7 @@ import {
   type NavGraph,
   type NavRoom,
   type NavTarget,
-  type DoorColor,
-} from './mapStrategy';
+  type DoorColor, type CompletionTotals, XFUSION_TOTALS, COMPLETION_TOTALS,} from './mapStrategy';
 import {
   planBossFight,
   describeDirectiveForUi,
@@ -432,6 +431,22 @@ export class LocalVisionAgent {
   private mapPageScanStep = 0;
   /** Gravity Suit (0x0020): com ela a lava deixa de ser obstáculo (travessia livre) */
   private lavaSafe = false;
+  /**
+   * Perfil da ROM. 'xfusion' troca os totais do checklist (47 mísseis, 7 Reserve-X — vistos
+   * no 100% zerado do GebirgeBR) e liga o modo "espinho é quase morte" que o vídeo descreve.
+   * O EmulatorPlayer detecta pelo header da ROM e chama setCompletionProfile().
+   */
+  private completionProfile: 'vanilla' | 'xfusion' = 'vanilla';
+
+  setCompletionProfile(profile: 'vanilla' | 'xfusion'): void {
+    if (profile === this.completionProfile) return;
+    this.completionProfile = profile;
+    this.navChecklist = []; // recalcula no próximo tick com os totais novos
+  }
+
+  get currentCompletionProfile(): 'vanilla' | 'xfusion' {
+    return this.completionProfile;
+  }
   private mapConsultTick = 0;
   private mapClosePresses = 0;
   private mapReadRoomCount = -1;
@@ -1324,6 +1339,15 @@ export class LocalVisionAgent {
     return this.resolveBlockType(wram, bx, by) === 0xa;
   }
 
+  /**
+   * No X-Fusion espinho não é "arranhão": o próprio zerado 100% descreve "dano desgraçado,
+   * não tome dano de espinho não". Com o perfil ligado, pousos em espinho custam o dobro no
+   * pathfinding — a rota alternativa quase sempre existe e o planificador passa a preferi-la.
+   */
+  private get spikeDangerMul(): number {
+    return this.completionProfile === 'xfusion' ? 2 : 1;
+  }
+
   /** Esta célula da sala é lava? (amostra o centro e as bordas da célula de 16px) */
   private isLavaCell(wram: MetroidWramSnapshot, bx: number, by: number): boolean {
     const lake = this.lavaLake;
@@ -1513,7 +1537,10 @@ export class LocalVisionAgent {
     });
 
     // (i) checklist
-    this.navChecklist = buildChecklist(this.navProgressInput(wram));
+    this.navChecklist = buildChecklist(
+      this.navProgressInput(wram),
+      this.completionProfile === 'xfusion' ? XFUSION_TOTALS : COMPLETION_TOTALS,
+    );
 
     // (j) replaneja quando muda de sala, quando algo muda no estado ou a cada ~40 ticks
     if (this.stepIndex - this.navPlanTick > 40 || firstSight || this.navTarget === null) {
@@ -2230,6 +2257,7 @@ export class LocalVisionAgent {
             navSummary: describeNavForUi(this.navTarget, this.navBacklog, this.mapReading),
             preferredDirection: this.preferredDirection,
             floorHazard: this.lavaLake ? 'LAVA' : 'NONE',
+            completionProfile: this.completionProfile,
             lavaTopRow: this.lavaTopRow,
             currentRoomDoors: wram.doors.map((d) => ({
               key: d.key,
@@ -2975,7 +3003,7 @@ export class LocalVisionAgent {
             if (dy === -1 && !isCellAir(bx, by - 1, true)) continue;
             if (dy === 1 && !isCellAir(nx, by, true)) continue;
             const needJump = dy === -1 && tAt(nx, ny + 1) !== 0x1 && !isHazardCeiling(nx, ny);
-            const hazardPen = dy < 0 && isHazardCeiling(nx, ny) ? 4 : 0;
+            const hazardPen = dy < 0 && isHazardCeiling(nx, ny) ? 4 * this.spikeDangerMul : 0;
             const cost = (needJump ? 2 : 1) + (isGate ? 3 : 0) + hazardPen;
             relaxEdge(idx, nx, ny, cost, dir, needJump, false, isGate, isGate, isBombTile);
           }
@@ -3090,7 +3118,7 @@ export class LocalVisionAgent {
 
           const tGate = tAt(tx, ny) === 0xc || tAt(tx, ny) === 0xf;
           const isBombTile = tAt(tx, ny) === 0xf;
-          const hazardPen = isHazardCeiling(tx, ny) ? 4 : 0;
+          const hazardPen = isHazardCeiling(tx, ny) ? 4 * this.spikeDangerMul : 0;
           const stepSign = dx > 0 ? 1 : -1;
           const adjacentWallBlocksJump = dy <= -3 && !isCellAir(bx + stepSign, by - 1, false);
 
@@ -4107,8 +4135,29 @@ export class LocalVisionAgent {
     // O codex usa isto para detectar "luta retomada depois da cena" (Mother Brain fase 3).
     this.lastCutsceneTick = this.stepIndex;
     this.cutsceneRoomId = wram.roomId;
-    const k: AIKey = this.cutsceneHoldTicks % 5 === 0 ? 'A' : 'NONE';
-    return this.makeMetroidAction('CUTSCENE', [k], 125, 'run', motionPct, 'Cena / Briefing (PT)', 'Avançando diálogo inicial da missão', wram);
+    // O corte do X-Fusion pula a cena com X ("se você apertar X, ele pula logo as cutscenes",
+    // narração do 100%). A gente avança com A uns 30 ticks — o suficiente para não perder o
+    // trigger da cena — e se a cena persistir, passa a mandar X também.
+    const k: AIKey =
+      this.cutsceneHoldTicks <= 30
+        ? this.cutsceneHoldTicks % 5 === 0
+          ? 'A'
+          : 'NONE'
+        : this.cutsceneHoldTicks % 3 === 0
+          ? 'X'
+          : this.cutsceneHoldTicks % 3 === 1
+            ? 'A'
+            : 'NONE';
+    return this.makeMetroidAction(
+      'CUTSCENE',
+      [k],
+      125,
+      'run',
+      motionPct,
+      'Cena / Briefing (PT)',
+      this.cutsceneHoldTicks <= 30 ? 'Avançando diálogo inicial da missão' : 'Pulando cena longa com X (padrão do hack)',
+      wram,
+    );
   }
 
   private executeEvadeSaxState(
