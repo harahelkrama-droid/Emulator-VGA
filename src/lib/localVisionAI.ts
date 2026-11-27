@@ -48,6 +48,7 @@ import {
   type LoadoutView,
 } from './bossCodex';
 import { detectDangerColor } from './visionDanger';
+import { getMissionSystem, type SectorId, type MissionSystem } from './missionSystem';
 
 interface GridMetrics {
   avgLum: number;
@@ -294,6 +295,8 @@ export class LocalVisionAgent {
   private sectorPowerAuxActivated = new Set<number>();
   /** Salas/setores onde já foram detectados terminais pendentes */
   private sectorTerminalsPending = new Map<number, Set<string>>(); // roomId → Set de letras pendentes
+  /** Sistema de missão completa — rastreia progresso por setor, terminais, itens, energia */
+  private missionSystem: MissionSystem | null = null;
   private stuckInRoomTicks = 0;
   private lastRoomEntryTick = 0;
 
@@ -3725,6 +3728,23 @@ export class LocalVisionAgent {
     }
   }
 
+  // Mapeia o roomId do WRAM para um SectorId do sistema de missão.
+  // Como os roomIds exatos do X-Fusion variam por versão, usa faixas aproximadas
+  // baseadas na estrutura padrão do Super Metroid:
+  //   0x00-0x3F: Crateria (SRX)
+  //   0x40-0x7F: Brinstar (NOC)
+  //   0x80-0xBF: Norfair (NOR)
+  //   0xC0-0xFF: Wrecked Ship / Maridia (WST/EAS)
+  //   0x100+: Tourian / área final (MET/CRT)
+  private roomIdToSector(roomId: number): SectorId | null {
+    if (roomId < 0x40) return 'SRX';
+    if (roomId < 0x80) return 'NOC';
+    if (roomId < 0xC0) return 'NOR';
+    if (roomId < 0x100) return 'WST';
+    if (roomId < 0x140) return 'EAS';
+    return 'MET';
+  }
+
   // =====================================================================
   // DETECÇÃO DE CAMINHOS SECRETOS / BLOCOS FALSOS (X-Ray Scope)
   // Quando o X-Ray Scope está equipado, blocos falsos nas paredes/teto/chão
@@ -3915,6 +3935,14 @@ export class LocalVisionAgent {
     ) {
       this.powerAuxActivated = true;
       this.roomsWithPowerIssue.delete(wram.roomId);
+
+      // Integração com o sistema de missão completa
+      const sectorId = this.roomIdToSector(wram.roomId);
+      if (sectorId && obj.letter) {
+        this.missionSystem?.activateTerminal(sectorId, obj.letter as 'A' | 'N' | 'D' | 'S');
+        this.missionSystem?.setCurrentSector(sectorId);
+      }
+
       // Se é o terminal A (Auxiliary Power), marca o setor como com energia ativada.
       // Só após o A é que N, D e S ficam disponíveis neste setor.
       if (obj.letter === 'A') {
@@ -3927,6 +3955,11 @@ export class LocalVisionAgent {
       // Save Room: restaura energia para 100% (missão principal)
       if (wram.maxHealth > 0) {
         wram.health = wram.maxHealth;
+      }
+      const sectorId = this.roomIdToSector(wram.roomId);
+      if (sectorId) {
+        this.missionSystem?.setEnergyFull(sectorId, true);
+        this.missionSystem?.setReserveFull(sectorId, true);
       }
     } else if (obj.letter === 'N') {
       // Navigation Room: Adam atualiza objetivos — marca para reavaliar mapa
@@ -3959,6 +3992,12 @@ export class LocalVisionAgent {
   ): AIAction {
     // A diretiva do codex só vale dentro do tick em que foi calculada.
     this.bossDirective = null;
+
+    // Inicializa o sistema de missão (lazy, uma vez por sessão)
+    if (!this.missionSystem) {
+      this.missionSystem = getMissionSystem('super-metroid');
+      void this.missionSystem.load();
+    }
 
     // Primeiro, fecha as lutas cujo alvo sumiu (morrer limpa o slot do inimigo). Isso tem
     // que rodar antes de qualquer retorno antecipado: na hora da vitória a sala fica sem
