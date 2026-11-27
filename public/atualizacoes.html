@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#090e1a">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="./app-icon.svg">
+  <title>Atualizações — RetroPlay</title>
+  <style>
+    :root{--bg:#090e1a;--panel:#111827;--line:#24314a;--text:#eef3fb;--muted:#94a3bf;--mint:#6ee7b7;--violet:#9c8cff}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 50% -25%,#1b2944 0,transparent 58%),var(--bg);color:var(--text);font:15px/1.6 system-ui,-apple-system,Segoe UI,sans-serif}
+    .wrap{max-width:900px;margin:auto;padding:24px 18px 56px}
+    .top{display:flex;align-items:center;justify-content:space-between;margin-bottom:36px}
+    .brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--text);font-weight:800;font-size:19px}
+    .logo{width:36px;height:36px;border-radius:10px;background:var(--mint);display:grid;place-items:center;color:#07151a;font-size:17px;font-weight:900}
+    .nav-btn{border:1px solid var(--line);border-radius:10px;padding:8px 13px;color:var(--muted);font-size:12px;font-weight:600;text-decoration:none}
+    .nav-btn:hover{color:var(--text);border-color:#3c5078}
+    .hero{margin-bottom:24px}
+    .eyebrow{color:var(--mint);font-size:12px;font-weight:800;letter-spacing:.1em;text-transform:uppercase}
+    .hero h1{font-size:clamp(30px,5.5vw,48px);line-height:1.06;letter-spacing:-0.03em;margin:10px 0}
+    .hero p{color:var(--muted);max-width:680px;margin:0}
+    .grid{display:grid;gap:14px;margin-top:24px}
+    .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px 20px}
+    .head{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
+    .head h2{font-size:17px;margin:0}
+    .tag{font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--mint)}
+    .tag.plan{color:#c8bcff}
+    .card p{color:var(--muted);font-size:13px;margin:6px 0 0}
+    .list{list-style:none;padding:0;margin:11px 0 0;display:grid;gap:8px}
+    .list li{padding-left:22px;position:relative;color:#d4def0;font-size:13px}
+    .list li:before{content:"✓";position:absolute;left:0;color:var(--mint);font-weight:900}
+    .list.future li:before{content:"→";color:#b2a6ff}
+    .button{display:inline-block;background:var(--mint);color:#07151a;font-weight:800;text-decoration:none;border-radius:10px;padding:10px 16px;margin-top:22px}
+    .fine{font-size:12px;color:#7785a0;margin-top:24px}
+    .footer{border-top:1px solid var(--line);padding-top:18px;margin-top:28px;color:#74819b;font-size:12px;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap}
+  </style>
+</head>
+<body>
+<main class="wrap">
+  <header class="top">
+    <a class="brand" href="./"><span class="logo">▶</span>RetroPlay</a>
+    <a class="nav-btn" href="./">← Voltar à biblioteca</a>
+  </header>
+
+  <section class="hero">
+    <div class="eyebrow">Notas de versão · Emulator-GBA</div>
+    <h1>O que mudou<br>no RetroPlay.</h1>
+    <p>Acompanhe as melhorias do emulador GBA e SNES com IA local sem API, análise de memória em tempo real e suporte offline.</p>
+  </section>
+
+  <div class="grid">
+    <article class="card">
+      <div class="head"><span class="tag">Disponível</span><h2>IA Local sem API e Filtro de Cenário</h2></div>
+      <ul class="list">
+        <li>IA Local (Visão + WRAM SNES) funcionando 100% no navegador sem chave de API nem limite de requisições.</li>
+        <li>Filtro de objetos estáticos do cenário: ignora props sem hitbox ou imóveis para não atacar parede/fundo.</li>
+        <li>Detecção visual de chefes e formas especiais: Omega Metroid com temporizador de fuga, SA-X (Varia Suit, Gravity Suit e forma Monstro), Core-X em 4 fases (Normal, Amarelo, Vermelho e Poder Exposto) e Metroids (incluindo evento de dreno/cura do Metroid Grande).</li>
+        <li>Banco de Conhecimento no navegador (IndexedDB) que registra cada poder coletado e seu efeito (pulo infinito, proteção térmica, feixes e peças da armadura).</li>
+        <li>Análise completa das 16 peças de armadura, reserva de energia (Reserve Tank) e botão de Resetar Energia / Jogo.</li>
+      </ul>
+    </article>
+
+    <article class="card">
+      <div class="head"><span class="tag">Disponível</span><h2>Biblioteca, Saves e PWA Offline</h2></div>
+      <ul class="list">
+        <li>Galeria responsiva com capas, detalhes e suporte a ROMs locais (.gba, .sfc, .smc) sem colisão de slots de save.</li>
+        <li>Dois slots de save state por jogo gravados no IndexedDB do navegador.</li>
+        <li>Service Worker resiliente e manifesto PWA para uso offline após a primeira visita online.</li>
+      </ul>
+    </article>
+
+    <article class="card">
+      <div class="head"><span class="tag plan">Em estudo</span><h2>Biblioteca na nuvem e sincronização</h2></div>
+      <ul class="list future">
+        <li>Armazenamento externo de jogos e capas sem crescer o repositório GitHub.</li>
+        <li>Sincronização opcional de saves entre dispositivos após validação de segurança e custos.</li>
+      </ul>
+    </article>
+  </div>
+
+  <a class="button" href="./">Voltar para os jogos</a>
+  <p class="fine">ROMs e capas só devem ser publicadas no GitHub quando houver autorização para redistribuição. Saves locais ficam armazenados apenas no navegador atual.</p>
+  <footer class="footer">
+    <span>RetroPlay · harahelkrama-droid/Emulator-GBA</span>
+    <span>GBA · SNES · IA Local sem API</span>
+  </footer>
+</main>
+</body>
+</html>

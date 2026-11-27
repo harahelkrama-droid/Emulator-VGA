@@ -1,0 +1,88 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    background-color: #090e1a;
+    color: #eef3fb;
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  button,
+  select,
+  input {
+    font-family: inherit;
+  }
+}
+
+.font-mono-data {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Centraliza perfeitamente o canvas do EmulatorJS em desktop, notebook e celular */
+#emulator-mount {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+  user-select: none;
+}
+
+#emulator-mount > div,
+#emulator-mount .ejs_parent {
+  width: 100% !important;
+  height: 100% !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+
+#emulator-mount canvas {
+  max-width: 100% !important;
+  max-height: 100% !important;
+  object-fit: contain !important;
+  margin: auto !important;
+}
+
+/* Tela cheia em modo paisagem limpo: oculta controles flutuantes/virtuais sobre o jogo */
+.fs-clean-controls .ejs_menu_bar,
+.fs-clean-controls .ejs_menu_button,
+.fs-clean-controls .ejs_virtualGamepad_parent,
+.fs-clean-controls .ejs_context_menu,
+.fs-clean-controls [class*="ejs_menu"],
+.fs-clean-controls [class*="ejs_virtualGamepad"] {
+  display: none !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.fs-landscape-rotated {
+  position: fixed !important;
+  top: 50% !important;
+  left: 50% !important;
+  width: 100dvh !important;
+  height: 100dvw !important;
+  max-width: none !important;
+  max-height: none !important;
+  transform: translate(-50%, -50%) rotate(90deg) !important;
+  transform-origin: center center !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,7 @@
+# ROMs: não publique jogos sem autorização expressa
+*.gba
+*.sfc
+*.smc
+# arquivos do sistema
+.DS_Store
+Thumbs.db
