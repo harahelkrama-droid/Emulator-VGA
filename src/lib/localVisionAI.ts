@@ -246,10 +246,21 @@ export class LocalVisionAgent {
   private stuckInRoomTicks = 0;
   private lastRoomEntryTick = 0;
 
-  // Sistema de análise inicial: abrir mapa para verificar habilidades e decidir direção
+  // Sistema de análise periódica do menu do jogo:
+  // espera 3 min → abre menu → analisa 3 min → fecha menu → espera 10 min → repete
   private mapAnalyzed = false;
   private mapAnalysisTick = 0;
+  // Fluxo de menu: esperar → abrir → analisar → fechar → esperar → repetir
+  private menuPhase: 'NONE' | 'OPENING' | 'ANALYZING' | 'CLOSING' | 'DONE' = 'NONE';
+  private menuCloseTick = 0;
+  private menuCheckedAbilities = false;
   private preferredDirection: 'LEFT' | 'RIGHT' | null = null;
+  // Tempos exatos (ticks @ ~125ms por tick):
+  // 3 min = 1440 ticks, 10 min = 4800 ticks
+  private lastMenuCloseTick = 0;
+  private readonly MENU_WAIT_BEFORE_OPEN_TICKS = 1440;    // 3 min esperando antes de abrir o menu
+  private readonly MENU_OPEN_INTERVAL_TICKS = 4800;      // 10 min entre aberturas do menu
+  private readonly MENU_ANALYSIS_DURATION_TICKS = 1440;   // 3 min de análise com menu aberto
   private initialLoadoutAnalyzed = false;
   private abilitiesSummary: string[] = [];
 
@@ -418,6 +429,10 @@ export class LocalVisionAgent {
     this.lastRoomEntryTick = this.stepIndex;
     this.mapAnalyzed = false;
     this.mapAnalysisTick = 0;
+    this.menuPhase = 'NONE';
+    this.menuCloseTick = 0;
+    this.lastMenuCloseTick = 0;
+    this.menuCheckedAbilities = false;
     this.preferredDirection = null;
     this.initialLoadoutAnalyzed = false;
     this.abilitiesSummary = [];
@@ -932,17 +947,60 @@ export class LocalVisionAgent {
     this.missileProbeCount++;
   }
 
-  // Abre o mapa no início do jogo para analisar habilidades e decidir direção
+  // Fluxo de menu periódico: ABRIR → verificar tudo (3 min) → FECHAR → jogar (10 min) → repetir
   private openMapAndAnalyze(
     wram: MetroidWramSnapshot,
     keys: AIKey[],
     motionPct: number,
   ): AIAction | null {
-    if (this.mapAnalyzed || wram.gameState !== 8) return null;
+    if (wram.gameState !== 8) return null;
 
     const mapKey: AIKey = 'SELECT';
 
-    if (this.stepIndex - this.mapAnalysisTick > 60) {
+    // Fase DONE: menu fechado, esperando 10 minutos antes de abrir novamente
+    if (this.menuPhase === 'DONE') {
+      const ticksSinceClose = this.stepIndex - this.lastMenuCloseTick;
+      if (ticksSinceClose >= this.MENU_OPEN_INTERVAL_TICKS) {
+        // 10 minutos passaram — inicia novo ciclo: espera 3 min antes de abrir
+        this.menuPhase = 'NONE';
+        this.mapAnalyzed = false;
+        this.menuCheckedAbilities = false;
+        this.mapAnalysisTick = this.stepIndex;
+      } else {
+        // Ainda faltam minutos para a próxima abertura — segue jogando normalmente
+        const remainingMin = Math.round((this.MENU_OPEN_INTERVAL_TICKS - ticksSinceClose) / 60);
+        return this.makeMetroidAction(
+          'EXPLORE',
+          [this.moveDir],
+          120,
+          'run',
+          motionPct,
+          `Jogatina · Próxima conferência em ${remainingMin} min`,
+          'Menu fechado · explorando e coletando itens até a próxima verificação',
+          wram,
+        );
+      }
+    }
+
+    // Fase NONE: esperando 3 minutos antes de abrir o menu do jogo
+    if (this.menuPhase === 'NONE') {
+      const waitElapsed = this.stepIndex - this.mapAnalysisTick;
+      if (waitElapsed < this.MENU_WAIT_BEFORE_OPEN_TICKS) {
+        // Ainda está esperando os 3 minutos antes de abrir — segue jogando
+        const remainingMin = Math.round((this.MENU_WAIT_BEFORE_OPEN_TICKS - waitElapsed) / 60);
+        return this.makeMetroidAction(
+          'EXPLORE',
+          [this.moveDir],
+          120,
+          'run',
+          motionPct,
+          `Jogatina · Abrindo menu em ${remainingMin} min`,
+          'Esperando 3 minutos antes de abrir o menu para conferência',
+          wram,
+        );
+      }
+      // 3 minutos de espera passaram — hora de abrir o menu
+      this.menuPhase = 'OPENING';
       this.mapAnalysisTick = this.stepIndex;
       return this.makeMetroidAction(
         'MENU',
@@ -950,22 +1008,99 @@ export class LocalVisionAgent {
         200,
         'run',
         motionPct,
-        'Abertura do Mapa · Analisando Habilidades',
-        'Abrindo mapa para verificar habilidades, armadura e decidir direção de exploração',
+        'Menu · Abrindo',
+        'Abrindo menu do jogo para verificar habilidades e atributos',
         wram,
       );
     }
 
-    return this.makeMetroidAction(
-      'MENU',
-      [mapKey],
-      150,
-      'run',
-      motionPct,
-      'Abertura do Mapa · Aguardando',
-      'Aguardando abertura do mapa para analisar habilidades',
-      wram,
-    );
+    // Transição de OPENING para ANALYZING após abrir o menu
+    if (this.menuPhase === 'OPENING') {
+      // Aguarda o menu abrir completamente antes de começar a analisar
+      if (this.stepIndex - this.mapAnalysisTick < 20) {
+        return this.makeMetroidAction(
+          'MENU',
+          [mapKey],
+          150,
+          'run',
+          motionPct,
+          'Menu · Abrindo',
+          'Aguardando abertura completa do menu do jogo',
+          wram,
+        );
+      }
+      this.menuPhase = 'ANALYZING';
+      this.mapAnalysisTick = this.stepIndex;
+    }
+
+    // Fase 2: ANALISANDO — fica com o menu aberto por 3 minutos verificando habilidades/atributos
+    if (this.menuPhase === 'ANALYZING') {
+      const analysisElapsed = this.stepIndex - this.mapAnalysisTick;
+
+      // Ainda está dentro dos 3 minutos de análise
+      if (analysisElapsed < this.MENU_ANALYSIS_DURATION_TICKS) {
+        return this.makeMetroidAction(
+          'MENU',
+          [mapKey],
+          150,
+          'run',
+          motionPct,
+          'Menu · Analisando Habilidades',
+          `Verificando armadura, peças, mísseis, super mísseis e energia (${Math.round(analysisElapsed / 60)}s / 3min)`,
+          wram,
+        );
+      }
+
+      // 3 minutos passaram — analisa o loadout completo e fecha o menu
+      this.analyzeInitialLoadout(wram);
+      this.menuCheckedAbilities = true;
+      this.menuPhase = 'CLOSING';
+      this.menuCloseTick = this.stepIndex;
+
+      return this.makeMetroidAction(
+        'MENU',
+        [mapKey],
+        200,
+        'run',
+        motionPct,
+        'Menu · Fechando',
+        'Análise de 3 min concluída · fechando menu para continuar a jogatina',
+        wram,
+      );
+    }
+
+    // Fase 3: FECHAR o menu/mapa
+    if (this.menuPhase === 'CLOSING') {
+      // Aguarda um pouco antes de fechar para garantir que a análise foi registrada
+      if (this.stepIndex - this.menuCloseTick < 30) {
+        return this.makeMetroidAction(
+          'MENU',
+          [mapKey],
+          150,
+          'run',
+          motionPct,
+          'Menu · Fechando',
+          'Fechando menu · habilidades e atributos confirmados',
+          wram,
+        );
+      }
+
+      // Fecha o menu pressionando SELECT novamente
+      this.menuPhase = 'DONE';
+      this.lastMenuCloseTick = this.stepIndex;
+      return this.makeMetroidAction(
+        'MENU',
+        [mapKey],
+        200,
+        'run',
+        motionPct,
+        'Menu · Fechado · Iniciando Jogatina',
+        'Menu fechado · agente pronto para explorar, coletar itens e combater',
+        wram,
+      );
+    }
+
+    return null;
   }
 
   // Analisa o loadout completo e define direção preferida de exploração
@@ -2671,12 +2806,28 @@ export class LocalVisionAgent {
     }
     this.cutsceneHoldTicks = 0;
 
-    // 0) Abre o mapa no início e analisa habilidades/atributos
+    // 0) Fluxo de menu: ABRIR → verificar habilidades/atributos → FECHAR → jogar
     const menuAction = this.openMapAndAnalyze(wram, [], motionPct);
     if (menuAction) return menuAction;
 
-    // Após o mapa estar aberto, analisa o loadout inicial e define direção
-    this.analyzeInitialLoadout(wram);
+    // Se o menu ainda não fechou (fase DONE não alcançada), aguarda antes de jogar
+    if (!this.mapAnalyzed) {
+      return this.makeMetroidAction(
+        'MENU',
+        [],
+        100,
+        'run',
+        motionPct,
+        'Menu · Aguardando conclusão',
+        'Menu ainda aberto · finalizando análise antes de iniciar a jogatina',
+        wram,
+      );
+    }
+
+    // Após o menu fechar, analisa o loadout (se não foi feito no fluxo) e define direção
+    if (!this.initialLoadoutAnalyzed) {
+      this.analyzeInitialLoadout(wram);
+    }
 
     // Atualiza grafo de salas, progresso real e detecção de bloqueio
     const { unlockedLabel, hitKnownBlocked } = this.syncRoomAndProgress(wram);
@@ -3873,21 +4024,39 @@ export class LocalVisionAgent {
       const nearCenter = Math.abs(wram.samusX - wpX) < 10 && pathStep.drop;
       const moveKey: AIKey = pathStep.dir;
       const keys: AIKey[] = nearCenter ? [moveKey] : [moveKey, dashKey];
+
+      // PULO CONTÍNUO: pula a cada poucos ticks durante exploração livre para avançar sem preocupação com obstáculos
+      const continuousJump = !nearDoor && !ceilingLow && !bombFloorUnderFoot && !pathStep.drop;
+      if (continuousJump) {
+        if (hasSpaceJump) {
+          // Space Jump: pula continuamente no ar e no chão
+          if (isGrounded ? this.nextJump(true, 2) : (this.stepIndex % 2 === 0 || this.samusVy >= 0)) {
+            keys.push(jumpKey);
+          }
+        } else if (isGrounded && this.nextJump(true, 3)) {
+          // Sem Space Jump: pula apenas quando está no chão
+          keys.push(jumpKey);
+        }
+      }
+
       const hitSmallStep = isGrounded && Math.abs(this.samusVx) === 0 && this.roomMovedOnce && !pathStep.drop && !ceilingLow;
       const needsAscend =
         !pathStep.drop &&
         !(ceilingLow && !pathStep.jump) &&
         (pathStep.jump || (!ceilingLow && wpY < wram.samusY - 12) || hitSmallStep);
 
-      if (hasSpaceJump && needsAscend && (!nearDoor || (targetDoor && targetDoor.y < wram.samusY - 14))) {
-        if (isGrounded) {
-          if (this.nextJump(true, 3)) keys.push(jumpKey);
-        } else if (this.stepIndex % 2 === 0 || this.samusVy >= 0) {
-          this.jumpHoldRemaining = 0;
+      // Só executa lógica de pulo existente se continuousJump não estiver ativo (evita duplicar jumpKey)
+      if (!continuousJump) {
+        if (hasSpaceJump && needsAscend && (!nearDoor || (targetDoor && targetDoor.y < wram.samusY - 14))) {
+          if (isGrounded) {
+            if (this.nextJump(true, 3)) keys.push(jumpKey);
+          } else if (this.stepIndex % 2 === 0 || this.samusVy >= 0) {
+            this.jumpHoldRemaining = 0;
+            keys.push(jumpKey);
+          }
+        } else if (this.nextJump(needsAscend && !nearDoor && isGrounded, pathStep.jump ? 4 : 3)) {
           keys.push(jumpKey);
         }
-      } else if (this.nextJump(needsAscend && !nearDoor && isGrounded, pathStep.jump ? 4 : 3)) {
-        keys.push(jumpKey);
       }
 
       if (this.nextShoot(Boolean(nearDoor || pathStep.shoot || pathStep.viaBreakable || isTimedEscape || this.stepIndex % 5 === 0))) {
