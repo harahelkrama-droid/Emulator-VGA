@@ -239,6 +239,17 @@ export interface AIStatusSnapshot {
     completionProfile?: 'vanilla' | 'xfusion';
     /** linha (em blocos da sala) onde o lago começa; -1 = sem lago */
     lavaTopRow: number;
+    /** corte atual do detector de lava (muda sozinho quando a IA erra e o frame separa) */
+    lavaCalib: { minRed: number; maxGreen: number; minRun: number };
+    /** o que a IA diagnosticou no próprio erro e o que mudou por causa disso */
+    corrections: Array<{
+      id: number;
+      kind: string;
+      scope: string;
+      diagnosis: string;
+      action: string;
+      status: 'ACTIVE' | 'HELPED' | 'REVERTED';
+    }>;
     /** portas da sala atual com a cor reconhecida no frame (base da decisão de abrir/voltar) */
     currentRoomDoors: Array<{ key: string; color: string; closed: boolean }>;
   };

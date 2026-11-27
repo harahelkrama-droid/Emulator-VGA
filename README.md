@@ -118,6 +118,21 @@ minutos depois do load** (reancora ao voltar do título) ou **logo após carrega
 e com o mapa na tela um toque para a direita e dois para a esquerda varrem as áreas vizinhas
 procurando a sala da habilidade pendente.
 
+Autocorreção (`src/lib/selfCorrection.ts`) — o laço que faltava. Toda vez que a IA apanha
+num lugar que o detector dela chamou de seguro, o WRAM rotula o pixel („aqui doeu‟ / „aqui era
+firme‟) e `deriveMoltenCalib` pergunta ao próprio frame se as duas classes separam: se sim, o
+corte da lava é derivado e adotado **no tick seguinte** (no print real a regra ancorada dá
+r>199 contra o r>185 que foi fixado à mão — a mesma conta); se não separam, nada é inventado e
+ela só marca a célula como perigosa. Outras falhas com causa viram correção do mesmo jeito:
+cor de porta contradita pelo estado real da hoja (corrige a cor e encolhe o raio da amostra,
+que era o que comia a pulga de fogo), três tiros sem efeito numa comporta (a célula para de ser
+tratada como quebrável), dano onde o perigo era conhecido (custo de pouso sobe em degraus de +2,
+teto +6) e „perdido‟ por oscilação. Cada correção nasce `ACTIVE`, vira `HELPED` se sobreviver
+900 ticks sem repetir, e é **revertida** na terceira repetição — errar é permitido, insistir no
+erro não. O caderno aparece no painel „Mapa & Objetivos‟ com as cores medidas e persiste em
+`localStorage` por ROM, então a paleta do hack não é reaprendida a cada sessão (nem vazada para
+uma partida vanilla).
+
 Perfil da ROM: o header é farejado ao montar (`SNESFOREVER.COM.BR` = X-Fusion) e aí o checklist
 troca os totais vanilla pelos do hack — **47 mísseis e 7 Reserve-X em 7 setores** (SRX/MDK/TRO/
 PYR/AQA/ARC/NOC, conferidos no zerado 100% do GebirgeBR, youtube.com/watch?v=7I3R3Rfv-3k) —, o
@@ -141,8 +156,10 @@ python3 -m venv /tmp/vid && /tmp/vid/bin/pip install av pillow numpy
 
 ```bash
 npm run check:map    # 49 checagens do módulo (portas, tela de mapa pintada, rota, backlog, checklist)
-npm run check:nav    # 50 checagens do agente num mundo de várias salas: mapa real + salas com lava
-npm run check:all    # tudo: codex de chefes + mapa + as duas simulações de agente
+npm run check:selffix # 43 checagens do laço erro→diagnóstico→parâmetro→reversão
+npm run check:nav    # 59 checagens do agente num mundo de várias salas: mapa, lava e a
+                     # autocorreção fechada (paleta desconhecida descoberta apanhando, seção J)
+npm run check:all    # tudo: codex de chefes + mapa + autocorreção + as duas simulações (263)
 ```
 
 ## Recursos da IA Local (Sem API)
