@@ -278,6 +278,9 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
     }
     const bytes = saved.state instanceof Uint8Array ? saved.state : new Uint8Array(saved.state);
     await gm.loadState(bytes);
+    // regra do usuário: logo depois de carregar um Save o agente pode abrir o menu (mapa)
+    // para reposicionar o plano — sem esperar a janela de 3 minutos do load do jogo.
+    agentRef.current.noteSaveStateLoaded();
     onNotify(`Slot ${slot} carregado.`);
   };
 

@@ -313,15 +313,22 @@ class World {
     if (keys.has('LEFT')) this.sx = Math.max(8, this.sx - 5);
     const fy = this.room(this.cur).floorY ?? FLOOR_Y;
     if (keys.has('A') && this.sy >= fy - 1) this.vy = this.room(this.cur).doors.some((d) => d.side === 'UP') ? -13 : -9;
-    if (keys.has('UP')) this.sy = Math.max(24, this.sy - 6);
+    const underOpenUp = this.room_.doors.some(
+      (d) => d.side === 'UP' && !d.closed && Math.abs(this.doorX(d) - this.sx) < 22,
+    );
+    if (keys.has('UP') && underOpenUp) this.sy = Math.max(24, this.sy - 6);
     this.vy += 1.6;
     this.sy += this.vy;
     if (this.sy >= fy) {
       this.sy = fy;
       this.vy = 0;
     }
-    // pisar na lava dói (e é isto que o agente tem que evitar)
-    if (this.inLava(this.sx, this.sy + 6)) this.health = Math.max(1, this.health - 25);
+    // pisar na lava dói (e é isto que o agente tem que evitar); com Gravity Suit é só um
+    // esquentado — o mesmo contrato do jogo real
+    if (this.inLava(this.sx, this.sy + 6)) {
+      const grav = (this.itemsMask & 0x0020) !== 0;
+      this.health = Math.max(1, this.health - (grav ? 1 : 25));
+    }
 
     // atirar na comporta fechada: cada cor tem seu preço, exatamente como no manual
     if (keys.has('X')) {
@@ -406,6 +413,7 @@ interface Run {
 
 function run(world: World, ticks: number, log: (t: number, a: AIAction) => void = () => {}): Run {
   const agent = new LocalVisionAgent();
+  agent.menuArmAfterTicks = 0; // nestes cenários o portão de 3 min não é o objeto do teste
   const actions: AIAction[] = [];
   for (let t = 0; t < ticks; t++) {
     const action = agent.decide(world.frame(), 'action', 'Difícil', world.wram());
@@ -562,6 +570,95 @@ section('F. Lava cercada, sala sem saída vertical: parar em vez de morrer');
   check('ficou na sala, preso na beirada (não teletransportou)', w.cur === 0x10, `sala=0x${w.cur.toString(16)}`);
   check('declarou-se perdido (o que libera a consulta de mapa)', (n?.lostSeverity ?? 0) >= 1, `sev=${n?.lostSeverity} causa=${n?.lostCause}`);
   check('tentou a leitura do mapa em vez de só andar de um lado para o outro', actions.some((a) => ks(a).includes('START')));
+}
+
+/* ============================== G. comporta no teto sobre a lava: atirar para cima */
+section('G. Porta do teto FECHADA sobre o lago: atirar nela e pular');
+{
+  const w = new World();
+  const ledge = w.room(0x10);
+  ledge.floorY = 144;
+  ledge.lava = { topRow: 10, fromBx: 8 };
+  ledge.doors.push({ side: 'UP', to: 0x11, color: 'RED', closed: true, x: 72, y: 74 });
+  w.missiles = 20;
+  const above = w.room(0x11);
+  above.items.push({ x: 150, y: FLOOR_Y - 6, kind: 'TANK' });
+  const { actions } = run(w, 600);
+  const opened = ledge.doors.every((d) => !d.closed);
+  const hpMin = Math.min(...actions.map((a) => a.snapshot?.health ?? 199));
+  check('selecionou míssil no HUD', actions.some((a) => ks(a).includes('SELECT')), 'SELECT nunca apareceu');
+  check('atirou PARA CIMA na comporta', actions.some((a) => (a.reason ?? '').includes('atirando para cima')));
+  // no simulador cada disparo também custa 1 míssil, além dos 5 da abertura: 20 → 14-15
+  check('pagou o preço da porta vermelha', w.missiles >= 14 && w.missiles <= 15, `restam ${w.missiles}, tiros=${w.missileShotsAtHatch}`);
+  check('a comporta abriu', opened);
+  check('subiu por ela e saiu da sala', w.cur === 0x11, `sala=0x${w.cur.toString(16)}`);
+  check('a vida nunca caiu (lava intacta)', hpMin >= 199, `min=${hpMin}`);
+}
+
+/* ==================== H. Gravity Suit: lava vira chão — atravessa com pulos em cadeia */
+section('H. Gravity Suit + Space Jump: atravessa o lago em vez de evitar');
+{
+  const w = new World();
+  w.itemsMask = 0x0020 | 0x0200; // Gravity Suit + Space Jump
+  const lakeRoom = w.room(0x10);
+  lakeRoom.floorY = 144;
+  lakeRoom.lava = { topRow: 10, fromBx: 5 };
+  lakeRoom.doors.push({ side: 'RIGHT', to: 0x21, color: 'PINK', closed: false });
+  w.room(0x21).items.push({ x: 150, y: FLOOR_Y - 6, kind: 'MISSILE' });
+  const { actions } = run(w, 400);
+  const n = nav(actions[0]!);
+  const jumps = actions.filter((a) => ks(a).includes('A')).length;
+  check('com a suit, nenhuma célula de lava é vetada', n?.floorHazard === 'NONE', `hazard=${n?.floorHazard}`);
+  check('atravessou o lago até a porta direita', w.cur === 0x21, `sala=0x${w.cur.toString(16)}`);
+  check('pegou a expansão do outro lado', w.room(0x21).items.length === 0);
+  check('usou pulo em cadeia sobre a lava (space jump)', jumps >= 3, `${jumps} pulos`);
+  check('o custo foi o de raspão, não morte', w.health >= 140 && w.health <= 198, `vida=${w.health}`);
+}
+
+/* ============ I. menu só depois de 3 min do load (ou logo após carregar um Save) ============ */
+section('I. Portão do menu: 3 minutos após o load, ou a permissão de um save');
+{
+  const buildTrapWorld = () => {
+    const w = new World();
+    const trap = w.room(0x10);
+    trap.floorY = 144;
+    trap.lava = { topRow: 10, fromBx: 9 };
+    return w;
+  };
+  // (1) portão por tempo
+  {
+    const w = buildTrapWorld();
+    const agent: any = new LocalVisionAgent();
+    agent.menuArmAfterTicks = 300; // "3 minutos" encolhidos para caber no teste
+    let firstStart = -1;
+    let panRight = false;
+    let panLeft = false;
+    for (let t = 0; t < 700; t++) {
+      const a = agent.decide(w.frame(), 'action', 'Difícil', w.wram());
+      if (firstStart < 0 && ks(a).includes('START')) firstStart = t;
+      if ((a.sceneLabel ?? '').includes('área à direita')) panRight = true;
+      if ((a.sceneLabel ?? '').includes('área à esquerda')) panLeft = true;
+      w.apply(a);
+    }
+    check('antes do tempo, o START nunca aparece', firstStart >= 300, `primeiro START no tick ${firstStart}`);
+    check('abre o menu assim que o tempo fecha', firstStart >= 300 && firstStart < 420, `tick ${firstStart}`);
+    check('varre direita e esquerda procurando a habilidade', panRight && panLeft, `→=${panRight} ←=${panLeft}`);
+    check('fecha o mapa de novo', !w.mapShown);
+  }
+  // (2) carregar um save dá permissão imediata
+  {
+    const w = buildTrapWorld();
+    const agent: any = new LocalVisionAgent();
+    agent.menuArmAfterTicks = 1_000_000; // "nunca" por tempo
+    let firstStart = -1;
+    for (let t = 0; t < 560; t++) {
+      if (t === 400) agent.noteSaveStateLoaded();
+      const a = agent.decide(w.frame(), 'action', 'Difícil', w.wram());
+      if (firstStart < 0 && ks(a).includes('START')) firstStart = t;
+      w.apply(a);
+    }
+    check('save carregado libera o menu na hora', firstStart >= 400 && firstStart < 460, `tick ${firstStart}`);
+  }
 }
 
 console.log(
