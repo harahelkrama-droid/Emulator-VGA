@@ -246,17 +246,20 @@ export class LocalVisionAgent {
   private stuckInRoomTicks = 0;
   private lastRoomEntryTick = 0;
 
-  // Sistema de análise periódica do menu do jogo (abrir → verificar → fechar → jogar → repetir a cada 10 min)
+  // Sistema de análise periódica do menu do jogo:
+  // espera 3 min → abre menu → analisa 3 min → fecha menu → espera 10 min → repete
   private mapAnalyzed = false;
   private mapAnalysisTick = 0;
-  // Fluxo de menu: abrir → verificar tudo → fechar → jogar → repetir periodicamente
+  // Fluxo de menu: esperar → abrir → analisar → fechar → esperar → repetir
   private menuPhase: 'NONE' | 'OPENING' | 'ANALYZING' | 'CLOSING' | 'DONE' = 'NONE';
   private menuCloseTick = 0;
   private menuCheckedAbilities = false;
   private preferredDirection: 'LEFT' | 'RIGHT' | null = null;
-  // Controle periódico: a cada 10 minutos (4800 ticks @ ~125ms) abre o menu para conferência
+  // Tempos exatos (ticks @ ~125ms por tick):
+  // 3 min = 1440 ticks, 10 min = 4800 ticks
   private lastMenuCloseTick = 0;
-  private readonly MENU_OPEN_INTERVAL_TICKS = 4800;      // 10 min entre verificações
+  private readonly MENU_WAIT_BEFORE_OPEN_TICKS = 1440;    // 3 min esperando antes de abrir o menu
+  private readonly MENU_OPEN_INTERVAL_TICKS = 4800;      // 10 min entre aberturas do menu
   private readonly MENU_ANALYSIS_DURATION_TICKS = 1440;   // 3 min de análise com menu aberto
   private initialLoadoutAnalyzed = false;
   private abilitiesSummary: string[] = [];
@@ -954,23 +957,49 @@ export class LocalVisionAgent {
 
     const mapKey: AIKey = 'SELECT';
 
-    // Se está em fase DONE, verifica se já passou 10 minutos desde o último fechamento
-    // Se passou, reinicia o ciclo para abrir o menu novamente para conferência
+    // Fase DONE: menu fechado, esperando 10 minutos antes de abrir novamente
     if (this.menuPhase === 'DONE') {
       const ticksSinceClose = this.stepIndex - this.lastMenuCloseTick;
       if (ticksSinceClose >= this.MENU_OPEN_INTERVAL_TICKS) {
-        // Hora de abrir o menu novamente para conferência periódica
+        // 10 minutos passaram — inicia novo ciclo: espera 3 min antes de abrir
         this.menuPhase = 'NONE';
         this.mapAnalyzed = false;
         this.menuCheckedAbilities = false;
+        this.mapAnalysisTick = this.stepIndex;
       } else {
-        // Ainda não é hora de abrir novamente — segue jogando normalmente
-        return null;
+        // Ainda faltam minutos para a próxima abertura — segue jogando normalmente
+        const remainingMin = Math.round((this.MENU_OPEN_INTERVAL_TICKS - ticksSinceClose) / 60);
+        return this.makeMetroidAction(
+          'EXPLORE',
+          [this.moveDir],
+          120,
+          'run',
+          motionPct,
+          `Jogatina · Próxima conferência em ${remainingMin} min`,
+          'Menu fechado · explorando e coletando itens até a próxima verificação',
+          wram,
+        );
       }
     }
 
-    // Fase 1: ABRIR o menu/mapa
+    // Fase NONE: esperando 3 minutos antes de abrir o menu do jogo
     if (this.menuPhase === 'NONE') {
+      const waitElapsed = this.stepIndex - this.mapAnalysisTick;
+      if (waitElapsed < this.MENU_WAIT_BEFORE_OPEN_TICKS) {
+        // Ainda está esperando os 3 minutos antes de abrir — segue jogando
+        const remainingMin = Math.round((this.MENU_WAIT_BEFORE_OPEN_TICKS - waitElapsed) / 60);
+        return this.makeMetroidAction(
+          'EXPLORE',
+          [this.moveDir],
+          120,
+          'run',
+          motionPct,
+          `Jogatina · Abrindo menu em ${remainingMin} min`,
+          'Esperando 3 minutos antes de abrir o menu para conferência',
+          wram,
+        );
+      }
+      // 3 minutos de espera passaram — hora de abrir o menu
       this.menuPhase = 'OPENING';
       this.mapAnalysisTick = this.stepIndex;
       return this.makeMetroidAction(
