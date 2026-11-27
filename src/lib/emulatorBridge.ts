@@ -225,16 +225,37 @@ export function mountEmulator(options: {
     }
   }, 350);
 
-  const script = document.createElement('script');
-  script.id = 'ejs-script';
-  script.src = 'https://cdn.emulatorjs.org/stable/data/loader.js';
-  script.onerror = () => {
-    window.clearInterval(pollId);
-    if (!cancelled) {
-      options.onError('Falha ao carregar o runtime do EmulatorJS. Verifique sua conexão.');
-    }
+  const EJS_MIRRORS = [
+    'https://cdn.emulatorjs.org/stable/data/loader.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/emulatorjs/3.1.0/loader.js',
+    'https://cdn.jsdelivr.net/npm/emulatorjs@3.1.0/dist/loader.js',
+  ];
+
+  let mirrorIndex = 0;
+  const tryLoadMirror = () => {
+    if (cancelled) return;
+    const src = EJS_MIRRORS[mirrorIndex];
+    const script = document.createElement('script');
+    script.id = 'ejs-script';
+    script.src = src;
+    script.onerror = () => {
+      window.clearInterval(pollId);
+      if (cancelled) return;
+      mirrorIndex++;
+      if (mirrorIndex < EJS_MIRRORS.length) {
+        // Tenta o próximo espelho automaticamente
+        tryLoadMirror();
+        return;
+      }
+      options.onError('Falha ao carregar o runtime do EmulatorJS em todos os espelhos. Verifique sua conexão.');
+    };
+    script.onload = () => {
+      // script carregado com sucesso; o poll de isEmulatorReady já está rodando
+    };
+    document.body.appendChild(script);
   };
-  document.body.appendChild(script);
+
+  tryLoadMirror();
 
   return () => {
     cancelled = true;

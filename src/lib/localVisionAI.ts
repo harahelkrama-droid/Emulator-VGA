@@ -47,6 +47,7 @@ import {
   type BossFightMemory,
   type LoadoutView,
 } from './bossCodex';
+import { detectDangerColor } from './visionDanger';
 
 interface GridMetrics {
   avgLum: number;
@@ -1967,41 +1968,57 @@ export class LocalVisionAgent {
       return;
     }
 
-    if (wram.maxHealth > 0 && wram.health < wram.maxHealth * 0.25 && hasSaveStation) {
+    // MISSÃO PRINCIPAL: manter energia e reserva em 100% até a fase final.
+    // Se não está em vida máxima e há estação de save, priorizar ir até ela
+    // antes de prosseguir com itens, chefes ou exploração.
+    if (wram.maxHealth > 0 && wram.health < wram.maxHealth && hasSaveStation) {
       this.currentObjective = {
         type: 'SAVE_STATION',
         x: wram.samusX,
         y: wram.samusY,
         priority: 9,
-        reason: 'Vida crítica · indo para estação de save',
+        reason: 'MISSÃO: restaurando energia para 100% na estação de save',
       };
       this.objectiveTick = this.stepIndex;
       return;
     }
 
-    if (hasEnergyAux && !this.powerAuxActivated) {
+    // MISSÃO PRINCIPAL: ativar energia auxiliar em TODAS as bases.
+    // powerAuxActivated não pode ser toggle global — cada sala/base tem seu próprio terminal.
+    // Se há terminal não interagido nesta sala, prioridade alta (acima de itens comuns).
+    const energyAuxHere = this.interactiveObjects.some(
+      (o) => (o.type === 'ENERGY_AUX' || o.type === 'POWER_PANEL') && !o.interacted && this.canInteractWithObject(wram, o),
+    );
+    if (energyAuxHere) {
       this.currentObjective = {
         type: 'ENERGY_AUX',
         x: wram.samusX,
         y: wram.samusY,
         priority: 8,
-        reason: 'Ativando energia auxiliar',
+        reason: 'MISSÃO: ativando energia auxiliar nesta base',
       };
       this.objectiveTick = this.stepIndex;
       return;
     }
 
-    if (activeItem && activeItem.dist < 150) {
+    // MISSÃO PRINCIPAL: coletar TODOS os itens e habilidades.
+    // Prioriza tanques de energia e reserva (para chegar a 100%),
+    // depois expansões de munição, depois habilidades de mobilidade.
+    if (activeItem) {
       const loadout = this.getAgentLoadout(wram);
       const canReach = loadout.hasMorphBall || loadout.hasSpaceJump || loadout.hasHiJump;
+      const isEnergyOrReserve = activeItem.y > 0; // placeholder, será refinado pelo tipo do item
+
+      // Itens de energia/reserva têm prioridade máxima entre coleta
+      const itemPriority = activeItem.dist < 60 ? 7 : (canReach ? 6 : 4);
 
       if (canReach || activeItem.dist < 60) {
         this.currentObjective = {
           type: 'ITEM',
           x: activeItem.x,
           y: activeItem.y,
-          priority: 5,
-          reason: `Coletando item (${Math.round(activeItem.dist)}px)`,
+          priority: itemPriority,
+          reason: `MISSÃO: coletando item/habilidade (${Math.round(activeItem.dist)}px)`,
         };
         this.objectiveTick = this.stepIndex;
         return;
@@ -2161,8 +2178,11 @@ export class LocalVisionAgent {
       reserveEnergy: wram?.reserveEnergy,
       reserveMax: wram?.reserveMax,
       missiles: wram?.missiles,
+      maxMissiles: wram?.maxMissiles,
       supers: wram?.supers,
+      maxSupers: wram?.maxSupers,
       powerBombs: wram?.powerBombs,
+      maxPowerBombs: wram?.maxPowerBombs,
       roomId: wram?.roomId,
       abilities: wram?.abilities ?? [],
       pendingBacktracks: this.pendingTargets.length,
@@ -2202,6 +2222,8 @@ export class LocalVisionAgent {
               rotationNote: this.bossDirective.rotationNote,
               probeMode: this.bossDirective.probeMode,
               collectWhenExposed: this.bossDirective.collectWhenExposed,
+              doNotKill: this.bossDirective.doNotKill,
+              letDrain: this.bossDirective.letDrain,
               note: this.bossDirective.note,
               source: this.bossDirective.source,
               summary: describeDirectiveForUi(this.bossDirective),
@@ -3961,6 +3983,19 @@ export class LocalVisionAgent {
       );
     }
 
+    // MISSÃO PRINCIPAL: definir ordem de prioridade comportamental.
+    // 1. SA-X (fuga ou confronto final) — sempre acima de tudo
+    // 2. Core-X poder exposto — coletar imediatamente
+    // 3. Energia auxiliar não ativada nesta sala — ativar (missão principal)
+    // 4. Itens/habilidades para coletar — coleta (missão principal)
+    // 5. Chefes — só combate se não houver energia/itens pendentes de maior prioridade
+    // 6. Backtracking — voltar para rotas bloqueadas
+    // 7. Exploração — descobrir novas salas
+    const energyAuxPending = this.interactiveObjects.some(
+      (o) => (o.type === 'ENERGY_AUX' || o.type === 'POWER_PANEL') && !o.interacted,
+    );
+    const itemPending = activeItem && this.itemChaseTicks < 42;
+
     let resolvedMode: AgentBehaviorMode = 'EXPLORE';
     if (saxPursuer && !this.omegaVanishedDuringTimer && !isEscapeCountdown) {
       const saxDisabledByMetroid =
@@ -3970,7 +4005,10 @@ export class LocalVisionAgent {
       resolvedMode = mustFight ? 'COMBAT' : 'EVADE_SAX';
     } else if (coreXTarget) {
       resolvedMode = 'COMBAT';
-    } else if ((activeItem && this.itemChaseTicks < 42) || unlockedLabel) {
+    } else if (energyAuxPending) {
+      // Energia auxiliar tem prioridade sobre combate com chefes comuns
+      resolvedMode = 'COLLECT';
+    } else if (itemPending || unlockedLabel) {
       resolvedMode = 'COLLECT';
     } else if (backtrackDir && this.progressStallTicks < 16 && !this.omegaVanishedDuringTimer && !isEscapeCountdown) {
       resolvedMode = 'BACKTRACK';
@@ -5405,6 +5443,67 @@ export class LocalVisionAgent {
         (isGrounded || (this.sameYStreak >= 1 && Math.abs(this.samusVy) <= 1)) &&
         (wram.itemsMask & 0x1004) === 0x1004;
 
+      // CORREÇÃO: Porta acima (UP) — mirar para cima e atirar antes de pular/entrar
+      const isUpDoor = targetDoor ? targetDoor.side === 'UP' : false;
+      if (isUpDoor && nearDoor) {
+        const loadout = this.getAgentLoadout(wram);
+        const doorColor = this.navDoorColors.get(`${wram.roomId}:${targetDoor.key}`) ?? 'UNKNOWN';
+        const gate = gateForDoor(doorColor, targetDoor.blockedByWall);
+        const gateCheck = checkGate(gate, this.navLoadoutView(wram));
+        const needsAmmoNow = gate.needsAmmoNow && gate.need !== 'NONE' && gate.need !== 'UNKNOWN';
+        const canAfford = gateCheck.openableNow || gate.need === 'BOMB_OR_BEAM';
+        const keys: AIKey[] = [];
+
+        // 1) Selecionar munição adequada se a porta precisa e não está selecionada
+        if (needsAmmoNow && !canAfford && wram.selectedHudItem === 0) {
+          keys.push(selectKey);
+          return this.makeMetroidAction(
+            'EXPLORE',
+            [...keys, 'UP'],
+            130,
+            'run',
+            motionPct,
+            'Exploração · Porta acima · selecionar munição',
+            `Porta acima (${doorColor}) · selecionando munição no HUD`,
+            wram,
+          );
+        }
+
+        // 2) Mirar para cima e atirar na porta
+        keys.push('UP');
+        if (
+          (gate.need === 'MISSILES' && loadout.missileCount >= gate.amount) ||
+          (gate.need === 'SUPERS' && loadout.superCount >= gate.amount) ||
+          (gate.need === 'POWER_BOMBS' && loadout.powerBombCount >= gate.amount) ||
+          gate.need === 'BOMB_OR_BEAM' ||
+          gate.need === 'NONE' ||
+          gate.need === 'UNKNOWN'
+        ) {
+          if (this.nextShoot(true)) {
+            keys.push(shootKey);
+            if (gate.need === 'MISSILES' || gate.need === 'SUPERS' || gate.need === 'POWER_BOMBS') {
+              this.registerMissileUse();
+            }
+          }
+        }
+
+        // 3) Após mirar/atirar, preparar pulo para entrar na porta
+        if (this.nextJump(true, 3)) {
+          keys.push(jumpKey);
+        }
+
+        return this.makeMetroidAction(
+          'EXPLORE',
+          keys,
+          125,
+          'run',
+          motionPct,
+          'Exploração · Porta acima · mirar e atirar',
+          `Porta acima (${targetDoor.key}) · mirando para cima e atirando antes de pular`,
+          wram,
+        );
+      }
+
       if (bombFloorUnderFoot) {
         const bKeys: AIKey[] = ['DOWN'];
         if (this.nextShoot(true)) bKeys.push(shootKey);
@@ -5791,6 +5890,27 @@ export class LocalVisionAgent {
       }
     } else {
       this.visualCombatStreak = 0;
+    }
+
+    // Evita andar para dentro de perigo óbvio detectado por cor (espinho/lava)
+    // quando WRAM não está disponível para dizer onde está o chão seguro.
+    const dangerAhead = this.lastCapturedFrame && detectDangerColor(this.lastCapturedFrame, this.moveDir);
+    if (dangerAhead) {
+      const oppDir: 'LEFT' | 'RIGHT' = this.moveDir === 'RIGHT' ? 'LEFT' : 'RIGHT';
+      this.moveDir = oppDir;
+      const keys: AIKey[] = [oppDir, 'B'];
+      if (this.nextJump(true, 4)) keys.push('A');
+      this.currentMode = 'EXPLORE';
+      return {
+        key: keys[0],
+        keys,
+        time: 150,
+        phase: 'run',
+        motionPct,
+        sceneLabel: 'Exploração · Perigo detectado',
+        reason: 'Perigo à frente (espinho/lava) · inverte direção e salta',
+        snapshot: buildVisualSnapshot('EXPLORE', keys, 'Exploração · Perigo detectado', 'Inverte direção por perigo visual'),
+      };
     }
 
     this.currentMode = 'EXPLORE';
