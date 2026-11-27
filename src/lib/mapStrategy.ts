@@ -421,13 +421,38 @@ export function readMapScreen(rgba: Uint8ClampedArray | Uint8Array, width: numbe
 /* ------------------------------------------------------------------- checklist */
 
 /** Totais do Super Metroid vanilla para 100% (46×5=230 mísseis, 10×5 super, 10×5 bombas). */
-export const COMPLETION_TOTALS = {
+export interface CompletionTotals {
+  readonly missileExpansions: number;
+  readonly superExpansions: number;
+  readonly bombExpansions: number;
+  readonly energyTanks: number;
+  readonly reserveTanks: number;
+}
+
+export const COMPLETION_TOTALS: CompletionTotals = {
   missileExpansions: 46,
   superExpansions: 10,
   bombExpansions: 10,
   energyTanks: 14,
   reserveTanks: 4,
-} as const;
+};
+
+/**
+ * Totais do hack X-Fusion conferidos no 100% zerado do GebirgeBR (YouTube 7I3R3Rfv-3k,
+ * 2025-11-21): a lista de itens do canal marca 47 pickups de míssil e 7 Reserve-X em 7
+ * setores (SRX/MDK/TRO/PYR/AQA/ARC/NOC). Supers e power bombs não aparecem na lista que
+ * conseguimos ler — mantemos o palpite vanilla e o checklist continua honesto no "≈".
+ */
+export const XFUSION_TOTALS: CompletionTotals = {
+  missileExpansions: 47,
+  superExpansions: 10,
+  bombExpansions: 10,
+  energyTanks: 14,
+  reserveTanks: 7,
+};
+
+export const XFUSION_SECTORS = ['SRX', 'MDK', 'TRO', 'PYR', 'AQA', 'ARC', 'NOC'] as const;
+
 
 export const CORE_ABILITIES = [
   { bit: 'MORPH_BALL', label: 'Morph Ball' },
@@ -482,7 +507,10 @@ function tanks(maxHealth: number): number {
   return Math.max(0, Math.floor((maxHealth - 99) / 100));
 }
 
-export function buildChecklist(p: ChecklistProgress): ChecklistItem[] {
+export function buildChecklist(
+  p: ChecklistProgress,
+  totals: CompletionTotals = COMPLETION_TOTALS,
+): ChecklistItem[] {
   const items: ChecklistItem[] = [];
   const et = tanks(p.maxHealth);
   items.push({
@@ -490,8 +518,8 @@ export function buildChecklist(p: ChecklistProgress): ChecklistItem[] {
     kind: 'TANK',
     label: 'Tanques de energia',
     have: et,
-    total: COMPLETION_TOTALS.energyTanks,
-    done: et >= COMPLETION_TOTALS.energyTanks,
+    total: totals.energyTanks,
+    done: et >= totals.energyTanks,
     note: `vida máxima ${p.maxHealth} (99 + 100×tanques)`,
     // energia é o que sustenta tudo o resto: sem tanque não se passa de Phantoon/Mother Brain
     weight: 10,
@@ -502,8 +530,8 @@ export function buildChecklist(p: ChecklistProgress): ChecklistItem[] {
     kind: 'RESERVE',
     label: 'Tanques de reserva',
     have: rt,
-    total: COMPLETION_TOTALS.reserveTanks,
-    done: p.maxReserve <= 0 ? true : rt >= COMPLETION_TOTALS.reserveTanks,
+    total: totals.reserveTanks,
+    done: p.maxReserve <= 0 ? true : rt >= totals.reserveTanks,
     note: p.maxReserve <= 0 ? 'nenhum reservatório (opcional, mas conta no 100%)' : `reserva ${p.maxReserve}`,
     weight: 4,
   });
@@ -527,9 +555,9 @@ export function buildChecklist(p: ChecklistProgress): ChecklistItem[] {
       weight,
     });
   };
-  pushCap('missiles', 'MISSILE', 'Expansões de míssil', p.maxMissiles, COMPLETION_TOTALS.missileExpansions, 8);
-  pushCap('supers', 'SUPER', 'Expansões de super míssil', p.maxSupers, COMPLETION_TOTALS.superExpansions, 8);
-  pushCap('bombs', 'BOMB', 'Expansões de power bomb', p.maxPowerBombs, COMPLETION_TOTALS.bombExpansions, 7);
+  pushCap('missiles', 'MISSILE', 'Expansões de míssil', p.maxMissiles, totals.missileExpansions, 8);
+  pushCap('supers', 'SUPER', 'Expansões de super míssil', p.maxSupers, totals.superExpansions, 8);
+  pushCap('bombs', 'BOMB', 'Expansões de power bomb', p.maxPowerBombs, totals.bombExpansions, 7);
 
   for (const ab of CORE_ABILITIES) {
     const have = p.abilities[ab.bit] === true;

@@ -179,6 +179,38 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
     setAiStatusText(aiEngine === 'local-vision' ? 'Pronta (Sem API)' : 'Pausada');
   };
 
+  // O hack X-Fusion assina o header como "SNESFOREVER.COM.BR" (o vanilla diz "SUPER
+  // METROID"). É a única forma honesta de escolher os totais do checklist sem perguntar:
+  // o vídeo 100% do hack provou 47 mísseis e 7 Reserve-X, e o planificador de espinho
+  // aperta o passo quando o jogo pune espinho como morte.
+  const [romProfile, setRomProfile] = useState<'vanilla' | 'xfusion'>('vanilla');
+  useEffect(() => {
+    let cancelled = false;
+    const url = game.isLocalBlob ? game.file : encodeURI(game.file);
+    void (async () => {
+      try {
+        const res = await fetch(url);
+        if (!res.ok || !res.arrayBuffer) return;
+        const buf = new Uint8Array(await res.arrayBuffer());
+        if (buf.length < 0x8000) return;
+        const header = new TextDecoder('latin1')
+          .decode(buf.subarray(0x7fc0, 0x7fd8))
+          .replace(/\0/g, '')
+          .toUpperCase();
+        const profile: 'vanilla' | 'xfusion' = header.includes('SNESFOREVER') ? 'xfusion' : 'vanilla';
+        if (!cancelled) {
+          setRomProfile(profile);
+          agentRef.current.setCompletionProfile(profile);
+        }
+      } catch {
+        /* ROM grande/CORS: segue com vanilla, nada quebra */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [game.file, game.isLocalBlob]);
+
   useEffect(() => {
     setReady(false);
     setFootMessage('Inicializando núcleo do emulador…');
@@ -959,6 +991,11 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
               <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-[#94a3bf]">
                 <ListChecks className="h-3 w-3" />
                 {snapshot.mapExploration.checklistSummary}
+                {snapshot.mapExploration.completionProfile === 'xfusion' && (
+                  <span className="rounded border border-[#5b4a1f] bg-[#2a230f] px-1 py-px text-[9px] font-bold text-[#e8c96a]">
+                    X-FUSION · 7 SETORES
+                  </span>
+                )}
               </div>
               <div className="mt-1 flex flex-wrap gap-1">
                 {snapshot.mapExploration.checklist

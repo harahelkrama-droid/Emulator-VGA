@@ -20,6 +20,8 @@ import {
   readMapScreen,
   reopenBacklog,
   describeChecklistForUi,
+  XFUSION_TOTALS,
+  XFUSION_SECTORS,
   type GateLoadout,
   type NavDoor,
   type NavGraph,
@@ -380,6 +382,40 @@ const doneList = buildChecklist({
   roomsUnvisited: 0,
 });
 check('100% = missionComplete e HUD diz "voltar e fechar"', missionComplete(doneList) && describeChecklistForUi(doneList).includes('checklist completo'));
+
+/* ------------------------------------ D2. perfil X-Fusion: totais conferidos no zerado 100% */
+section('D2. Perfil X-Fusion: 47 mísseis e 7 Reserve-X (vídeo GebirgeBR 7I3R3Rfv-3k)');
+const xfSameInput = buildChecklist({
+  maxHealth: 1499,
+  maxReserve: 400,
+  maxMissiles: 230,
+  maxSupers: 50,
+  maxPowerBombs: 50,
+  abilities: {
+    MORPH_BALL: true, BOMBS: true, HI_JUMP: true, SPACE_JUMP: true, SPRING_BALL: true, VARIA: true, GRAVITY: true,
+    SCREW: true, GRAPPLE: true, XRAY: true, CHARGE: true, ICE: true, WAVE: true, SPAZER: true,
+  },
+  bossesDefeated: 11,
+  bossesKnown: 11,
+  terminalsDone: 4,
+  terminalsKnown: 4,
+  roomsUnvisited: 0
+}, XFUSION_TOTALS);
+check('o "100% vanilla" NÃO é 100% no hack (47/7 faltam)', !missionComplete(xfSameInput));
+check('a sobra é míssil + reserva, exatamente 1+3', (() => {
+  const open = openObjectives(xfSameInput);
+  return open.length === 2 && open.some((c) => c.id === 'missiles' && c.have === 46 && c.total === 47) && open.some((c) => c.id === 'reserve-tanks' && c.total === 7);
+})(), JSON.stringify(openObjectives(xfSameInput).map((c) => `${c.id}:${c.have}/${c.total}`)));
+const xfFull = buildChecklist({
+  maxHealth: 1499, maxReserve: 700, maxMissiles: 235, maxSupers: 50, maxPowerBombs: 50,
+  abilities: {
+    MORPH_BALL: true, BOMBS: true, HI_JUMP: true, SPACE_JUMP: true, SPRING_BALL: true, VARIA: true, GRAVITY: true,
+    SCREW: true, GRAPPLE: true, XRAY: true, CHARGE: true, ICE: true, WAVE: true, SPAZER: true,
+  },
+  bossesDefeated: 11, bossesKnown: 11, terminalsDone: 4, terminalsKnown: 4, roomsUnvisited: 0,
+}, XFUSION_TOTALS);
+check('com os totais do hack, 47/7 fecha o checklist', missionComplete(xfFull));
+check('o hack tem 7 setores nomeados (SRX … NOC)', XFUSION_SECTORS.length === 7 && XFUSION_SECTORS[0] === 'SRX' && XFUSION_SECTORS[6] === 'NOC');
 
 const t0 = Date.now();
 for (let k = 0; k < 2000; k++) {

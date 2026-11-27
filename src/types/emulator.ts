@@ -225,6 +225,7 @@ export interface AIStatusSnapshot {
     preferredDirection: string | null;
     /** chão hostil da sala atual, reconhecido no frame (lava não é bloco no SM) */
     floorHazard: 'LAVA' | 'NONE';
+    completionProfile?: 'vanilla' | 'xfusion';
     /** linha (em blocos da sala) onde o lago começa; -1 = sem lago */
     lavaTopRow: number;
     /** portas da sala atual com a cor reconhecida no frame (base da decisão de abrir/voltar) */
