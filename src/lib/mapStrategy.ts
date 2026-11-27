@@ -1079,14 +1079,195 @@ export function isIncandescentPixel(r: number, g: number, b: number): boolean {
  * (r≈208-210) vs o tijolo quente da plataforma #b11014 (r=177) e a sombra #930409 — o
  * corte r>185 separa os dois com folga; g/b baixos separam do laranja clássico.
  */
-export function isRedHotLavaPixel(r: number, g: number, b: number): boolean {
-  return r > 185 && g < 80 && b < 95 && r - g > 105 && r - b > 95;
+/**
+ * Parâmetros do corte "esta célula é corpo de lava". A base é o que foi MEDIDO no print do
+ * usuário, mas virou argumento porque o agente pode derivar outro calibração sozinho: quando
+ * ele pisa num lugar que o detector dele dizia ser seguro e leva dano, os pixels daquele lugar
+ * são a classe positiva e os do chão ao lado são a negativa (see deriveMoltenCalib). É o
+ * mesmo raciocínio que um humano faz olhando o frame — só que aplicado no tick seguinte.
+ */
+export interface MoltenCalib {
+  /** média R da célula acima disto é quente demais para ser chão */
+  minRed: number;
+  /** ...e média G abaixo disto (carmim é fraco em verde; laranja não passa aqui) */
+  maxGreen: number;
+  /** células de 8px contíguas para chamar uma linha de superfície do lago */
+  minRun: number;
 }
 
+export const LAVA_CALIB_BASE: MoltenCalib = { minRed: 185, maxGreen: 80, minRun: 8 };
+
+/** Limites do que a autocorreção pode fazer: fora daqui ela não tem opinião. */
+export const LAVA_CALIB_LIMITS = {
+  minRedMin: 150,
+  minRedMax: 214,
+  maxGreenMin: 55,
+  maxGreenMax: 170,
+  minRunMin: 6,
+  minRunMax: 12,
+} as const;
+
+export function isRedHotLavaPixel(
+  r: number,
+  g: number,
+  b: number,
+  calib: MoltenCalib = LAVA_CALIB_BASE,
+): boolean {
+  return r > calib.minRed && g < calib.maxGreen && b < 95 && r - g > 105 && r - b > 95;
+}
+
+export interface MoltenCalibSample {
+  /** células de 8px (coords de TELA) onde doeu — a classe positiva */
+  hurt: Array<{ r: number; c: number }>;
+  /** células de 8px onde dá para ficar em pé — a classe negativa */
+  safe: Array<{ r: number; c: number }>;
+}
+
+export interface MoltenCalibReport {
+  calib: MoltenCalib;
+  /** as duas classes em hex, para o diagnóstico sair legível no HUD */
+  hurtHex: string;
+  safeHex: string;
+  /** folga entre as classes em R; 0 = não dá para separar (e a correção é recusada) */
+  gap: number;
+}
+
+const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
+
+function cellMeanAt(
+  rgba: Uint8ClampedArray | Uint8Array,
+  frameW: number,
+  frameH: number,
+  cr: number,
+  cc: number,
+  sx: number,
+  sy: number,
+): [number, number, number] | null {
+  const px0 = Math.floor(cc * MOLTEN_CELL * sx);
+  const px1 = Math.floor((cc + 1) * MOLTEN_CELL * sx) - 1;
+  const py0 = Math.floor(cr * MOLTEN_CELL * sy);
+  const py1 = Math.floor((cr + 1) * MOLTEN_CELL * sy) - 1;
+  let rs = 0;
+  let gs = 0;
+  let bs = 0;
+  let n = 0;
+  for (let py = Math.max(0, py0); py <= Math.min(frameH - 1, py1); py += 1) {
+    const row = py * frameW;
+    for (let px = Math.max(0, px0); px <= Math.min(frameW - 1, px1); px += 1) {
+      const i = (row + px) * 4;
+      rs += rgba[i] ?? 0;
+      gs += rgba[i + 1] ?? 0;
+      bs += rgba[i + 2] ?? 0;
+      n++;
+    }
+  }
+  return n > 0 ? [rs / n, gs / n, bs / n] : null;
+}
+
+/**
+ * MÉDIA RGB de uma célula de 8px do frame. Exposto porque a calibração derivada e o detector
+ * têm que usar o MESMO estimador — a média da célula foi justamente o que separou lava de
+ * plataforma no print real (amostra esparsa inverte o sinal em textura de tijolo).
+ */
+export function moltenCellMean(
+  rgba: Uint8ClampedArray | Uint8Array,
+  frameW: number,
+  frameH: number,
+  cr: number,
+  cc: number,
+): [number, number, number] | null {
+  if (!rgba || rgba.length === 0 || frameW < 64 || frameH < 64) return null;
+  if (cr < 0 || cc < 0 || cr >= MOLTEN_ROWS || cc >= MOLTEN_COLS) return null;
+  return cellMeanAt(rgba, frameW, frameH, cr, cc, frameW / 256, frameH / 224);
+}
+
+const hex = (m: [number, number, number]): string =>
+  `#${m.map((v) => Math.round(clamp(v, 0, 255)).toString(16).padStart(2, '0')).join('')}`;
+
+/**
+ * Autocalibração supervisionada pelo próprio erro: quem rotula os pixels é o WRAM (aqui
+ * doeu / aqui é chão firme), não uma constante no código. Retorna null quando as duas
+ * classes não separam — nesse caso NÃO há o que aprender, e o chamador tem que cair no
+ * recuo conservador (marcar a célula) em vez de inventar threshold.
+ *
+ * No frame real do print isto reproduz a conta humana: lava #d22b30 (r≈210) contra
+ * plataforma #b11014 (r=177) → corte ~193, do lado do 185 que eu tinha fixado à mão.
+ */
+export function deriveMoltenCalib(
+  rgba: Uint8ClampedArray | Uint8Array,
+  frameW: number,
+  frameH: number,
+  sample: MoltenCalibSample,
+): MoltenCalibReport | null {
+  if (!rgba || rgba.length === 0 || frameW < 64 || frameH < 64) return null;
+  if (sample.hurt.length === 0 || sample.safe.length === 0) return null;
+  const sx = frameW / 256;
+  const sy = frameH / 224;
+  const hurt: Array<[number, number, number]> = [];
+  const safe: Array<[number, number, number]> = [];
+  for (const cell of sample.hurt) {
+    const m = cellMeanAt(rgba, frameW, frameH, cell.r, cell.c, sx, sy);
+    if (m) hurt.push(m);
+  }
+  for (const cell of sample.safe) {
+    const m = cellMeanAt(rgba, frameW, frameH, cell.r, cell.c, sx, sy);
+    if (m) safe.push(m);
+  }
+  if (hurt.length === 0 || safe.length === 0) return null;
+
+  // corte tem que ficar ABAIXO do mais escuro dos que doeram e ACIMA do mais claro dos firmes
+  const hurtR = Math.min(...hurt.map((m) => m[0]));
+  const safeR = Math.max(...safe.map((m) => m[0]));
+  const gap = hurtR - safeR;
+  if (gap < 12) return null; // dano de inimigo/espinho, não de cor de lava: nada a aprender
+
+  const hurtG = Math.max(...hurt.map((m) => m[1]));
+  const safeG = Math.max(...safe.map((m) => m[1]));
+  // O corte fica ANCORADO no escuro que doeu (recuando no máximo 1/3 da folga), não no
+  // meio do caminho: folga grande (chão cinza vs lava, no simulador) no meio do caminho daria
+  // r>137 e passaria a ver lava em Sprite/portal quente. Ancorado, o corte no frame real do
+  // print sai ~186 — a mesma coisa que a calibração humana (185) fez.
+  const slack = Math.min(20, Math.floor(gap / 3));
+  const calib: MoltenCalib = {
+    minRed: clamp(Math.floor(hurtR) - slack, LAVA_CALIB_LIMITS.minRedMin, LAVA_CALIB_LIMITS.minRedMax),
+    maxGreen: clamp(Math.floor(hurtG) + 12, LAVA_CALIB_LIMITS.maxGreenMin, LAVA_CALIB_LIMITS.maxGreenMax),
+    // se o chão "seguro" tem verde ALTO demais para caber abaixo do nosso teto de G, o
+    // predicado dele não depende de G — não há risco; caso contrário (chão esverdeado),
+    // a folga do G é o que separa, então deixamos safeG + 4 valer também
+    ...(safeG + 4 > hurtG + 12 ? { maxGreen: clamp(Math.floor(safeG) + 4, LAVA_CALIB_LIMITS.maxGreenMin, LAVA_CALIB_LIMITS.maxGreenMax) } : {}),
+    minRun: LAVA_CALIB_BASE.minRun,
+  };
+
+  // teste adversário das duas direções: o predicado não pode chamar chão de lava,
+  // e tem que chamar de lava tudo o que já nos machucou. Sem isso, a "correção" é recusada.
+  for (let guard = 0; guard < 10; guard++) {
+    const falsePos = safe.some((m) => isRedHotLavaPixel(m[0], m[1], m[2], calib));
+    if (!falsePos) break;
+    const worst = Math.max(...safe.filter((m) => isRedHotLavaPixel(m[0], m[1], m[2], calib)).map((m) => m[0]));
+    if (worst >= LAVA_CALIB_LIMITS.minRedMax) return null;
+    calib.minRed = clamp(Math.floor(worst) + 2, LAVA_CALIB_LIMITS.minRedMin, LAVA_CALIB_LIMITS.minRedMax);
+  }
+  if (safe.some((m) => isRedHotLavaPixel(m[0], m[1], m[2], calib))) return null;
+  if (!hurt.every((m) => isRedHotLavaPixel(m[0], m[1], m[2], calib))) return null;
+
+  return {
+    calib,
+    hurtHex: hex(hurt.reduce((a, m) => (m[0] < a[0] ? m : a), hurt[0]!)),
+    safeHex: hex(safe.reduce((a, m) => (m[0] > a[0] ? m : a), safe[0]!)),
+    gap,
+  };
+}
+
+/**
+ * Detecta o lago de lava no frame. `calib` é o que a autocorreção troca: sem ela vale a
+ * paleta medida manualmente; com ela vale a calibração que o agente derivou do frame depois
+ * de pisar onde o detector dele dizia que era seguro.
+ */
 export function senseMoltenLake(
   rgba: Uint8ClampedArray | Uint8Array,
   frameW: number,
   frameH: number,
+  calib: MoltenCalib = LAVA_CALIB_BASE,
 ): MoltenLake | null {
   if (!rgba || rgba.length === 0 || frameW < 64 || frameH < 64) return null;
   const sx = frameW / 256;
@@ -1133,7 +1314,7 @@ export function senseMoltenLake(
     for (let i = 0; i < mask.length; i++) cells += mask[i]!;
     return { mask, surfaceRow: cr, col0: run.from, col1: run.to, cells, tier: 'orange' };
   }
-  return senseRedHotLake(rgba, frameW, frameH, sx, sy);
+  return senseRedHotLake(rgba, frameW, frameH, sx, sy, calib);
 }
 
 /**
@@ -1155,6 +1336,7 @@ function senseRedHotLake(
   frameH: number,
   sx: number,
   sy: number,
+  calib: MoltenCalib,
 ): MoltenLake | null {
   const hot = new Uint8Array(MOLTEN_COLS * (MOLTEN_ROWS - 18));
   let incandescents = 0;
@@ -1186,7 +1368,7 @@ function senseRedHotLake(
         }
       }
       if (n === 0) continue;
-      hot[(cr - 18) * MOLTEN_COLS + cc] = isRedHotLavaPixel(rs / n, gs / n, bs / n) ? 1 : 0;
+      hot[(cr - 18) * MOLTEN_COLS + cc] = isRedHotLavaPixel(rs / n, gs / n, bs / n, calib) ? 1 : 0;
     }
   }
   if (incandescents < 2) return null;
@@ -1220,7 +1402,7 @@ function senseRedHotLake(
     // 8 células = 64px: o poço do print tem a superfície APERTADA entre plataformas
     // (corridas de 12px+ só existiriam num lago aberto) — 10 como no laranja matava o
     // caso real; a segurança extra vem da continuidade abaixo + das bolhas.
-    if (best < 8) continue;
+    if (best < calib.minRun) continue;
     // A corrida precisa ter PROFUNDIDADE: painel/faixa decorativa morre em 1-2 linhas, lago
     // desce até o fim da banda. Medido no print: as 8 colunas do poço têm profundidade 5-6;
     // a faixa sintética de 2 linhas tem 1. Exige 60% das colunas com ≥3 linhas seguidas.

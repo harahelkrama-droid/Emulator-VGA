@@ -40,8 +40,10 @@ interface SimRoom {
   doors: SimDoor[];
   items: SimItem[];
   bossHp?: number;
-  /** linha (em blocos) onde a lava começa e a coluna onde ela existe à direita */
-  lava?: { topRow: number; fromBx: number };
+  /** linha (em blocos) onde a lava começa e a coluna onde ela existe à direita; `rgb`
+   * permite pintar uma paleta que NENHUM tier do detector conhece — é assim que se testa a
+   * autocorreção (a IA tem que descobrir o corte sozinha, depois de apanhar) */
+  lava?: { topRow: number; fromBx: number; rgb?: RGB; bubble?: RGB };
   /** linha do "chão" em px (o bloco abaixo é sólido no mapa) */
   floorY?: number;
 }
@@ -206,7 +208,7 @@ class World {
       for (let y = lake.topRow * 16; y < H; y += 1) {
         for (let x = lake.fromBx * 16; x < W; x += 1) {
           const bubble = ((x * 7 + y * 13) % 41) < 6;
-          put(x, y, bubble ? [250, 168, 70] : [240, 120, 40]);
+          put(x, y, bubble ? lake.bubble ?? [250, 168, 70] : lake.rgb ?? [240, 120, 40]);
         }
       }
     }
@@ -659,6 +661,38 @@ section('I. Portão do menu: 3 minutos após o load, ou a permissão de um save'
     }
     check('save carregado libera o menu na hora', firstStart >= 400 && firstStart < 460, `tick ${firstStart}`);
   }
+}
+
+/* ============ J. autocorreção: paleta que nenhum tier conhece, descoberta apanhando ============ */
+section('J. Lava de paleta DESCONHECIDA: a IA descobre o corte sozinha e para de andar nela');
+{
+  // #aa2222 (r=170) está abaixo do corte calibrado à mão (r>185) e fora do laranja clássico:
+  // no primeiro passo o detector NÃO vê nada — é exatamente a situação do print do usuário,
+  // com a diferença que aqui ninguém mexe no código. Bolhas #e8b060 existem (a estrutura do
+  // poço continua sendo a de um lago), só o corpo é escuro demais para o threshold fixo.
+  const w = new World();
+  const room = w.room(0x10);
+  room.floorY = 144;
+  room.lava = { topRow: 10, fromBx: 8, rgb: [170, 34, 34], bubble: [232, 176, 96] };
+  const { actions } = run(w, 700);
+  const snap = (i: number) => actions[i]?.snapshot?.mapExploration;
+  const firstHazard = actions.findIndex((a) => a.snapshot?.mapExploration?.floorHazard === 'LAVA');
+  const firstDamage = actions.findIndex((a) => (a.snapshot?.health ?? 199) < 199);
+  const corrected = actions.find((a) => (a.snapshot?.mapExploration?.corrections?.length ?? 0) > 0);
+  const rec = corrected?.snapshot?.mapExploration?.corrections?.[0];
+  const calib = actions[actions.length - 1]?.snapshot?.mapExploration?.lavaCalib;
+  check('o detector cego no início (nenhum lago reconhecido antes do dano)', firstHazard < 0 || firstDamage < firstHazard, `dano=${firstDamage} lava=${firstHazard}`);
+  check('o dano aconteceu (é o rótulo do erro)', firstDamage >= 0, `tick=${firstDamage}`);
+  check('a IA registrou o próprio erro', !!rec && rec.kind === 'LAVA_UNSIGHTED', rec ? `${rec.kind}` : 'nenhuma correção');
+  check('o diagnóstico cita as cores medidas do frame', /#[0-9a-f]{6}/i.test(rec?.diagnosis ?? ''), rec?.diagnosis ?? '');
+  check('a calibração adotada é DERIVADA, não a fixa', !!calib && calib.minRed !== 185 && calib.minRed >= 150 && calib.minRed <= 214, `r>${calib?.minRed}`);
+  check('depois da correção o lago passa a ser reconhecido', firstHazard >= 0 && firstDamage >= 0 && firstHazard > firstDamage && firstHazard - firstDamage <= 3, `Δ=${firstHazard - firstDamage}`);
+  const tail = actions.slice(-120);
+  const hpTail = tail.map((a) => a.snapshot?.health ?? 999);
+  check('e a vida para de cair (saiu do lago)', Math.min(...hpTail) === Math.max(...hpTail), `${Math.min(...hpTail)}→${Math.max(...hpTail)}`);
+  check('não ficou andando para dentro: terminou fora da lava', w.sx < 8 * 16, `x=${Math.round(w.sx)}`);
+  check('a revisão classificou a correção', rec?.status === 'ACTIVE' || rec?.status === 'HELPED', rec?.status);
+  console.log(`    \x1b[2m↳ ${rec?.diagnosis}\n      ↳ ${rec?.action}\x1b[0m`);
 }
 
 console.log(

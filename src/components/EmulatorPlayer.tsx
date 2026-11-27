@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronUp, Cpu, Database, Gamepad2, ListChecks, Map as MapIcon, Maximize2, Power, RotateCcw, Save, Shield, Swords, Timer, X } from 'lucide-react';
+import { Check, ChevronDown, ChevronUp, Cpu, Database, Gamepad2, ListChecks,
+  Wrench, Map as MapIcon, Maximize2, Power, RotateCcw, Save, Shield, Swords, Timer, X } from 'lucide-react';
 import {
   captureGameFrame,
   getEmulatorGameManager,
@@ -42,6 +43,15 @@ const DIFFICULTY_OPTIONS = [
 const ENGINE_STORAGE = 'retroplay_ai_engine_v2';
 const PROFILE_STORAGE = 'retroplay_ai_profile_v2';
 const GEMINI_KEY_STORAGE = 'retroplay_gemini_api_key';
+/**
+ * Caderno de autocorreções da IA (threshold de lava derivado do frame, custo de perigo, cor
+ * de porta corrigida). Persistir isto é o ponto: aprender a paleta do hack uma vez e reler o
+ * print de novo amanhã seria o mesmo erro de sempre — decorrer e recomeçar.
+ */
+// o sufixo é o arquivo da ROM: a calibração que a IA derivou do X-Fusion NÃO pode ser
+// importada numa sessão de Super Metroid vanilla (e vice-versa) — paletas diferentes são o
+// motivo pelo qual ela foi aprendida
+const selfFixKey = (gameFile: string) => `retroplay_ai_self_corrections_v1:${gameFile}`;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 
@@ -91,6 +101,18 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
     'Ao ativar, o jogo entra em tela cheia e a IA joga em tempo real coletando itens e fugindo da SA-X até o confronto final.',
   );
   const [snapshot, setSnapshot] = useState<AIStatusSnapshot | null>(null);
+  const selfFixCountRef = useRef(-1);
+
+  // devolve as correções da sessão anterior ao agente, assim que ele existe
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(selfFixKey(game.file));
+      if (!raw) return;
+      agentRef.current.importSelfCorrections(JSON.parse(raw));
+    } catch {
+      /* JSON corrompido: o ledger ignora e o agente aprende de novo do zero */
+    }
+  }, []);
   const [knowledgeLog, setKnowledgeLog] = useState<EncounterKnowledgeRecord[]>([]);
   const [showArmorDetails, setShowArmorDetails] = useState(true);
   const [aiCautionApproved, setAiCautionApproved] = useState(false);
@@ -409,6 +431,16 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
         setAiStatusText(aiEngine === 'local-vision' ? 'Jogando (Local Sem API)' : `Ativa (${aiEngine})`);
         if (action.snapshot) {
           setSnapshot(action.snapshot);
+          // grava o caderno quando o número de correções muda (barato, sem escrever a 60 Hz)
+          const n = action.snapshot.mapExploration?.corrections?.length ?? 0;
+          if (aiEngine === 'local-vision' && n !== selfFixCountRef.current) {
+            selfFixCountRef.current = n;
+            try {
+              localStorage.setItem(selfFixKey(game.file), JSON.stringify(agentRef.current.exportSelfCorrections()));
+            } catch {
+              /* cota cheia/modo privado: a sessão continua, só não atravessa o reload */
+            }
+          }
         }
         if (action.learnedKnowledge && action.learnedKnowledge.length > 0) {
           for (const entry of action.learnedKnowledge) {
@@ -1017,6 +1049,43 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
                 )}
               </div>
             </div>
+
+            {/* autocorreção: o que a IA descobriu sozinha, com os números medidos no frame */}
+            {(snapshot.mapExploration.corrections?.length ?? 0) > 0 && (
+              <div className="mt-2 border-t border-[#24314a] pt-2">
+                <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-[#e8c96a]">
+                  <Wrench className="h-3 w-3" />
+                  autocorreções · {snapshot.mapExploration.corrections.length}
+                  <span className="font-mono-data text-[#94a3bf] normal-case">
+                    lava r&gt;{snapshot.mapExploration.lavaCalib?.minRed ?? 185}
+                  </span>
+                </div>
+                <ul className="mt-1 space-y-1">
+                  {snapshot.mapExploration.corrections.map((c) => (
+                    <li
+                      key={`${c.id}-${c.status}`}
+                      title={`${c.diagnosis}
+→ ${c.action}`}
+                      className="rounded-md bg-[#172033] px-1.5 py-1 text-[10px] leading-snug text-[#c7d3e6]"
+                    >
+                      <span
+                        className={
+                          c.status === 'HELPED'
+                            ? 'mr-1 rounded bg-[#6ee7b7]/15 px-1 text-[9px] font-bold text-[#6ee7b7]'
+                            : c.status === 'REVERTED'
+                              ? 'mr-1 rounded bg-[#f87171]/15 px-1 text-[9px] font-bold text-[#f87171]'
+                              : 'mr-1 rounded bg-[#e8c96a]/15 px-1 text-[9px] font-bold text-[#e8c96a]'
+                        }
+                      >
+                        {c.status === 'HELPED' ? 'colou' : c.status === 'REVERTED' ? 'revertida' : 'ativa'}
+                      </span>
+                      <span className="text-[#94a3bf]">{c.scope}</span> · {c.diagnosis}
+                      <span className="block text-[#94a3bf]">→ {c.action}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
         )}
 

@@ -26,8 +26,11 @@ import {
   describeNavForUi,
   lakeTopBlock,
   senseMoltenLake,
+  deriveMoltenCalib,
+  moltenCellMean,
   MOLTEN_CELL,
   MOLTEN_COLS,
+  MOLTEN_ROWS,
   type MoltenLake,
   type ChecklistItem,
   type LostVerdict,
@@ -39,6 +42,11 @@ import {
   type NavRoom,
   type NavTarget,
   type DoorColor, type CompletionTotals, XFUSION_TOTALS, COMPLETION_TOTALS,} from './mapStrategy';
+import {
+  SelfCorrectionLedger,
+  type CorrectionEffect,
+  type FaultKind,
+} from './selfCorrection';
 import {
   planBossFight,
   describeDirectiveForUi,
@@ -399,6 +407,15 @@ export class LocalVisionAgent {
   private navStartRoomId = -1;
   private navPrevItemCount = 0;
   /** lago de lava reconhecido no frame (o mapa de blocos vê ar onde há lava) */
+  /**
+   * Ledger do "erro → diagnóstico → correção". Único lugar onde a IA muda os próprios
+   * parâmetros em tempo de execução (threshold de lava, custo de perigo, cor de porta,
+   * célula inquebrável). É memória de sessão, com teto de correções ativas.
+   */
+  private selfFix = new SelfCorrectionLedger();
+  /** tiros dados em cada porta sem a porta mudar de estado (3 = minha premissa estava errada) */
+  private doorShotTally = new Map<string, number>();
+  private lastFaultTick = new Map<string, number>();
   private lavaLake: MoltenLake | null = null;
   private lavaLakeRoomId = -1;
   private lavaLakeTick = -99;
@@ -521,6 +538,9 @@ export class LocalVisionAgent {
       legIndex: 0,
     };
     this.prevHealth = 0;
+    this.selfFix = new SelfCorrectionLedger();
+    this.doorShotTally.clear();
+    this.lastFaultTick.clear();
     this.prevItemsMask = 0;
     this.prevBeamsMask = 0;
     this.prevMaxMissiles = 0;
@@ -871,6 +891,20 @@ export class LocalVisionAgent {
         (wram.maxHealth < this.prevMaxHealth || lostItems || lostBeams || respawnedFromZero)
       ) {
         energyOrStateReset = true;
+        // morrer é o erro mais caro da sessão: entra no caderno como falha com causa, e a
+        // correção (sala marcada como cara, penalidade de perigo acima) vale para a próxima
+        // tentativa em vez de eu simplesmente repetir a rota que me matou
+        if (this.faultCooldownOk('RESPAWN', `sala ${wram.roomId}`, this.stepIndex)) {
+          this.applyCorrection(
+            this.selfFix.observe({
+              kind: 'RESPAWN',
+              tick: this.stepIndex,
+              roomId: wram.roomId,
+              bx: Math.floor(wram.samusX / 16),
+              by: Math.floor(wram.samusY / 16),
+            }),
+          );
+        }
       } else if (!isScriptedMetroidDrain) {
         const newItems = wram.itemsMask & ~this.prevItemsMask;
         const newBeams = wram.beamsMask & ~this.prevBeamsMask;
@@ -1120,6 +1154,13 @@ export class LocalVisionAgent {
    * caminhar para dentro do lago.
    */
   private senseLavaFloor(wram: MetroidWramSnapshot): void {
+    // uma autocorreção da calibração pede releitura imediata (senão o threshold novo só
+    // valeria no próximo tick de amostragem, isto é, depois de mais um passo dentro do lago)
+    if (this.selfFix.needsRescan) {
+      this.selfFix.clearRescanFlag();
+      this.lavaLakeRoomId = -1;
+      this.lavaLakeTick = -99;
+    }
     // Gravity Suit muda a SEMÂNTICA da lava (ela vira "água quente" atravessável), e o
     // jogador pode achá-la a qualquer momento — por isso isso é lido todo tick, não no
     // throttle da amostragem de frame.
@@ -1155,7 +1196,7 @@ export class LocalVisionAgent {
     this.lavaCamX = wram.cameraX;
     this.lavaCamY = wram.cameraY;
     if (roomChanged) this.lavaEdgeCommitRoom = -1;
-    const lake = senseMoltenLake(rgba, frame.width, frame.height);
+    const lake = senseMoltenLake(rgba, frame.width, frame.height, this.selfFix.lavaCalib);
     this.lavaLake = lake;
     this.lavaTopRow = lake ? lakeTopBlock(lake, wram.cameraY) : -1;
     if (lake && roomChanged) {
@@ -1313,6 +1354,7 @@ export class LocalVisionAgent {
         if (this.nextShoot(true)) {
           keys.push(shootKey);
           this.registerMissileUse();
+          this.noteDoorShot(wram, door);
         }
         // pulo curto encostando no batente: em comporta alta é o que encosta o projétil/mira
         if (this.isSamusGrounded(wram) && this.nextJump(true, 2)) keys.push(jumpKey);
@@ -1324,6 +1366,33 @@ export class LocalVisionAgent {
         ? 'comporta do teto · atirando para cima'
         : 'lava no chão · indo até a porta superior para atirar nela',
     };
+  }
+
+  /**
+   * Contabiliza tiro em porta e, no terceiro sem efeito, conclui que a PREMISSA estava errada
+   * (a cor amostrada não batia com o que a porta é) — o ledger marca a célula como não
+   * quebrável, e o planificador para de gastar munição nela. Um humano faria o mesmo e xingaria.
+   */
+  private noteDoorShot(wram: MetroidWramSnapshot, door: DoorInfo): void {
+    const key = `${wram.roomId}:${door.key}`;
+    const shots = (this.doorShotTally.get(key) ?? 0) + 1;
+    this.doorShotTally.set(key, shots);
+    if (shots >= 3 && door.blockedByWall) {
+      this.doorShotTally.delete(key);
+      if (this.faultCooldownOk('AMMO_WASTED', `sala ${wram.roomId}`, this.stepIndex)) {
+        this.applyCorrection(
+          this.selfFix.observe({
+            kind: 'AMMO_WASTED',
+            tick: this.stepIndex,
+            roomId: wram.roomId,
+            bx: door.bx,
+            by: door.by,
+            doorKey: key,
+            attempts: shots,
+          }),
+        );
+      }
+    }
   }
 
   /** Versão barata de "dá para ficar de pé aqui" para o guard de lava. */
@@ -1346,6 +1415,170 @@ export class LocalVisionAgent {
    */
   private get spikeDangerMul(): number {
     return this.completionProfile === 'xfusion' ? 2 : 1;
+  }
+
+  /**
+   * Custo de pousar/encostar em perigo: o fator do perfil MAIS o que a autocorreção somou
+   * depois de apanhar num lugar que eu jurava seguro. É assim que um erro vira comportamento
+   * sem esperar por um humano: no tick seguinte o pathfinding já foge daquela classe de célula.
+   */
+  private get hazardPenalty(): number {
+    return 4 * this.spikeDangerMul + this.selfFix.hazardPenAdd;
+  }
+
+  /** Uma falha por tipo/escopo a cada ~10 s, senão o ledger vira ruído. */
+  private faultCooldownOk(kind: FaultKind, scope: string, tick: number): boolean {
+    const key = `${kind}:${scope}`;
+    const last = this.lastFaultTick.get(key) ?? -9999;
+    if (tick - last < 600) return false;
+    this.lastFaultTick.set(key, tick);
+    return true;
+  }
+
+  /** Única ponte entre o diagnóstico e o controle: aplica no agente o que o ledger decidiu. */
+  private applyCorrection(eff: CorrectionEffect | null | undefined): void {
+    if (!eff) return;
+    if (eff.unbreakable) this.unbreakableGates.add(eff.unbreakable);
+    if (eff.dangerCells) for (const c of eff.dangerCells) this.dangerCells.add(c);
+    if (eff.doorOverride) this.navDoorColors.set(eff.doorOverride.doorKey, eff.doorOverride.color);
+    if (eff.rescanNow) {
+      // a calibração nova só vale se o frame for relido AGORA: esperar o throttle de
+      // amostragem custaria mais um passo dentro da lava
+      this.lavaLakeRoomId = -1;
+      this.lavaLakeTick = -99;
+    }
+  }
+
+  /**
+   * Fecha o ciclo no tick do dano. Quem rotula o pixel é o WRAM ("aqui doeu" / "aqui era
+   * plataforma"), não uma constante: o frame é amostrado nas células do pé e nas laterais,
+   * e SE (e somente se) as duas classes separarem, o detector de lava adota o corte medido.
+   * Sem separação, o ledger cai no recuo conservador (marcar a célula) — errado seria
+   * chutar um threshold a partir de ruído e passar a ver lava em tudo.
+   */
+  private selfCorrectFromDamage(wram: MetroidWramSnapshot, hpLost: number): void {
+    const frame = this.lastCapturedFrame;
+    const rgba = frame?.rgba as unknown as Uint8ClampedArray | undefined;
+    if (!rgba || !frame || frame.width < 64) return;
+    // combate não é erro de mapa: inimigo colado explica o dano melhor do que "meu detector errou"
+    for (const e of wram.enemies) {
+      if (Math.abs(e.x - wram.samusX) < 40 && Math.abs(e.y - wram.samusY) < 40) return;
+    }
+    const bx = Math.floor(wram.samusX / 16);
+    const by = Math.floor((wram.samusY + 6) / 16);
+    const cell = (wx: number, wy: number) => ({
+      r: Math.floor((wy - wram.cameraY) / MOLTEN_CELL),
+      c: Math.floor((wx - wram.cameraX) / MOLTEN_CELL),
+    });
+
+    // Eu VIA o perigo e pisei mesmo assim: o que está errado é o CUSTO, não a cor — o fix é
+    // a penalidade do pathfinding, que sobe em degraus limitados pelo ledger.
+    if (this.lavaLake) {
+      if (this.faultCooldownOk('HAZARD_BLIND', `sala ${wram.roomId}`, this.stepIndex)) {
+        this.applyCorrection(
+          this.selfFix.observe({
+            kind: 'HAZARD_BLIND',
+            tick: this.stepIndex,
+            roomId: wram.roomId,
+            bx,
+            by,
+            hpLost,
+          }),
+        );
+      }
+      return;
+    }
+
+    // Nada marcado na sala = hipótese de paleta desconhecida (foi exatamente o caso do print).
+    // Amostro o que doeu e o que estava ao lado, e quem responde é o frame — se as classes
+    // não separarem, o ledger recusa a tese e marca a célula (recuo, não chute).
+    if (!this.faultCooldownOk('LAVA_UNSIGHTED', 'sessão', this.stepIndex)) return;
+    const grounded = this.isSamusGrounded(wram);
+    // A janela da amostra é a região do dano: o tile em que estou e os dois abaixo/ao lado.
+    // O que doeu não é "a célula exata" (o hitbox do perigo sobrepõe o meu corpo), então
+    // rankweamos os candidatos por brilho e ficamos com os 3 QUENTES da janela — é o corpo da
+    // lava que sobra quando o sprite da Samus é removido da conta.
+    const feetY = grounded ? wram.samusY + 10 : wram.samusY + 14;
+    const colC = Math.floor((wram.samusX - wram.cameraX) / MOLTEN_CELL);
+    const rowC = Math.floor((feetY - wram.cameraY) / MOLTEN_CELL);
+    const candidates: Array<{ r: number; c: number; mean: [number, number, number] }> = [];
+    const mine = (cr: number, cc: number): boolean => {
+      // células cobertas pelo sprite (x±7, y-15..y+3): meu próprio vermelho não pode virar prova
+      const x0 = wram.samusX - wram.cameraX - 7;
+      const x1 = wram.samusX - wram.cameraX + 7;
+      const y0 = wram.samusY - wram.cameraY - 15;
+      const y1 = wram.samusY - wram.cameraY + 3;
+      return cc * MOLTEN_CELL < x1 && (cc + 1) * MOLTEN_CELL > x0 && cr * MOLTEN_CELL < y1 && (cr + 1) * MOLTEN_CELL > y0;
+    };
+    for (let dr = -1; dr <= 2; dr++) {
+      for (let dc = -2; dc <= 2; dc++) {
+        const rr = rowC + dr;
+        const cc = colC + dc;
+        if (rr < 0 || cc < 0 || rr >= MOLTEN_ROWS || cc >= MOLTEN_COLS) continue;
+        if (mine(rr, cc)) continue;
+        const mean = moltenCellMean(rgba, frame.width, frame.height, rr, cc);
+        if (mean) candidates.push({ r: rr, c: cc, mean });
+      }
+    }
+    if (candidates.length < 4) return;
+    const hurt = candidates
+      .slice()
+      .sort((a, b) => b.mean[0] - a.mean[0])
+      .slice(0, 3)
+      .map((c) => ({ r: c.r, c: c.c }));
+    // classe negativa: o chão firme do mesmo nível, uns 40px para cada lado (de onde viemos)
+    const safe = [
+      cell(wram.samusX + 40, feetY),
+      cell(wram.samusX - 40, feetY),
+      cell(wram.samusX - 40, wram.samusY + 2),
+      cell(this.prevSamusX, this.prevSamusY + 10),
+    ].filter(
+      (c) =>
+        c.r >= 0 &&
+        c.c >= 0 &&
+        c.r < MOLTEN_ROWS &&
+        c.c < MOLTEN_COLS &&
+        // o chão "firme" também não pode estar contaminado pelo meu próprio sprite: senão a
+        // classe negativa herda o vermelho da Samus e o corte sai mais folgado do que precisa
+        !mine(c.r, c.c) &&
+        !hurt.some((h) => h.r === c.r && h.c === c.c),
+    );
+    if (safe.length === 0) return;
+    const report = deriveMoltenCalib(rgba, frame.width, frame.height, { hurt, safe });
+    this.applyCorrection(
+      this.selfFix.observe({
+        kind: 'LAVA_UNSIGHTED',
+        tick: this.stepIndex,
+        roomId: wram.roomId,
+        bx,
+        by,
+        hpLost,
+        calib: report?.calib ?? null,
+        hurtHex: report?.hurtHex,
+        safeHex: report?.safeHex,
+        gap: report?.gap,
+      }),
+    );
+  }
+
+  /** Estado serializável do caderno de autocorreções (para persistir junto do progresso). */
+  exportSelfCorrections(): ReturnType<SelfCorrectionLedger['serialize']> {
+    return this.selfFix.serialize();
+  }
+
+  /**
+   * Devolve as correções de uma sessão anterior. A calibração de lava que já foi provada é
+   * a coisa mais valiosa que existe: reler o print do usuário de novo seria o mesmo erro
+   * de sempre — aprender uma vez e esquecer.
+   */
+  importSelfCorrections(rows: unknown): void {
+    if (!Array.isArray(rows) || rows.length === 0) return;
+    this.selfFix.restore(rows);
+    if (this.selfFix.needsRescan) {
+      this.selfFix.clearRescanFlag();
+      this.lavaLakeRoomId = -1;
+      this.lavaLakeTick = -99;
+    }
   }
 
   /** Esta célula da sala é lava? (amostra o centro e as bordas da célula de 16px) */
@@ -1465,14 +1698,42 @@ export class LocalVisionAgent {
     const frame = this.lastCapturedFrame;
     const rgba = frame?.rgba as unknown as Uint8ClampedArray | undefined;
     if (rgba && frame && frame.width > 0 && wram.doors.length > 0) {
+      const sampleRadius = this.selfFix.doorSampleRadius;
       for (const d of wram.doors) {
         const key = `${wram.roomId}:${d.key}`;
+        const override = this.selfFix.doorOverrideFor(key);
+        if (override) {
+          this.navDoorColors.set(key, override); // a correção manda mais que a amostra
+          continue;
+        }
+        if (!d.blockedByWall) this.doorShotTally.delete(key); // abriu: contagem zera
         if (this.navDoorColors.get(key) === 'PINK' || this.navDoorColors.get(key) === 'CORRODED') continue; // já resolvidas
         const sx = d.x - wram.cameraX;
         const sy = d.y - wram.cameraY;
         if (sx < 6 || sy < 6 || sx > frame.width - 6 || sy > frame.height - 6) continue;
-        const c = classifyDoorColor(rgba, frame.width, frame.height, sx, sy);
-        if (c) this.navDoorColors.set(key, c);
+        const c = classifyDoorColor(rgba, frame.width, frame.height, sx, sy, sampleRadius);
+        if (c) {
+          this.navDoorColors.set(key, c);
+          // VERDADE DE CAMPO: o WRAM sabe se a porta está aberta. Amostra dizendo "fechada"
+          // (vermelha/verde/amarela/azul) com o batente livre = EU li errado o pixel, e a
+          // correção é dupla: a cor guardada e o raio da amostra (menos pulga/lava dentro).
+          if (!d.blockedByWall && c !== 'PINK' && c !== 'CORRODED') {
+            if (this.faultCooldownOk('DOOR_COLOR_WRONG', `sala ${wram.roomId}`, this.stepIndex)) {
+              this.applyCorrection(
+                this.selfFix.observe({
+                  kind: 'DOOR_COLOR_WRONG',
+                  tick: this.stepIndex,
+                  roomId: wram.roomId,
+                  bx: d.bx,
+                  by: d.by,
+                  doorKey: key,
+                  colorSampled: c,
+                  doorOpen: true,
+                }),
+              );
+            }
+          }
+        }
       }
     }
 
@@ -1535,6 +1796,30 @@ export class LocalVisionAgent {
       inCombat: this.currentMode === 'COMBAT',
       busy: this.mapConsultPhase !== 'IDLE',
     });
+
+    // (h2) autocorreção do roteiro: os vereditos de "perdido" têm causa, e a causa diz o
+    // que mudar — círculo pede reancoragem, parede pede desistir do ponto
+    if (this.navLost?.lost && this.navLost.cause) {
+      const cause = this.navLost.cause;
+      const kind: FaultKind | null =
+        cause === 'OSCILLATION' || cause === 'REENTERED_DOOR'
+          ? 'OSCILLATION'
+          : cause === 'STALL' || cause === 'NO_PROGRESS'
+            ? 'POSITION_STALL'
+            : null;
+      if (kind && this.faultCooldownOk(kind, `sala ${wram.roomId}`, this.stepIndex)) {
+        this.applyCorrection(
+          this.selfFix.observe({
+            kind,
+            tick: this.stepIndex,
+            roomId: wram.roomId,
+            bx: Math.floor(wram.samusX / 16),
+            by: Math.floor(wram.samusY / 16),
+          }),
+        );
+      }
+    }
+    this.applyCorrection(this.selfFix.review(this.stepIndex, true));
 
     // (i) checklist
     this.navChecklist = buildChecklist(
@@ -2259,6 +2544,9 @@ export class LocalVisionAgent {
             floorHazard: this.lavaLake ? 'LAVA' : 'NONE',
             completionProfile: this.completionProfile,
             lavaTopRow: this.lavaTopRow,
+            lavaCalib: { ...this.selfFix.lavaCalib },
+            /** o que a IA diagnosticou e mudou em si mesma (mais recente por último) */
+            corrections: this.selfFix.describeForUi(),
             currentRoomDoors: wram.doors.map((d) => ({
               key: d.key,
               color: this.navDoorColors.get(`${wram.roomId}:${d.key}`) ?? 'UNKNOWN',
@@ -2559,10 +2847,12 @@ export class LocalVisionAgent {
 
     let samusDamagedThisTick = false;
     let samusBigHealThisTick = false;
+    let damageDelta = 0;
     if (!energyOrStateReset && this.prevHealth > 0 && wram.health > 0) {
       const deltaHp = this.prevHealth - wram.health;
       if (deltaHp >= 6) {
         samusDamagedThisTick = true;
+        damageDelta = deltaHp;
       }
       if (deltaHp >= 25) {
         this.recentDamageSpikeTick = this.stepIndex;
@@ -2581,6 +2871,10 @@ export class LocalVisionAgent {
     this.prevHealth = wram.health;
     // Usado pelo codex para reconhecer "agarrada" (Draygon) e dano sofrido no tick.
     this.samusDamagedThisTick = samusDamagedThisTick;
+    // autocorreção: o dano é o rótulo barato de "minha leitura do mundo estava errada"
+    if (samusDamagedThisTick && !this.bossEngagedThisTick) {
+      this.selfCorrectFromDamage(wram, damageDelta);
+    }
 
     if (samusBigHealThisTick) {
       this.bigMetroidHealedTick = this.stepIndex;
@@ -3003,7 +3297,7 @@ export class LocalVisionAgent {
             if (dy === -1 && !isCellAir(bx, by - 1, true)) continue;
             if (dy === 1 && !isCellAir(nx, by, true)) continue;
             const needJump = dy === -1 && tAt(nx, ny + 1) !== 0x1 && !isHazardCeiling(nx, ny);
-            const hazardPen = dy < 0 && isHazardCeiling(nx, ny) ? 4 * this.spikeDangerMul : 0;
+            const hazardPen = dy < 0 && isHazardCeiling(nx, ny) ? this.hazardPenalty : 0;
             const cost = (needJump ? 2 : 1) + (isGate ? 3 : 0) + hazardPen;
             relaxEdge(idx, nx, ny, cost, dir, needJump, false, isGate, isGate, isBombTile);
           }
@@ -3118,7 +3412,7 @@ export class LocalVisionAgent {
 
           const tGate = tAt(tx, ny) === 0xc || tAt(tx, ny) === 0xf;
           const isBombTile = tAt(tx, ny) === 0xf;
-          const hazardPen = isHazardCeiling(tx, ny) ? 4 * this.spikeDangerMul : 0;
+          const hazardPen = isHazardCeiling(tx, ny) ? this.hazardPenalty : 0;
           const stepSign = dx > 0 ? 1 : -1;
           const adjacentWallBlocksJump = dy <= -3 && !isCellAir(bx + stepSign, by - 1, false);
 
@@ -3185,7 +3479,7 @@ export class LocalVisionAgent {
               dx !== 0 ? (dx > 0 ? 'RIGHT' : 'LEFT') : bx >= rw / 2 ? 'LEFT' : 'RIGHT';
             const needJump = (dy < 0 || !isFloorTile(nx, ny + 1)) && !isHazardCeiling(nx, ny);
             const needDrop = dy > 0 && !isFloorTile(nx, ny + 1);
-            const hazardPen = isHazardCeiling(nx, ny) ? 4 : 0;
+            const hazardPen = isHazardCeiling(nx, ny) ? this.hazardPenalty : 0;
             const flyCost = (dy <= 0 ? 2 : 1) + (dx === 0 ? 1 : 0) + (isGate ? 3 : 0) + hazardPen;
             relaxEdge(idx, nx, ny, flyCost, moveDir, needJump, needDrop, isGate, isGate, isBombTile);
           }
