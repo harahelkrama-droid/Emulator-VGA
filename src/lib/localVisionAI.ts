@@ -246,14 +246,18 @@ export class LocalVisionAgent {
   private stuckInRoomTicks = 0;
   private lastRoomEntryTick = 0;
 
-  // Sistema de análise inicial: abrir mapa para verificar habilidades e decidir direção
+  // Sistema de análise periódica do menu do jogo (abrir → verificar → fechar → jogar → repetir a cada 10 min)
   private mapAnalyzed = false;
   private mapAnalysisTick = 0;
-  // Fluxo de menu: abrir → verificar tudo → fechar → jogar
+  // Fluxo de menu: abrir → verificar tudo → fechar → jogar → repetir periodicamente
   private menuPhase: 'NONE' | 'OPENING' | 'ANALYZING' | 'CLOSING' | 'DONE' = 'NONE';
   private menuCloseTick = 0;
   private menuCheckedAbilities = false;
   private preferredDirection: 'LEFT' | 'RIGHT' | null = null;
+  // Controle periódico: a cada 10 minutos (4800 ticks @ ~125ms) abre o menu para conferência
+  private lastMenuCloseTick = 0;
+  private readonly MENU_OPEN_INTERVAL_TICKS = 4800;      // 10 min entre verificações
+  private readonly MENU_ANALYSIS_DURATION_TICKS = 1440;   // 3 min de análise com menu aberto
   private initialLoadoutAnalyzed = false;
   private abilitiesSummary: string[] = [];
 
@@ -424,6 +428,7 @@ export class LocalVisionAgent {
     this.mapAnalysisTick = 0;
     this.menuPhase = 'NONE';
     this.menuCloseTick = 0;
+    this.lastMenuCloseTick = 0;
     this.menuCheckedAbilities = false;
     this.preferredDirection = null;
     this.initialLoadoutAnalyzed = false;
@@ -939,15 +944,30 @@ export class LocalVisionAgent {
     this.missileProbeCount++;
   }
 
-  // Fluxo de menu: ABRIR → verificar tudo (habilidades/atributos) → FECHAR → começar a jogar
+  // Fluxo de menu periódico: ABRIR → verificar tudo (3 min) → FECHAR → jogar (10 min) → repetir
   private openMapAndAnalyze(
     wram: MetroidWramSnapshot,
     keys: AIKey[],
     motionPct: number,
   ): AIAction | null {
-    if (this.mapAnalyzed || wram.gameState !== 8) return null;
+    if (wram.gameState !== 8) return null;
 
     const mapKey: AIKey = 'SELECT';
+
+    // Se está em fase DONE, verifica se já passou 10 minutos desde o último fechamento
+    // Se passou, reinicia o ciclo para abrir o menu novamente para conferência
+    if (this.menuPhase === 'DONE') {
+      const ticksSinceClose = this.stepIndex - this.lastMenuCloseTick;
+      if (ticksSinceClose >= this.MENU_OPEN_INTERVAL_TICKS) {
+        // Hora de abrir o menu novamente para conferência periódica
+        this.menuPhase = 'NONE';
+        this.mapAnalyzed = false;
+        this.menuCheckedAbilities = false;
+      } else {
+        // Ainda não é hora de abrir novamente — segue jogando normalmente
+        return null;
+      }
+    }
 
     // Fase 1: ABRIR o menu/mapa
     if (this.menuPhase === 'NONE') {
@@ -960,7 +980,7 @@ export class LocalVisionAgent {
         'run',
         motionPct,
         'Menu · Abrindo',
-        'Abrindo menu para verificar habilidades e atributos',
+        'Abrindo menu do jogo para verificar habilidades e atributos',
         wram,
       );
     }
@@ -976,7 +996,7 @@ export class LocalVisionAgent {
           'run',
           motionPct,
           'Menu · Abrindo',
-          'Aguardando abertura completa do menu',
+          'Aguardando abertura completa do menu do jogo',
           wram,
         );
       }
@@ -984,10 +1004,12 @@ export class LocalVisionAgent {
       this.mapAnalysisTick = this.stepIndex;
     }
 
-    // Fase 2: ANALISANDO — aguarda o mapa carregar e verifica habilidades/atributos
+    // Fase 2: ANALISANDO — fica com o menu aberto por 3 minutos verificando habilidades/atributos
     if (this.menuPhase === 'ANALYZING') {
-      // Aguarda tempo suficiente para o mapa ficar visível
-      if (this.stepIndex - this.mapAnalysisTick < 90) {
+      const analysisElapsed = this.stepIndex - this.mapAnalysisTick;
+
+      // Ainda está dentro dos 3 minutos de análise
+      if (analysisElapsed < this.MENU_ANALYSIS_DURATION_TICKS) {
         return this.makeMetroidAction(
           'MENU',
           [mapKey],
@@ -995,12 +1017,12 @@ export class LocalVisionAgent {
           'run',
           motionPct,
           'Menu · Analisando Habilidades',
-          'Verificando armadura, peças, mísseis, super mísseis e energia',
+          `Verificando armadura, peças, mísseis, super mísseis e energia (${Math.round(analysisElapsed / 60)}s / 3min)`,
           wram,
         );
       }
 
-      // Analisa o loadout completo
+      // 3 minutos passaram — analisa o loadout completo e fecha o menu
       this.analyzeInitialLoadout(wram);
       this.menuCheckedAbilities = true;
       this.menuPhase = 'CLOSING';
@@ -1013,7 +1035,7 @@ export class LocalVisionAgent {
         'run',
         motionPct,
         'Menu · Fechando',
-        'Habilidades verificadas · fechando menu para começar a jogatina',
+        'Análise de 3 min concluída · fechando menu para continuar a jogatina',
         wram,
       );
     }
@@ -1034,9 +1056,9 @@ export class LocalVisionAgent {
         );
       }
 
-      // Fecha o menu pressionando SELECT novamente (ou START para confirmar/sair)
+      // Fecha o menu pressionando SELECT novamente
       this.menuPhase = 'DONE';
-      this.mapAnalyzed = true;
+      this.lastMenuCloseTick = this.stepIndex;
       return this.makeMetroidAction(
         'MENU',
         [mapKey],
@@ -1047,12 +1069,6 @@ export class LocalVisionAgent {
         'Menu fechado · agente pronto para explorar, coletar itens e combater',
         wram,
       );
-    }
-
-    // Fase 4: DONE — menu fechado, libera o jogo
-    if (this.menuPhase === 'DONE') {
-      this.mapAnalyzed = true;
-      return null;
     }
 
     return null;
