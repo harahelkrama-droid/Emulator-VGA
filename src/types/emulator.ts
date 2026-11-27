@@ -94,7 +94,41 @@ export interface ArmorAnalysis {
   pieces: EquipmentPieceStatus[];
 }
 
+/** Estado da luta contra chefe, conforme o Codex de Chefes (`src/lib/bossCodex.ts`). */
+export interface BossFightStatus {
+  strategyId: string;
+  bossName: string;
+  encounter: string;
+  phaseLabel: string;
+  weakPoint: string;
+  ammo: string;
+  ammoLabel: string;
+  /** SETUP = preparando (farmar/abrir janela) · ATTACK = dano · HOLD = não atacar · FINISHER = golpe secreto. */
+  role: 'SETUP' | 'ATTACK' | 'HOLD' | 'FINISHER';
+  movement: string;
+  aim: string;
+  windowOpen: boolean;
+  windowLabel: string;
+  mayFire: boolean;
+  distance: number;
+  rangeState: 'TOO_CLOSE' | 'IN_RANGE' | 'TOO_FAR';
+  hpPct: number;
+  damageDealt: number;
+  hits: number;
+  /** O prior do guia não estava ferindo e a munição foi trocada por evidência. */
+  rotated: boolean;
+  rotationNote: string | null;
+  /** O plano do guia não estava ferindo e o agente caiu para sondagem de munição. */
+  probeMode: boolean;
+  /** Poder do Core-X exposto: parar de atirar e ir coletar. */
+  collectWhenExposed: boolean;
+  note: string;
+  source: string;
+  summary: string;
+}
+
 export interface AIStatusSnapshot {
+  bossFight?: BossFightStatus;
   mode: AgentBehaviorMode;
   behaviorLabel: string;
   uSearchPhase?: USearchPhase;
@@ -150,6 +184,47 @@ export interface AIStatusSnapshot {
   mapExploration?: {
     roomsExplored: number;
     mapFullyExplored: boolean;
+    /** veredicto do detector de "estou perdido" */
+    lost: boolean;
+    lostCause: string | null;
+    lostNote: string;
+    /** 0..3 — 2+ dispara a consulta do mapa do jogo (START) */
+    lostSeverity: number;
+    /** última leitura da tela de mapa */
+    mapRead: {
+      ok: boolean;
+      coveragePct: number;
+      hint: string | null;
+      hintDir: string | null;
+      note: string;
+      ageTicks: number;
+    } | null;
+    /** próximo alvo escolhido no grafo de salas */
+    target: {
+      kind: string;
+      label: string;
+      reason: string;
+      route: string[];
+      firstDoor: string | null;
+      roomId: number;
+    } | null;
+    /** portas que faltam habilidade/munição — o "volta depois" */
+    backlog: Array<{ roomId: number; doorKey: string; need: string; missing: string }>;
+    /** checklist do objetivo (tanques, expansões, chefes, terminais) */
+    checklist: Array<{
+      id: string;
+      label: string;
+      kind: string;
+      have: number;
+      total: number;
+      done: boolean;
+      note: string;
+    }>;
+    checklistSummary: string;
+    navSummary: string;
+    preferredDirection: string | null;
+    /** portas da sala atual com a cor reconhecida no frame (base da decisão de abrir/voltar) */
+    currentRoomDoors: Array<{ key: string; color: string; closed: boolean }>;
   };
   // Sistema de interação com objetos/terminal/energia
   interaction?: {
