@@ -47,7 +47,8 @@ export type SpecialEntityType =
   | 'CORE_X_NAKED'
   | 'METROID_LARVA'
   | 'BIG_METROID'
-  | 'SAX_MONSTER';
+  | 'SAX_MONSTER'
+  | 'MISSION_PROGRESS';
 
 export type CoreXStage = 'NORMAL' | 'AMARELO' | 'VERMELHO' | 'PODER_EXPOSTO';
 
