@@ -1,5 +1,5 @@
 import type { AIKey, ArmorAnalysis, EquipmentPieceStatus } from '../types/emulator';
-import { getEmulatorGameManager } from './emulatorBridge';
+import { getEmulatorGameManager, readEmulatorRam } from './emulatorBridge';
 
 export interface EnemyInfo {
   slot: number;
@@ -97,6 +97,14 @@ export interface MetroidWramSnapshot {
   doors: DoorInfo[];
   blockTypes: Uint8Array | null;
   btsBytes: Uint8Array | null;
+  /**
+   * `false` quando as máscaras de item NÃO são auto-consistentes (coletado ≠ equipado,
+   * munição acima do teto). Nesse caso o agente não pode INVENTARIAR nada: X-Ray desliga a
+   * caça a bloco falso e Gravity Suit desliga a travessia de lava. Ver `localVisionAI`.
+   */
+  inventoryTrusted: boolean;
+  /** o que exatamente não bateu (vai para o painel do player) */
+  inventoryIssue: string | null;
 }
 
 interface CachedDoorShape {
@@ -417,15 +425,19 @@ function buildArmorAnalysis(
   };
 }
 
-export async function readMetroidWram(): Promise<MetroidWramSnapshot | null> {
+/**
+ * @param ttlMs permite reusar o último estado do núcleo (ver `readEmulatorRam`): a serialização
+ *     completa do estado é o item mais caro do laço e as posições/HP não mudam entre dois frames.
+ */
+export async function readMetroidWram(ttlMs = 0): Promise<MetroidWramSnapshot | null> {
   if (window.EJS_core !== 'snes') return null;
   const gm = getEmulatorGameManager();
   if (!gm || typeof gm.getState !== 'function') return null;
 
   try {
-    const raw = await Promise.resolve(gm.getState());
+    const raw = await readEmulatorRam(ttlMs);
     if (!raw) return null;
-    const state = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+    const state = raw;
     const base = findRamBase(state);
     if (base < 0 || base + 0x2000 >= state.length) return null;
 
@@ -738,6 +750,47 @@ export async function readMetroidWram(): Promise<MetroidWramSnapshot | null> {
       }
     }
 
+    // ─── confiança do inventário ────────────────────────────────────────────────────────
+    // No Super Metroid não existe "coletou e deixou de equipar": as duas máscaras têm que
+    // bater, e nenhuma munição pode passar do próprio teto. Quando não batem, a LEITURA é
+    // lixo — não o jogador. Foi exatamente isso que o playtest headless de 25 min pegou no
+    // X-Fusion: itemsMask=0xfbbf (as 16 habilidades!) com itemsEquipped=0x0 numa Samus de
+    // 99 HP e 5 mísseis no prólogo de Ceres. O bit 0x8000 inventado ligava a caça a "blocos
+    // falsos" e a sala virou um poço de 22 minutos.
+    // Regra: duvidamos do bit que INVENTA alvo (X-Ray) e do bit que DECLARA segurança
+    // (Gravity); habilidades de ação (bomba, space jump) continuam válidas porque cada uma
+    // é testada e vetada pela sua própria hipótese no `actionGuardian`.
+    const popcount = (v: number) => {
+      let n = 0;
+      let x = v & 0xffff;
+      while (x) {
+        x &= x - 1;
+        n++;
+      }
+      return n;
+    };
+    const ammoWithinCeiling =
+      missiles <= maxMissiles && supers <= maxSupers && powerBombs <= maxPowerBombs;
+    const collectedEquippedAgree = (itemsMask & ~itemsEquipped) === 0 && (beamsMask & ~beamsEquipped) === 0;
+    const issues: string[] = [];
+    if (!ammoWithinCeiling) issues.push(`munição acima do teto (${missiles}/${maxMissiles})`);
+    if (!collectedEquippedAgree) {
+      issues.push(
+        `coletado 0x${itemsMask.toString(16)}/${popcount(itemsMask)} peças ≠ equipado 0x${itemsEquipped.toString(16)}`,
+      );
+    }
+    if (maxHealth > 0 && maxHealth < 99) issues.push(`vida máxima ${maxHealth} abaixo do tanque inicial`);
+    // "Carregou tudo e continua com o tanque inicial" é a digital de um offset lido no lugar
+    // errado: no SM/X-Fusion as 4 tanques valem +25 cada e a suíte completa não existe com 99 HP.
+    // Foi o que a caçada ao bloco falso precisava para ligar sozinha no prólogo de Ceres.
+    if (popcount(itemsMask & 0xffff) >= 14 && maxHealth > 0 && maxHealth <= 99) {
+      issues.push(
+        `${popcount(itemsMask & 0xffff)}/16 habilidades com ${maxHealth} de vida máxima — impossível, o offset de item não é deste hack`,
+      );
+    }
+    const inventoryTrusted = issues.length === 0;
+    const inventoryIssue = inventoryTrusted ? null : issues.join(' · ');
+
     const armorAnalysis = buildArmorAnalysis(
       health,
       maxHealth,
@@ -798,6 +851,8 @@ export async function readMetroidWram(): Promise<MetroidWramSnapshot | null> {
       doors,
       blockTypes,
       btsBytes,
+      inventoryTrusted,
+      inventoryIssue,
     };
   } catch {
     return null;

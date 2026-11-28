@@ -49,6 +49,8 @@ import {
   type EscortDoor,
   type EscortEntity,
 } from './metroidEscort';
+import { ActionGuardian, cellKey, targetKey } from './actionGuardian';
+import type { EscapePlan } from './actionGuardian';
 import {
   SelfCorrectionLedger,
   type CorrectionEffect,
@@ -256,6 +258,35 @@ export class LocalVisionAgent {
   private roomGraph = new Map<number, RoomNode>();
   private pendingTargets: PendingTarget[] = [];
   private lastRoomId = -1;
+  /**
+   * Memória de idas e vindas entre salas (A→B→A). Um único round trip é normal — ela entrou,
+   * viu, volta. Dois round trips seguidos pela MESMA porta significam que o "próximo alvo"
+   * do planejador é a sala que ela acabou de deixar: o alvo de lá manda ela voltar, e o ciclo
+   * não tem fim. Foi exatamente o que substituiu a caçada ao bloco falso no playtest de
+   * 25 min: 8.226 ticks (66 % da sessão) e 240 travessias entre 0x8B7D e 0x8BBB, com a Samus
+   * quase nunca andando dentro da sala nova.
+   */
+  /**
+   * "acabei de entrar por esta porta": veto curto (14 ticks) contra o batente de chegada.
+   * O jogo entrega a Samus DENTRO da porta com a tecla anterior ainda segurada pelo laço de
+   * decisão; sem o veto, o primeiro passo do plano na sala nova é o caminho de volta e a
+   * travessia re-dispara. Custa 2,4 s e economiza a sessão inteira (ver `bounceTally`).
+   */
+  private entryCalm: { roomId: number; forbid: 'LEFT' | 'RIGHT'; until: number; x: number; y: number } | null = null;
+  /**
+   * Orçamento da TENTATIVA DE PORTA. Ficar na soleira atirando/girando slot sem a sala trocar não
+   * é progresso — é o estado em que a sessão de 25 min terminou: 9.160 ticks (79 % do tempo) em
+   * 0x8CB3 x=216 com `Abrindo porta (RIGHT)`, e o sentinela mudo porque o chão daquela soleira é
+   * lido como "no ar". Um humano atira, gira o slot, espera o scroll e, se nada acontece, trata a
+   * porta como trancada e procura outra. É o que este orçamento faz.
+   */
+  private doorAttempt = { key: '', ticks: 0 };
+  private roomChain: number[] = [];
+  private bounceTally = new Map<string, { n: number; tick: number }>();
+  /** aresta proibida como destino de alvo: `${from}->${to}` → até quando */
+  private bounceBan = new Map<string, number>();
+  /** ticks consecutivos dentro do estado de transição de porta (0x0b) */
+
   private entryDoorKey: string | null = null;
   private activeDoorKey: string | null = null;
   private roomTicks = 0;
@@ -270,6 +301,24 @@ export class LocalVisionAgent {
   private samusVy = 0;
   private sameYStreak = 0;
   private progressStallTicks = 0;
+  // ─── camada de verificação (src/lib/actionGuardian.ts) ──────────────────────────────
+  // Nada aqui troca a heurística do agente: é o freio dela. Cada jogada repetitiva vira uma
+  // hipótese com orçamento (e é confrontada com o efeito real no tick seguinte) e o
+  // travamento passa a ser medido por ganho HORIZONTAL — pular no mesmo tijolo deixa de contar
+  // como progresso. O playtest de 25 min (playtest/RELATORIO-IA-25min.md) mostrou que a falta
+  // dessa peça custou 22 minutos de sessão numa sala atravessável em 3 s.
+  private readonly guardian = new ActionGuardian();
+  /** teclas do último AIAction — o sentinela precisa saber para onde ela estava EMPURRANDO */
+  private lastActionKeys: AIKey[] = [];
+  /** ms do último AIAction (vão de pulo curto redefine a cadência do próximo tick) */
+  private lastActionMs = 125;
+  private guardianRoomId = -1;
+  /** true no tick em que a sala acabou de trocar (lido pela escada de escape) */
+  private roomChangedThisTick = false;
+  /** degrau MAP_READ pede leitura de mapa já, sem esperar o refratário */
+  private forceMapReadTicks = 0;
+  /** aposta de bloco falso a ser conferida no tick seguinte (abriu ou não abriu?) */
+  private pendingSecretShot: { key: string; roomId: number; bx: number; by: number } | null = null;
   private missileProbeCount = 0;
   private recentBlockedSpots: Array<{ x: number; y: number; dir: 'LEFT' | 'RIGHT' }> = [];
   private itemChaseTicks = 0;
@@ -450,6 +499,8 @@ export class LocalVisionAgent {
   /** vida no último tick, para a testemunha ver o dano que AINDA VAI SER ROTULADO neste tick */
   private lavaWitnessHealth = -1;
   private lavaProvenSafe = new Set<string>();
+  /** ticks seguidos percorrendo a região marcada sem dano (a prova de travessia) */
+  private lavaCrossTicks = 0;
   /** salas onde o veto de chão hostil foi desligado por falso-positivo provado */
   private lavaVetoOff = new Set<number>();
   // memória da escolta de Metroid (o bicho é o roteiro: seguir, não atirar)
@@ -577,6 +628,13 @@ export class LocalVisionAgent {
     this.samusVy = 0;
     this.sameYStreak = 0;
     this.progressStallTicks = 0;
+    this.guardian.reset();
+    this.lastActionKeys = [];
+    this.lastActionMs = 125;
+    this.guardianRoomId = -1;
+    this.roomChangedThisTick = false;
+    this.forceMapReadTicks = 0;
+    this.pendingSecretShot = null;
     this.missileProbeCount = 0;
     this.recentBlockedSpots = [];
     this.itemChaseTicks = 0;
@@ -1041,7 +1099,7 @@ export class LocalVisionAgent {
       this.lastEnergyResetTick = this.stepIndex;
       this.enemyTracks.clear();
       this.recentDamageSpikeTick = -100;
-      this.progressStallTicks = 0;
+      this.forgiveStall();
       this.itemChaseTicks = 0;
       this.recentBlockedSpots = [];
       this.unbreakableGates.clear();
@@ -1218,7 +1276,9 @@ export class LocalVisionAgent {
     // Gravity Suit muda a SEMÂNTICA da lava (ela vira "água quente" atravessável), e o
     // jogador pode achá-la a qualquer momento — por isso isso é lido todo tick, não no
     // throttle da amostragem de frame.
-    const safe = (wram.itemsMask & 0x0020) !== 0;
+    // Gravity Suit declarada por um inventário NÃO-confiável é o pior tipo de engano: ela não
+    // cria um alvo, ela retira um veto (a lava vira "atravessável"). Conservador por padrão.
+    const safe = wram.inventoryTrusted && (wram.itemsMask & 0x0020) !== 0;
     if (safe !== this.lavaSafe) {
       this.lavaSafe = safe;
       if (safe) {
@@ -1411,8 +1471,13 @@ export class LocalVisionAgent {
     const { run: dashKey, shoot: shootKey, select: selectKey, jump: jumpKey } = wram.controls;
     const keys: AIKey[] = near ? ['UP'] : [dir, dashKey];
     if (near) {
-      if (wram.selectedHudItem === 0) {
+      // 1) deixa o míssil selecionado ANTES de atirar; 2) só então dispara e pula. O driver de
+      // slot devolve um tick por toque, então o HUD é lido entre toques em vez de "torcer".
+      const slot = this.slotPlanFor(wram, 'MISSILES');
+      if (slot.tap) {
         keys.push(selectKey);
+      } else if (slot.restore) {
+        keys.push(wram.controls.cancel);
       } else {
         if (this.nextShoot(true)) {
           keys.push(shootKey);
@@ -1420,7 +1485,8 @@ export class LocalVisionAgent {
           this.noteDoorShot(wram, door);
         }
         // pulo curto encostando no batente: em comporta alta é o que encosta o projétil/mira
-        if (this.isSamusGrounded(wram) && this.nextJump(true, 2)) keys.push(jumpKey);
+        const shape = this.guardian.jumpHold(wram.samusY - 40, wram.samusY, this.isSamusGrounded(wram));
+        if (this.isSamusGrounded(wram) && this.nextJump(true, shape.holdTicks)) keys.push(jumpKey);
       }
     }
     return {
@@ -1471,8 +1537,10 @@ export class LocalVisionAgent {
     // HP é o mesmo do tick anterior.
     const hurt = this.lavaWitnessHealth >= 0 && wram.health < this.lavaWitnessHealth;
     this.lavaWitnessHealth = wram.health;
+    if (hurt) this.lavaCrossTicks = 0;
     const cx = Math.floor((wram.samusX - wram.cameraX) / MOLTEN_CELL);
     const cy = Math.floor((wram.samusY + 6 - wram.cameraY) / MOLTEN_CELL);
+    let touched = 0;
     for (let dc = -1; dc <= 1; dc++) {
       const cc = cx + dc;
       if (cc < 0 || cc >= MOLTEN_COLS || cy < 0 || cy >= MOLTEN_ROWS) continue;
@@ -1492,6 +1560,22 @@ export class LocalVisionAgent {
         this.lavaProvenSafe.add(cellKey);
         this.lavaWitness.delete(cellKey);
       }
+      touched++;
+    }
+    // Prova de TRAVESSIA: 10 ticks na MESMA célula de 8 px só acontecem se ela parar em cima do
+    // "lago" — ou seja, o desmentido dependia da IA estar travada (era o bug, não a cura). Quem
+    // anda 5 px por tick cruza a célula em 2 ticks e nunca prova nada. Então acumula também o
+    // tempo percorrido dentro da região marcada sem dano: 14 ticks assim = "pisei e não doeu" →
+    // todas as células sob observação viram "firme" de uma vez, e o limiar de 4 derruba o lago.
+    if (touched > 0) {
+      this.lavaCrossTicks++;
+      if (this.lavaCrossTicks >= 14 && this.lavaWitness.size > 0) {
+        for (const k of this.lavaWitness.keys()) this.lavaProvenSafe.add(k);
+        this.lavaWitness.clear();
+        this.lavaCrossTicks = 0;
+      }
+    } else {
+      this.lavaCrossTicks = 0;
     }
   }
 
@@ -2089,7 +2173,7 @@ export class LocalVisionAgent {
       backlogKeys: new Set(this.navBacklog.map((b) => `${b.roomId}`)),
       startRoomId: this.navStartRoomId,
     });
-    this.navTarget = plan.target;
+    this.navTarget = this.applyBounceBan(plan.target, wram);
     // mescla: mantém entradas antigas que o plano de agora não conseguiu reavaliar
     const fresh = plan.backlog;
     const keep = this.navBacklog.filter(
@@ -2097,6 +2181,67 @@ export class LocalVisionAgent {
         && !this.roomGraph.get(old.roomId)?.doors.get(old.doorKey)?.targetRoomId,
     );
     this.navBacklog = [...fresh, ...keep].slice(0, 12);
+  }
+
+  /** Registra A→B→A e, no segundo round trip pela mesma porta, proíbe a aresta como alvo. */
+  private registerRoomBounce(prevRoomId: number, curRoomId: number): void {
+    if (prevRoomId <= 0 || curRoomId <= 0 || prevRoomId === curRoomId) return;
+    const chain = this.roomChain;
+    const cameBackTo = chain.length > 0 && chain[chain.length - 1] === curRoomId;
+    if (cameBackTo) {
+      // chave NORMALIZADA pelo par: num vaivém A↔B os dois sentidos aparecem alternados, e contar
+      // por orientação ("A->B", "B->A") divide o mesmo sintoma ao meio — ele nunca chega ao
+      // limiar. É o par que importa, não o sentido.
+      const key = prevRoomId < curRoomId ? `${prevRoomId}|${curRoomId}` : `${curRoomId}|${prevRoomId}`;
+      const st = this.bounceTally.get(key);
+      const n = st && this.stepIndex - st.tick < 1200 ? st.n + 1 : 1;
+      this.bounceTally.set(key, { n, tick: this.stepIndex });
+      // 2 round trips seguidos (4 travessias) sem nada coletado no meio já é o padrão do
+      // playtest; 1 volta é jogo normal (entrou, viu que não tinha nada, saiu).
+      if (n >= 2) {
+        // 30 s de jogo sem essa aresta como destino, e uma leitura de mapa arma a fronteira
+        // alternativa: sem um alvo novo, proibir só adia o mesmo erro
+        this.bounceBan.set(`${curRoomId}->${prevRoomId}`, this.stepIndex + 900);
+        this.bounceBan.set(`${prevRoomId}->${curRoomId}`, this.stepIndex + 900);
+        // e planta a memória de colisão no batente de volta: o caminho que já existe para isso é
+        // `recentBlockedSpots` + `hitKnownBlocked`, que inverte a direção e anota no grafo.
+        const backDoor = this.lastRoomDoorsSnapshot.find((d) => d.side === (this.moveDir === 'LEFT' ? 'LEFT' : 'RIGHT'));
+        if (backDoor) {
+          this.recentBlockedSpots.push({ x: backDoor.x, y: backDoor.y, dir: this.moveDir });
+          if (this.recentBlockedSpots.length > 12) this.recentBlockedSpots.shift();
+        }
+        this.bounceTally.delete(key);
+        if (this.loopDetected) this.loopDetected = false;
+        // e descarta os alvos pendentes que apontam para a sala proibida: sem isso a fila
+        // `pendingTargets` continua puxando ela de volta pelo mesmo batente no tick seguinte
+        this.pendingTargets = this.pendingTargets.filter(
+          (t) => !(this.bounceBanned(curRoomId, t.roomId) || this.bounceBanned(prevRoomId, t.roomId)),
+        );
+      }
+    }
+    chain.push(prevRoomId);
+    if (chain.length > 4) chain.shift();
+  }
+
+  private bounceBanned(fromRoom: number, toRoom: number): boolean {
+    const until = this.bounceBan.get(`${fromRoom}->${toRoom}`);
+    return until !== undefined && this.stepIndex < until;
+  }
+
+  /**
+   * Chuta o alvo que só manda ela de volta pela porta por onde acabou de entrar. Devolve `null`
+   * → o plano cai na exploração de fronteira da sala atual (que é o comportamento "procure
+   * outra saída" que faltava). Não mexe na aresta física: a porta continua aberta e o grafo
+   * continua sabendo dela — só deixa de ser o DESTINO por um tempo.
+   */
+  private applyBounceBan(target: NavTarget | null, wram: MetroidWramSnapshot): NavTarget | null {
+    if (!target) return null;
+    if (target.roomId === wram.roomId) return target;
+    if (this.bounceBanned(wram.roomId, target.roomId)) return null;
+    const node = this.roomGraph.get(wram.roomId);
+    const nextRoom = target.firstDoor ? node?.doorLinks.get(target.firstDoor) : undefined;
+    if (nextRoom !== undefined && this.bounceBanned(wram.roomId, nextRoom)) return null;
+    return target;
   }
 
   /** Item chegou: reabre as portas que estavam no backlog e devolve a sala para pendingTargets. */
@@ -2145,7 +2290,12 @@ export class LocalVisionAgent {
   noteSaveStateLoaded(): void {
     this.menuGrantedAfterSave = true;
     this.menuClockOriginTick = this.stepIndex;
-    this.mapReadBackoff = 120; // a leitura pós-save é sempre bem-vinda
+    // A regra do usuário é "logo depois de carregar um save". Então o refratário de leitura
+    // zera (ele é o limite de taxa da consulta periódica, não uma ordem de prioridade) e a
+    // próxima janela livre é armada de fato — sem isso, uma leitura que a ESCADA DE ESCAPE já
+    // tinha feito pouco antes do load deixava o mapa bloqueado por mais 120 ticks.
+    this.mapReadBackoff = 0;
+    this.forceMapReadTicks = 40;
   }
 
   /** O portão do menu: 3 minutos de sessão desde o load, ou permissão dada por um save. */
@@ -2179,9 +2329,12 @@ export class LocalVisionAgent {
       // "reler a cada 2 ticks". E reler o mesmo mapa sem ter descoberto sala nenhuma desde a
       // última leitura é inútil — cada leitura estéril triplica a espera, até o ciclo periódico.
       const sinceRead = this.stepIndex - this.lastMapReadTick;
-      if (sinceRead < this.mapReadBackoff) return null;
+      // o degrau MAP_READ da escada de escape fura o refratário: "presa há 420 ticks sem
+      // ganhar um pixel na horizontal" é exatamente o caso em que reler o mapa NÃO é inútil
+      if (sinceRead < this.mapReadBackoff && this.forceMapReadTicks <= 0) return null;
       const periodic = sinceRead >= this.MAP_CONSULT_INTERVAL_TICKS;
-      const lost = this.navLost.lost && this.stepIndex - this.mapReadFailedTick > 240;
+      const lost =
+        (this.navLost.lost && this.stepIndex - this.mapReadFailedTick > 240) || this.forceMapReadTicks > 0;
       if (!lost && !periodic) return null;
       if (wram.enemies.some((e) => e.hp > 0) || bossEngaged) return null;
       if (wram.gameState !== 8) return null;
@@ -2502,46 +2655,67 @@ export class LocalVisionAgent {
 
   // Detecção de loop com escape forçado
   private checkForcedEscape(wram: MetroidWramSnapshot): boolean {
-    this.lastRoomPositions.push({
-      x: wram.samusX,
-      y: wram.samusY,
-      tick: this.stepIndex,
-    });
+    return this.updateEscapeLadder(wram).engaged;
+  }
 
-    if (this.lastRoomPositions.length > 30) {
-      this.lastRoomPositions.shift();
-    }
+  /**
+   * Escada de escape (F1/F5 do relatório). A versão antiga:
+   *   1. media `netMovement` das últimas 30 amostras e, com ela ~0, invertia a *preferência de
+   *      rota* — que muitas vezes ERA a direção da parede onde ela já estava presa (o
+   *      `dir=LEFT` repetido ~130 vezes contra a parede esquerda da sala 0x8b7d);
+   *   2. ao fim da janela de 60 ticks zerava `stuckInRoomTicks` e as posições — apagando a
+   *      única evidência que poderia ter disparado a leitura do mapa.
+   * Aqui o degrau vem do `EscapeLadder` (impulso → inverte o EMPURRÃO medido → varre com tiro
+   * → lê o mapa → bloqueia a sala no grafo) e **nenhum degrau limpa o contador**: só trocar de
+   * sala reseta. Cada degrau tem orçamento curto para não virar ele o novo loop.
+   */
+  private updateEscapeLadder(wram: MetroidWramSnapshot): EscapePlan {
+    this.lastRoomPositions.push({ x: wram.samusX, y: wram.samusY, tick: this.stepIndex });
+    if (this.lastRoomPositions.length > 30) this.lastRoomPositions.shift();
 
-    if (this.stuckInRoomTicks > 100 && !this.loopDetected) {
-      this.loopDetected = true;
+    const inCombat = this.bossEngagedThisTick || wram.enemies.some((e) => e.hp > 0);
+    const plan = this.guardian.ladder.next(
+      this.stepIndex,
+      this.guardian.sentinel.current,
+      this.roomChangedThisTick,
+      { inCombat, canReadMap: this.menuOpenAllowed() },
+    );
+
+    // os dois campos antigos continuam coerentes (UI e uSearch leem isso)
+    this.loopDetected = plan.engaged;
+    this.forcedEscapeDir = plan.dir;
+    if (plan.engaged) {
       this.forcedEscapeTick = this.stepIndex;
-
-      const lastPos = this.lastRoomPositions[this.lastRoomPositions.length - 1];
-      const firstPos = this.lastRoomPositions[0];
-      const netMovement = lastPos.x - firstPos.x;
-
-      if (Math.abs(netMovement) < 10) {
-        this.forcedEscapeDir =
-          this.preferredDirection === 'RIGHT' ? 'LEFT' : 'RIGHT';
-      } else {
-        this.forcedEscapeDir = netMovement > 0 ? 'LEFT' : 'RIGHT';
-      }
-
-      return true;
+      if (plan.rung === 'MAP_READ' && this.forceMapReadTicks <= 0) this.forceMapReadTicks = 4;
+      if (plan.rung === 'BLOCK_ROOM') this.sealCurrentRoom(wram);
     }
+    return plan;
+  }
 
-    if (this.loopDetected) {
-      const escapeDuration = this.stepIndex - this.forcedEscapeTick;
-      if (escapeDuration > 60) {
-        this.loopDetected = false;
-        this.forcedEscapeDir = null;
-        this.stuckInRoomTicks = 0;
-        this.lastRoomPositions = [];
-      }
-      return true;
+  /**
+   * "não é por aqui" com memória: a célula vira hostil, os dois lados da sala constam como
+   * gastos e o portão onde ela bate deixa de ser tratado como quebrável. É o que tira do
+   * repertório o estado "presa aqui para sempre" — ela pode voltar mais tarde, agora com
+   * motivo registrado e com as apostas da sala renovadas só quando algo novo acontecer.
+   */
+  private sealCurrentRoom(wram: MetroidWramSnapshot): void {
+    const node = this.getOrCreateRoom(wram.roomId);
+    node.triedLeft = true;
+    node.triedRight = true;
+    const bx = Math.floor(wram.samusX / 16);
+    const by = Math.floor(wram.samusY / 16);
+    this.dangerCells.add(`${wram.roomId}:${bx},${by}`);
+    for (const spot of [...this.recentBlockedSpots].slice(-4)) {
+      this.dangerCells.add(`${wram.roomId}:${Math.floor(spot.x / 16)},${Math.floor(spot.y / 16)}`);
     }
-
-    return false;
+    for (const [id, sp] of node.secretPaths) {
+      const h = this.guardian.hypotheses.open(targetKey(wram.roomId, 'XRAY', sp.x, sp.y), 'SECRET_BLOCK', wram.roomId, 3);
+      h.budget = 0;
+      h.status = 'DEAD';
+      this.unbreakableGates.add(`${wram.roomId}:${id}`);
+    }
+    node.secretPaths.clear();
+    this.stuckInRoomTicks = 90;
   }
 
   // Evasão inteligente da SA-X: considera se a SA-X está bloqueando a rota
@@ -2683,6 +2857,28 @@ export class LocalVisionAgent {
           : undefined,
       // Sistema de loadout: mostra quais habilidades/armadura/ferramentas o agente tem
       agentLoadout: wram ? this.getAgentLoadout(wram) : undefined,
+      // Camada de verificação: o que o agente aposta, quantas vezes já perdeu, e em que degrau
+      // de escape está. Sem isto a tela mostrava "explorando" enquanto ela pulava no mesmo
+      // tijolo havia 22 minutos — que foi o diagnóstico mais difícil do playtest.
+      guardian: (() => {
+        const g = this.guardian.snapshot();
+        return {
+          stallTicks: g.stallTicks,
+          roomTicks: g.roomTicks,
+          severity: g.severity,
+          pushDir: g.pushDir,
+          pinnedEdge: g.pinnedEdge,
+          escapeRung: g.escape.rung,
+          escapeStep: g.escape.step,
+          deadHypotheses: g.deadCount,
+          hypotheses: g.hypotheses,
+          jump: g.jump,
+          slot: g.slot,
+          lockedTarget: g.lock.lockedSlot,
+          inventoryTrusted: wram ? wram.inventoryTrusted : true,
+          inventoryIssue: wram ? wram.inventoryIssue : null,
+        };
+      })(),
       // Sistema de exploração do mapa
       mapExploration: wram
         ? {
@@ -2806,6 +3002,12 @@ export class LocalVisionAgent {
     uSearchPhase: USearchPhase = 'NONE',
   ): AIAction {
     this.currentMode = mode;
+    // O sentinela precisa saber o que estava sendo segurado (para inverter o EMPURRÃO, não a
+    // preferência de rota) e o `time` vira a cadência efetiva do laço no player.
+    this.lastActionKeys = keys;
+    this.lastActionMs = time;
+    this.guardian.slots.setOwnedAmmo(wram.maxMissiles > 0, wram.maxSupers > 0, wram.maxPowerBombs > 0);
+    if (this.forceMapReadTicks > 0) this.forceMapReadTicks--;
     const learnedKnowledge =
       this.pendingLearnedKnowledge.length > 0 ? this.pendingLearnedKnowledge.splice(0) : undefined;
     return {
@@ -2935,6 +3137,22 @@ export class LocalVisionAgent {
         }
       }
 
+      this.registerRoomBounce(prevRoomId, wram.roomId);
+      {
+        const nodeHere = this.getOrCreateRoom(wram.roomId);
+        let backKey: string | null = null;
+        for (const [k, target] of nodeHere.doorLinks) if (target === prevRoomId) backKey = k;
+        const backDoor = backKey ? wram.doors.find((d) => d.key === backKey) : undefined;
+        if (backDoor && (backDoor.side === 'LEFT' || backDoor.side === 'RIGHT')) {
+          this.entryCalm = {
+            roomId: wram.roomId,
+            forbid: backDoor.side,
+            until: this.stepIndex + 14,
+            x: backDoor.x,
+            y: backDoor.y,
+          };
+        }
+      }
       this.lastRoomId = wram.roomId;
       // Rastreia salas exploradas para detectar quando o mapa foi "ganho"
       if (!this.roomsExplored.has(wram.roomId)) {
@@ -2961,7 +3179,7 @@ export class LocalVisionAgent {
       this.samusVx = 0;
       this.samusVy = 0;
       this.sameYStreak = 0;
-      this.progressStallTicks = 0;
+      this.forgiveStall();
       this.missileProbeCount = 0;
       this.recentBlockedSpots = [];
       this.itemChaseTicks = 0;
@@ -3099,21 +3317,38 @@ export class LocalVisionAgent {
       this.uSearch.cooldown--;
     }
 
-    if (!this.uSearch.active) {
-      const horizDist = Math.abs(wram.samusX - this.anchorX);
-      const vertMoved = Math.abs(wram.samusY - this.anchorY) >= 28;
-
-      if (horizDist >= 20 || vertMoved) {
-        this.anchorX = wram.samusX;
-        this.anchorY = wram.samusY;
-        this.progressStallTicks = 0;
-        if (horizDist >= 40) {
-          this.missileProbeCount = 0;
-        }
-      } else if (this.roomMovedOnce) {
-        this.progressStallTicks++;
-        this.stuckInRoomTicks++;
-      }
+    // ─── sentinela de estagnação (F4 do relatório) ──────────────────────────────────────
+    // O critério antigo era `|Δx| < 20 && |Δy| < 28`: qualquer pulo no lugar passava de 28 px
+    // em y, re-ancorava a posição e ZERAVA o travamento. Uma Samus presa no fundo de um poço
+    // — pulando e caindo no mesmo tijolo por 22 minutos — tinha severidade 1 e o detector de
+    // "perdida" não podia subir para 2, que é o limiar de consultar o mapa. Agora só conta
+    // ganho horizontal ou pouso numa célula de apoio diferente, e o número mora no sentinela.
+    const roomChangedNow = wram.roomId !== this.guardianRoomId;
+    this.roomChangedThisTick = roomChangedNow;
+    this.guardianRoomId = wram.roomId;
+    const gv = this.guardian.sentinel.feed({
+      tick: this.stepIndex,
+      roomId: wram.roomId,
+      x: wram.samusX,
+      y: wram.samusY,
+      keys: this.lastActionKeys,
+      grounded: this.isSamusGrounded(wram),
+      roomChanged: roomChangedNow,
+      progressEvent: Boolean(unlockedLabel),
+      // "em combate" = ESTOU brigando (chefe ou modo COMBAT/FLEE no tick anterior), não
+      // "existe um inimigo com HP nesta sala" — esta última formulação é quase sempre vera no
+      // *X-Fusion* e desligava o sentinela para sempre.
+      inCombat: this.bossEngagedThisTick || this.currentMode === 'COMBAT' || this.currentMode === 'EVADE_SAX',
+      roomWidthPx: wram.roomWidthPx,
+    });
+    this.anchorX = wram.samusX;
+    this.anchorY = wram.samusY;
+    this.progressStallTicks = this.uSearch.active ? this.progressStallTicks : gv.stallTicks;
+    if (gv.stallTicks === 0 && Math.abs(gv.lastNetDx) >= 40) {
+      this.missileProbeCount = 0;
+    }
+    if (this.roomMovedOnce && !this.uSearch.active && gv.stallTicks > 0) {
+      this.stuckInRoomTicks = Math.max(this.stuckInRoomTicks, gv.stallTicks);
     }
 
     // Decrementa cooldown de interação
@@ -3129,6 +3364,17 @@ export class LocalVisionAgent {
       );
 
     return { unlockedLabel, hitKnownBlocked };
+  }
+
+  /**
+   * Perdoa o travamento corrente (pouso em chão novo, item coletado, reset de energia, caça a
+   * item em andamento) por UM motivo só: a aposta anterior já não explica o mundo. Mantém um
+   * ponto de verdade — o contador mora no `StuckSentinel` — porque zerar só o espelho local foi
+   * o que permitiu 22 minutos de loop sem ninguém notar.
+   */
+  private forgiveStall(): void {
+    this.guardian.sentinel.forgive();
+    this.progressStallTicks = 0;
   }
 
   private resolveBlockType(wram: MetroidWramSnapshot, bx: number, by: number): number {
@@ -4201,66 +4447,98 @@ export class LocalVisionAgent {
   // agente saiba que há uma rota secreta a ser testada (atirar/bombardear).
   // =====================================================================
   private detectSecretPaths(wram: MetroidWramSnapshot): void {
+    const currNode = this.getOrCreateRoom(wram.roomId);
+
+    // 1) CONFRONTA a aposta do tick anterior: o bloco deixou de ser "sólido com BTS"? Então era
+    // falso mesmo. Se não, é mais uma tentativa gasta — e ao estourar o orçamento a célula entra
+    // em `unbreakableGates` e para de ser alvo. É exatamente o passo que faltava: o código
+    // antigo fazia `sp.tested = true` e, no tick seguinte, `secretPaths.clear()` apagava a
+    // marca. Resultado medido no ROM real: 5.678 ticks batendo tiro de feixe na mesma parede.
+    if (this.pendingSecretShot) {
+      const p = this.pendingSecretShot;
+      if (p.roomId !== wram.roomId) {
+        this.pendingSecretShot = null;
+        this.secretApproach.clear();
+      } else if (wram.blockTypes && wram.btsBytes) {
+        const idx = p.by * wram.roomWidthBlocks + p.bx;
+        const stillSolid =
+          idx >= 0 &&
+          idx < wram.blockTypes.length &&
+          wram.blockTypes[idx] === 0x8 &&
+          wram.btsBytes[idx] !== 0;
+        this.guardian.hypotheses.settle(p.key, !stillSolid, this.stepIndex);
+        if (!stillSolid) {
+          currNode.secretPaths.delete(`${p.bx}:${p.by}`);
+        } else if (this.guardian.hypotheses.isDead(p.key)) {
+          this.unbreakableGates.add(cellKey(wram.roomId, p.bx, p.by));
+          currNode.secretPaths.delete(`${p.bx}:${p.by}`);
+        }
+        this.pendingSecretShot = null;
+      }
+    }
+
+    // 2) X-Ray vindo de inventário NÃO-confiável CRIA alvos que não existem. No *X-Fusion* o
+    // bit 0x8000 aparecia armado no prólogo de Ceres (a máscara lida em $7E:09A4 vale 0xfbbf
+    // com $7E:09A2 = 0), e a "caça ao segredo" virou o buraco negro da sessão. Sem confiança
+    // na leitura, não há caçada: a navegação comum continua.
+    if (!wram.inventoryTrusted) {
+      if (currNode.secretPaths.size > 0) currNode.secretPaths.clear();
+      return;
+    }
     const hasXRay = (wram.itemsMask & 0x8000) !== 0;
     if (!hasXRay || !wram.blockTypes || !wram.btsBytes) return;
 
     const roomId = wram.roomId;
-    const currNode = this.getOrCreateRoom(roomId);
-    const { roomWidthBlocks, roomHeightBlocks } = wram;
+    const rw = wram.roomWidthBlocks;
+    const rh = wram.roomHeightBlocks;
 
-    // Limpa caminhos secretos antigos desta sala para reavaliar cada sessão
-    currNode.secretPaths.clear();
+    // Varre SÓ as bordas, que é o domínio do critério. Antes: `for by { for bx { if (!isEdge)
+    // continue; } }` — rw*rh voltas por tick (2.048 numa sala 128×16) para jogar fora ~96% no
+    // primeiro `continue` (era o pico de 25 ms/decisão medido no playtest).
+    const cells: number[] = [];
+    for (let bx = 0; bx < rw; bx++) cells.push(bx, (rh - 1) * rw + bx);
+    for (let by = 1; by < rh - 1; by++) cells.push(by * rw, by * rw + rw - 1);
 
-    // Percorre a borda da sala (paredes, teto, chão) procurando blocos que
-    // parecem sólidos (tipo 0x8) mas são na verdade blocos falsos revelados pelo X-Ray.
-    // No Super Metroid, blocos falsos costumam ter BTS byte diferente de 0 e
-    // tipo de bloco sólido nas bordas da sala.
-    const edgeRows = [0, roomHeightBlocks - 1];
-    const edgeCols = [0, roomWidthBlocks - 1];
+    for (const idx of cells) {
+      if (idx < 0 || idx >= wram.blockTypes.length) continue;
+      const bx = idx % rw;
+      const by = Math.floor(idx / rw);
+      const id = `${bx}:${by}`;
+      const gateKey = cellKey(roomId, bx, by);
+      if (this.unbreakableGates.has(gateKey)) {
+        if (currNode.secretPaths.has(id)) currNode.secretPaths.delete(id);
+        continue;
+      }
+      if (wram.blockTypes[idx] !== 0x8) continue;
+      if (wram.btsBytes[idx] === 0) continue;
 
-    for (let by = 0; by < roomHeightBlocks; by += 1) {
-      for (let bx = 0; bx < roomWidthBlocks; bx += 1) {
-        // Só verifica bordas da sala (onde caminhos secretos aparecem)
-        const isEdge = bx === 0 || bx === roomWidthBlocks - 1 || by === 0 || by === roomHeightBlocks - 1;
-        if (!isEdge) continue;
-
-        const idx = by * roomWidthBlocks + bx;
-        const blockType = wram.blockTypes[idx];
-        const bts = wram.btsBytes[idx];
-
-        // Tipo 0x8 = bloco sólido aparente; BTS diferente de 0 pode indicar bloco falso
-        // Tipo 0xa = espinho (não é caminho secreto)
-        // Tipo 0xf = quebrável por bomba (já é visível, não precisa de X-Ray)
-        if (blockType !== 0x8) continue;
-        if (bts === 0) continue; // bloco sólido de verdade
-
-        // Marca como caminho secreto candidato
-        currNode.secretPaths.set(`${bx}:${by}`, {
+      const x = bx * 16 + 8;
+      const y = by * 16 + 8;
+      const h = this.guardian.hypotheses.open(targetKey(roomId, 'XRAY', x, y), 'SECRET_BLOCK', roomId, 3, `bloco falso (${bx},${by})`);
+      if (h.status === 'DEAD') {
+        this.unbreakableGates.add(gateKey);
+        continue;
+      }
+      if (!currNode.secretPaths.has(id)) {
+        currNode.secretPaths.set(id, {
           bx,
           by,
-          x: bx * 16 + 8,
-          y: by * 16 + 8,
-          blockType,
-          bts,
-          tested: false,
+          x,
+          y,
+          blockType: 0x8,
+          bts: wram.btsBytes[idx],
+          // "testada" = orçamento esgotado, não "atirei uma vez"
+          tested: h.attempts >= h.budget,
           reason: 'bloco falso detectado via X-Ray',
         });
       }
-    }
-
-    // Se encontrou caminhos secretos, adiciona nota para o agente testar
-    if (currNode.secretPaths.size > 0) {
-      const count = currNode.secretPaths.size;
-      const secretNote = `Caminho secreto detectado (${count} bloco(s) falso(s) via X-Ray) na sala 0x${roomId.toString(16)}`;
-      // Registra no pendingTargets para o agente priorizar testar esses blocos
-      for (const [key, sp] of currNode.secretPaths) {
-        if (sp.tested) continue;
+      if (h.attempts === 0) {
         this.addPendingTarget({
           roomId,
-          x: sp.x,
-          y: sp.y,
-          dir: sp.bx < roomWidthBlocks / 2 ? 'LEFT' : 'RIGHT',
-          note: `CAMINHO SECRETO · teste bloco falso em (${sp.bx},${sp.by})`,
+          x,
+          y,
+          dir: bx < rw / 2 ? 'LEFT' : 'RIGHT',
+          note: `CAMINHO SECRETO · teste bloco falso em (${bx},${by})`,
           priority: 50,
         });
       }
@@ -4268,81 +4546,204 @@ export class LocalVisionAgent {
   }
 
   // Testa um bloco falso candidato (atira/bomba para revelar passagem secreta)
-  private executeSecretPathTest(wram: MetroidWramSnapshot): AIAction | null {
+  private executeSecretPathTest(wram: MetroidWramSnapshot, motionPct: number): AIAction | null {
+    if (!wram.inventoryTrusted) return null;
     const hasXRay = (wram.itemsMask & 0x8000) !== 0;
     if (!hasXRay) return null;
 
     const currNode = this.getOrCreateRoom(wram.roomId);
     if (currNode.secretPaths.size === 0) return null;
 
-    // Encontra o caminho secreto mais próximo não testado
+    // Encontra o caminho secreto mais próximo AINDA VIVA no orçamento de tentativas
     let nearest: { key: string; sp: { bx: number; by: number; x: number; y: number; tested: boolean } } | null = null;
     let nearestDist = Infinity;
     for (const [key, sp] of currNode.secretPaths) {
       if (sp.tested) continue;
+      const hypoKey = targetKey(wram.roomId, 'XRAY', sp.x, sp.y);
+      if (this.guardian.hypotheses.isDead(hypoKey)) continue;
       const dist = Math.hypot(sp.x - wram.samusX, sp.y - wram.samusY);
       if (dist < nearestDist) {
         nearestDist = dist;
-        nearest = { key, sp };
+        nearest = { key: hypoKey, sp };
       }
     }
     if (!nearest) return null;
 
     const { sp } = nearest;
     const dist = nearestDist;
+    const { shoot: shootKey, jump: jumpKey, run: dashKey } = wram.controls;
 
     // Se está perto do bloco falso, testa atirando ou usando bomba
     if (dist < 64) {
       const keys: AIKey[] = [sp.x >= wram.samusX ? 'RIGHT' : 'LEFT'];
-      // Aponta para o bloco (para cima se estiver acima, etc.)
-      if (sp.y < wram.samusY - 8) keys.push('UP');
-      else if (sp.y > wram.samusY + 8) keys.push('DOWN');
+      const aimUp = sp.y < wram.samusY - 8;
+      const aimDown = sp.y > wram.samusY + 8;
+      if (aimUp) keys.push('UP');
+      else if (aimDown) keys.push('DOWN');
+
+      const shape = this.guardian.jumpHold(sp.y, wram.samusY, this.isSamusGrounded(wram));
 
       // Se tem bomba e está embaixo, planta bomba
-      if (sp.y > wram.samusY && (wram.itemsMask & 0x1004) === 0x1004) {
+      if (aimDown && (wram.itemsMask & 0x1004) === 0x1004) {
         keys.push('DOWN');
-        if (this.nextShoot(true)) keys.push(wram.controls.shoot);
-        sp.tested = true;
+        if (this.nextShoot(true)) {
+          keys.push(shootKey);
+          this.guardian.hypotheses.attempt(nearest.key, this.stepIndex);
+          this.pendingSecretShot = { key: nearest.key, roomId: wram.roomId, bx: sp.bx, by: sp.by };
+        }
         return this.makeMetroidAction(
           'COLLECT',
           keys,
           140,
           'run',
-          0,
+          motionPct,
           'Caminho Secreto · Bomba',
-          `Testando bloco falso com bomba em (${sp.bx},${sp.by})`,
+          `Testando bloco falso com bomba em (${sp.bx},${sp.by}) (tentativa ${this.guardian.hypotheses.get(nearest.key)?.attempts ?? 0}/3)`,
           wram,
         );
       }
 
-      // Senão, atira no bloco falso
-      if (this.nextShoot(true)) keys.push(wram.controls.shoot);
-      sp.tested = true;
+      // Senão, atira no bloco falso — UMA aposta por vez, conferida no tick seguinte
+      if (this.nextShoot(true)) {
+        keys.push(shootKey);
+        this.guardian.hypotheses.attempt(nearest.key, this.stepIndex);
+        this.pendingSecretShot = { key: nearest.key, roomId: wram.roomId, bx: sp.bx, by: sp.by };
+        if (aimUp && shape.gapPx > 10 && this.nextJump(true, shape.holdTicks)) keys.push(jumpKey);
+        const attempts = this.guardian.hypotheses.get(nearest.key)?.attempts ?? 1;
+        return this.makeMetroidAction(
+          'COLLECT',
+          keys,
+          // pulo curto = tick curto: é o `time` que devolve resolução ao aperto do botão
+          aimUp ? Math.max(50, Math.min(160, shape.holdMs)) : 95,
+          'run',
+          motionPct,
+          'Caminho Secreto · Atirar',
+          `Atirando no bloco falso em (${sp.bx},${sp.by}) · tentativa ${attempts}/3${attempts >= 3 ? ' — próxima vira "parede", não alvo' : ''}`,
+          wram,
+        );
+      }
       return this.makeMetroidAction(
         'COLLECT',
         keys,
-        130,
+        60,
         'run',
-        0,
-        'Caminho Secreto · Atirar',
-        `Atirando no bloco falso em (${sp.bx},${sp.by}) para revelar passagem`,
+        motionPct,
+        'Caminho Secreto · Mirando',
+        `Alinhando o tiro no bloco falso em (${sp.bx},${sp.by})`,
         wram,
       );
     }
 
-    // Se não está perto, se aproxima
-    const keys: AIKey[] = [sp.x >= wram.samusX ? 'RIGHT' : 'LEFT', wram.controls.run];
-    if (this.nextJump(true, 3)) keys.push(wram.controls.jump);
+    // Se não está perto, se aproxima — com o pulo dimensionado pelo vão (F: "erro de pulo"
+    // vinha do aperto fixo de 3 ticks: curto demais para plataforma alta, alto demais para
+    // ajuste de borda, e sem encadear quando o vão passava do pulo simples)
+    this.chargeSecretApproach(nearest.key, dist, wram.roomId, sp.bx, sp.by);
+    const keys: AIKey[] = [sp.x >= wram.samusX ? 'RIGHT' : 'LEFT', dashKey];
+    const shape = this.guardian.jumpHold(sp.y, wram.samusY, this.isSamusGrounded(wram));
+    if (this.nextJump(true, shape.holdTicks)) keys.push(jumpKey);
     return this.makeMetroidAction(
       'COLLECT',
       keys,
-      125,
+      Math.max(55, Math.min(140, shape.holdMs)),
       'run',
-      0,
+      motionPct,
       'Caminho Secreto · Aproximando',
-      `Indo até bloco falso em (${sp.bx},${sp.by})`,
+      `Indo até bloco falso em (${sp.bx},${sp.by}) · ${shape.why}`,
       wram,
     );
+  }
+
+  /**
+   * Orçamento de APREXIMAÇÃO de um alvo de bloco falso. Caminhar até o bloco é parte da aposta,
+   * não um prelúdio grátis: no playtest refeito a Samus passou 16.597 ticks em "Indo até bloco
+   * falso em (47,13)" encostada na parede direita da sala 0x8b5a — o tiro nunca era disparado,
+   * então nenhuma tentativa era contabilizada e a aposta nunca morria. Cada janela de 40 ticks
+   * sem fechar 10 px de distância custa uma vida da hipótese; esgotado o orçamento, a célula vira
+   * `unbreakableGates` e para de ser alvo.
+   */
+  private secretApproach = new Map<string, { dist: number; tick: number }>();
+
+  /** devolve true quando a aproximação do alvo perdeu a última vida (alvo morto) */
+  private chargeSecretApproach(key: string, dist: number, roomId: number, bx: number, by: number): boolean {
+    const prev = this.secretApproach.get(key);
+    if (!prev) {
+      if (this.secretApproach.size > 64) this.secretApproach.clear();
+      this.secretApproach.set(key, { dist, tick: this.stepIndex });
+      return false;
+    }
+    if (dist <= prev.dist - 10) {
+      this.secretApproach.set(key, { dist, tick: this.stepIndex });
+      return false;
+    }
+    if (this.stepIndex - prev.tick < 40) return false;
+    this.secretApproach.set(key, { dist, tick: this.stepIndex });
+    this.guardian.hypotheses.attempt(key, this.stepIndex);
+    this.guardian.hypotheses.settle(key, false, this.stepIndex);
+    if (this.guardian.hypotheses.isDead(key)) {
+      this.secretApproach.delete(key);
+      this.unbreakableGates.add(cellKey(roomId, bx, by));
+      this.getOrCreateRoom(roomId).secretPaths.delete(`${bx}:${by}`);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Encostar é o que coleta o parasita X (atirar nele destrói a cura). Caminha até o X solto —
+   * ou até o ponto onde o inimigo caiu, se o X já flutuou para fora da tela — sem atirar, e o
+   * `PreyChaser` fecha a janela quando vida/munição voltaram ou quando o prazo venceu. O vão
+   * vertical usa o mesmo `JumpModulator` da navegação: sem pulo na altura certa a coleta
+   * vira "pular no lugar" outra vez.
+   */
+  private executeParasiteAbsorb(
+    wram: MetroidWramSnapshot,
+    motionPct: number,
+    intent:
+      | { kind: 'ABSORB'; slot: number; dir: 'LEFT' | 'RIGHT'; aim: 'UP' | 'DOWN' | null }
+      | { kind: 'SWEEP_LOOT'; x: number; y: number; dir: 'LEFT' | 'RIGHT' },
+  ): AIAction | null {
+    const { run: dashKey, jump: jumpKey } = wram.controls;
+    const keys: AIKey[] = [intent.dir, dashKey];
+    if (intent.kind === 'ABSORB' && intent.aim) keys.push(intent.aim);
+    const targetY = intent.kind === 'SWEEP_LOOT' ? intent.y : wram.samusY;
+    const shape = this.guardian.jumpHold(targetY, wram.samusY, this.isSamusGrounded(wram));
+    if (shape.gapPx > 8 && this.nextJump(true, shape.holdTicks)) keys.push(jumpKey);
+    return this.makeMetroidAction(
+      'COLLECT',
+      keys,
+      Math.max(45, Math.min(120, shape.holdMs)),
+      'run',
+      motionPct,
+      intent.kind === 'ABSORB' ? 'Coleta · absorvendo parasita X' : 'Coleta · varrendo o ponto do abate',
+      intent.kind === 'ABSORB'
+        ? 'Encostando no X solto (atirar nele jogaria a cura fora)'
+        : 'Procurando o X liberado pelo abate antes de voltar a andar',
+      wram,
+    );
+  }
+
+  /**
+   * SELECT é um seletor ROTATIVO: um toque e "torcer" só funciona para míssil. Este helper dá
+   * ao caminho de porta a mesma disciplina que o codex de chefes já tinha — conta toques, sabe
+   * quantas casas o HUD tem e desiste quando a volta não achou o slot (HUD de hack), em vez de
+   * pingar SELECT para sempre.
+   */
+  private slotPlanFor(
+    wram: MetroidWramSnapshot,
+    need: string,
+  ): { tap: boolean; restore: boolean; gaveUp: boolean; want: number; why: string } {
+    const want: 0 | 1 | 2 | 3 =
+      need === 'MISSILES' ? 1 : need === 'SUPERS' ? 2 : need === 'POWER_BOMBS' ? 3 : 0;
+    const hasSpecial =
+      want === 1
+        ? wram.maxMissiles > 0 && wram.missiles > 0
+        : want === 2
+          ? wram.maxSupers > 0 && wram.supers > 0
+          : want === 3
+            ? wram.maxPowerBombs > 0 && wram.powerBombs > 0
+            : false;
+    const step = this.guardian.slots.plan(this.stepIndex, wram.selectedHudItem as 0 | 1 | 2 | 3, want, hasSpecial);
+    return { tap: step.tapSelect, restore: step.restoreBeam, gaveUp: step.gaveUp, want, why: step.why };
   }
 
   // Verifica se Samus está perto o suficiente para interagir com um objeto
@@ -4470,6 +4871,10 @@ export class LocalVisionAgent {
     if (wram.gameState === 0x0b) {
       this.resetUSearch();
       this.jumpHoldRemaining = 0;
+      // Medido no playtest: SOLTA-LA no meio do scroll é pior — o estado 0x0b deste hack só
+      // anda com a tecla da porta pressionada (67 % → 83 % dos ticks dentro do estado quando o
+      // direcional foi liberado). Então a tecla fica; o que muda é o primeiro tick DEPOIS da
+      // transição (ver `entryDoorCalmTicks` em `syncRoomAndProgress`).
       return this.makeMetroidAction(
         'EXPLORE',
         [this.moveDir],
@@ -4569,7 +4974,7 @@ export class LocalVisionAgent {
       this.roomsWithPowerIssue.add(wram.roomId);
     }
 
-    const nearbyEnemy = activeEnemies
+    let nearbyEnemy = activeEnemies
       .map((e) => ({ ...e, dist: Math.hypot(e.x - wram.samusX, e.y - wram.samusY) }))
       .filter((e) => {
         if (e.hp <= 0) return false;
@@ -4588,6 +4993,48 @@ export class LocalVisionAgent {
       })
       .sort((a, b) => a.dist - b.dist)[0];
 
+    // ─── alvo travado + parasita X (objetivo 2 do pedido) ────────────────────────────────
+    // Dois erros que o playtest mostrou: (1) o alvo era re-escolhido a cada tick por distância,
+    // então dois inimigos no mesmo canto viravam tiro em nada; (2) não existia o conceito de
+    // "encostar no X que o abate soltou" — em *X-Fusion* isso É a cura e a munição, e atirar
+    // nele joga fora. `PreyChaser` resolve os dois: lock-on por `slot` com prazo, prioridade
+    // absoluta ao X solto (andar, nunca atirar) e varredura do ponto do abate enquanto houver
+    // vida/munição a recuperar.
+    const preyIntent = this.guardian.prey.decide(
+      this.stepIndex,
+      activeEnemies.map((e) => ({
+        slot: e.slot,
+        x: e.x,
+        y: e.y,
+        hp: e.hp,
+        xRadius: e.xRadius,
+        yRadius: e.yRadius,
+        // hitbox pequena e perto do corpo = X solto (ele não tem "vida" de inimigo)
+        fromKill: e.xRadius <= 12 && e.yRadius <= 12 && Math.hypot(e.x - wram.samusX, e.y - wram.samusY) < 120,
+      })),
+      { x: wram.samusX, y: wram.samusY },
+      {
+        wantFight: !this.escortActive && !metroidLarva && !saxPursuer && !bossEngaged,
+        needHeal: wram.maxHealth > 0 && wram.health < wram.maxHealth * 0.98,
+        // "preciso de munição" = está BAIXA, não "não está no talo". Caçar X com 40/40 mísseis
+        // é gastar a sala em nada; o ganho real aparece quando o estoque ameaça acabar.
+        needAmmo:
+          (wram.maxMissiles > 0 && wram.missiles <= Math.floor(wram.maxMissiles / 4)) ||
+          (wram.maxSupers > 0 && wram.supers === 0) ||
+          (wram.maxPowerBombs > 0 && wram.powerBombs === 0),
+        maxHealth: wram.maxHealth,
+      },
+    );
+    if (preyIntent.kind === 'ABSORB' || preyIntent.kind === 'SWEEP_LOOT') {
+      const absorb = this.executeParasiteAbsorb(wram, motionPct, preyIntent);
+      if (absorb) return absorb;
+    } else if (preyIntent.kind === 'ENGAGE') {
+      const locked = activeEnemies.find((e) => e.slot === preyIntent.slot);
+      if (locked) {
+        nearbyEnemy = { ...locked, dist: Math.hypot(locked.x - wram.samusX, locked.y - wram.samusY) };
+      }
+    }
+
     // Se um item não foi alcançado após 42 ticks, registra para backtracking futuro
     if (activeItem && this.itemChaseTicks >= 42) {
       this.addPendingTarget({
@@ -4601,7 +5048,7 @@ export class LocalVisionAgent {
       this.moveDir = activeItem.x >= wram.samusX ? 'LEFT' : 'RIGHT';
       this.anchorX = wram.samusX;
       this.anchorY = wram.samusY;
-      this.progressStallTicks = 0;
+      this.forgiveStall();
     }
 
     // Limpa pendência alcançada na sala atual
@@ -4825,22 +5272,33 @@ export class LocalVisionAgent {
     );
 
     // Detecção de loop com escape forçado
-    const forcedEscape = this.checkForcedEscape(wram);
-    if (forcedEscape && this.loopDetected && this.forcedEscapeDir) {
+    // Estagnação → escada de escape. `MAP_READ` não devolve teclas daqui: ele arma
+    // `forceMapReadTicks` e deixa o `mapConsultStep` abrir o mapa (ele tem a máquina de
+    // abrir/ler/varrer/fechar, que não é para duplicar aqui).
+    const escape = this.updateEscapeLadder(wram);
+    // um pedido de leitura de mapa pendente tem prioridade sobre o corpo do escape: o degrau
+    // MAP_READ não devolve teclas de propósito (quem abre o menu é o `mapConsultStep`, com a
+    // máquina de abrir/varrer/fechar). Sem esta cessão, o BLOCK_ROOM engolia a janela e o
+    // START atrasava 100+ ticks (a simulação de navegação pegou: tick 438 em vez de <420).
+    if (escape.engaged && escape.dir && this.forceMapReadTicks <= 0) {
       const { jump: jumpKey, run: dashKey, shoot: shootKey } = wram.controls;
-      const escapeDir: AIKey = this.forcedEscapeDir;
-      const keys: AIKey[] = [escapeDir, dashKey];
-      if (this.nextJump(true, 3)) keys.push(jumpKey);
-      if (this.nextShoot(true)) keys.push(shootKey);
-      this.stuckInRoomTicks++;
+      const keys: AIKey[] = [escape.dir, dashKey];
+      // varrer com tiro é o jeito humano de achar vão em parede cega; no impulso não atira,
+      // para não gastar munição nem grudar num novo alvo
+      if (escape.rung === 'SWEEP' || escape.rung === 'REVERSE_PUSH') keys.push(shootKey);
+      if (escape.jump) {
+        const shape = this.guardian.jumpHold(wram.samusY - 52, wram.samusY, this.isSamusGrounded(wram));
+        if (this.nextJump(true, shape.holdTicks)) keys.push(jumpKey);
+      }
       return this.makeMetroidAction(
         'EXPLORE',
         keys,
-        160,
+        // impulso é um toquezinho; o resto anda no cadência normal
+        escape.rung === 'NUDGE' ? 55 : 120,
         'run',
         motionPct,
-        'Escape Forçado · Loop Detectado',
-        `Forçando saída da sala (stuck=${this.stuckInRoomTicks} ticks, dir=${this.forcedEscapeDir})`,
+        `Escape · ${escape.rung}`,
+        `${escape.reason} · travada há ${this.guardian.sentinel.current.stallTicks} ticks na sala 0x${wram.roomId.toString(16)} (${escape.durationTicks} ticks de degrau)`,
         wram,
       );
     }
@@ -4950,7 +5408,7 @@ export class LocalVisionAgent {
           secretPathPending &&
           (wram.itemsMask & 0x8000) !== 0
         ) {
-          const secretAction = this.executeSecretPathTest(wram);
+          const secretAction = this.executeSecretPathTest(wram, motionPct);
           if (secretAction) return secretAction;
         }
         return this.executeCollectState(motionPct, wram, activeItem ?? null, unlockedLabel);
@@ -5964,7 +6422,7 @@ export class LocalVisionAgent {
       this.moveDir = targetDir;
       this.anchorX = wram.samusX;
       this.anchorY = wram.samusY;
-      this.progressStallTicks = 0;
+      this.forgiveStall();
       this.missileProbeCount = 0;
       this.resetUSearch(6);
       return this.makeMetroidAction(
@@ -6079,7 +6537,7 @@ export class LocalVisionAgent {
     this.moveDir = oppDir;
     this.anchorX = wram.samusX;
     this.anchorY = wram.samusY;
-    this.progressStallTicks = 0;
+    this.forgiveStall();
     this.jumpHoldRemaining = 0;
     this.resetUSearch(10);
 
@@ -6130,6 +6588,9 @@ export class LocalVisionAgent {
     if (
       !this.bossEngagedThisTick &&
       wram.selectedHudItem !== 0 &&
+      // o driver de slot é dono da seleção: enquanto um pedido está armado (SELECT girado à
+      // espera do HUD bater), desfazer aqui devolvia o tiro para o feixe e a porta não abria
+      !this.guardian.slots.armed(this.stepIndex) &&
       (this.progressStallTicks < 14 || this.progressStallTicks > 20 || this.missileProbeCount >= 2)
     ) {
       return this.makeMetroidAction('EXPLORE', [this.moveDir, cancelKey], 120, 'run', motionPct, 'Exploração · Feixe principal', 'Retornando ao feixe principal', wram);
@@ -6145,7 +6606,7 @@ export class LocalVisionAgent {
       this.moveDir = oppDir;
       this.anchorX = wram.samusX;
       this.anchorY = wram.samusY;
-      this.progressStallTicks = 0;
+      this.forgiveStall();
       this.jumpHoldRemaining = 0;
       return this.makeMetroidAction(
         'EXPLORE',
@@ -6169,6 +6630,14 @@ export class LocalVisionAgent {
       if (d.blockedByWall && !isTimedEscape) continue;
       const rec = currNode.doors.get(d.key);
       if (rec?.locked && !isTimedEscape) continue;
+      // o veto de ping-pong precisa valer também aqui: `navTarget` é filtrado, mas a lista de
+      // portas-alvo da sala é o que realmente guia o passo — filtrar só o alvo deixava ela andar
+      // até o batente proibido do mesmo jeito e atravessar (foi o que o playtest mostrou: o laço
+      // apenas mudou de par de salas, 0x8B7D/0x8BBB → 0x8BF9/0x8C37)
+      const linkedRoom = currNode.doorLinks.get(d.key);
+      if (linkedRoom !== undefined && linkedRoom !== wram.roomId && this.bounceBanned(wram.roomId, linkedRoom)) {
+        continue;
+      }
 
       let priority = 3;
       if (!rec || rec.targetRoomId === undefined) {
@@ -6187,7 +6656,19 @@ export class LocalVisionAgent {
     // porta que não abre agora (cor/munição) sai do caminho
     this.applyNavBiasToDoorTargets(wram, doorTargets);
 
-    const pathStep = this.planPathInRoom(wram, doorTargets);
+    let pathStep = this.planPathInRoom(wram, doorTargets);
+    // veto de chegada: o plano não pode ser "voltar pela porta por onde ela acabou de entrar"
+    if (
+      pathStep &&
+      this.entryCalm &&
+      this.stepIndex < this.entryCalm.until &&
+      this.entryCalm.roomId === wram.roomId &&
+      pathStep.dir === this.entryCalm.forbid &&
+      Math.hypot(wram.samusX - this.entryCalm.x, wram.samusY - this.entryCalm.y) < 88
+    ) {
+      pathStep = null;
+    }
+    if (this.entryCalm && this.stepIndex >= this.entryCalm.until) this.entryCalm = null;
     if (pathStep) {
       this.activeDoorKey = pathStep.goalKey;
     }
@@ -6284,7 +6765,7 @@ export class LocalVisionAgent {
         this.moveDir = oppDir;
         this.anchorX = wram.samusX;
         this.anchorY = wram.samusY;
-        this.progressStallTicks = 0;
+        this.forgiveStall();
         const keys: AIKey[] = [oppDir, dashKey];
         if (hasSpaceJump && !ceilingLow && this.stepIndex % 2 === 0) keys.push(jumpKey);
         return this.makeMetroidAction('EXPLORE', keys, 150, 'run', motionPct, isTimedEscape ? 'Fuga · Contornando obstáculo' : 'Exploração · Invertendo rota', 'Desviando de obstáculo na rota de fuga', wram);
@@ -6324,6 +6805,36 @@ export class LocalVisionAgent {
       const wpX = pathStep.wpBx * 16 + 8;
       const wpY = pathStep.wpBy * 16 + 8;
       const nearDoor = targetDoor && Math.hypot(targetDoor.x - wram.samusX, targetDoor.y - wram.samusY) <= 56;
+      if (nearDoor && targetDoor) {
+        const attemptKey = `${wram.roomId}:${targetDoor.key}`;
+        this.doorAttempt = { key: attemptKey, ticks: this.doorAttempt.key === attemptKey ? this.doorAttempt.ticks + 1 : 1 };
+        // 120 ticks (~15 s de jogo a 8 decisões/s) cobrem com folga o scroll de abertura + 3
+        // projéteis + uma volta de slot. Passou disso, a premissa "esta porta abre agora" caiu.
+        if (this.doorAttempt.ticks === 120) {
+          const rec = this.getOrCreateRoom(wram.roomId).doors.get(targetDoor.key);
+          if (rec) rec.locked = true;
+          this.doorAttempt = { key: '', ticks: 0 };
+          this.activeDoorKey = null;
+          this.moveDir = this.moveDir === 'RIGHT' ? 'LEFT' : 'RIGHT';
+          this.anchorX = wram.samusX;
+          this.anchorY = wram.samusY;
+          this.forgiveStall();
+          this.forceMapReadTicks = 12;
+          this.replan(wram);
+          return this.makeMetroidAction(
+            'EXPLORE',
+            [this.moveDir, dashKey],
+            150,
+            'run',
+            motionPct,
+            'Exploração · Porta desistida',
+            '120 ticks na soleira sem a porta abrir · marcada como trancada e rota refeita',
+            wram,
+          );
+        }
+      } else if (this.doorAttempt.ticks > 0) {
+        this.doorAttempt = { key: '', ticks: 0 };
+      }
       const floorBelowT = this.resolveBlockType(wram, samusBx, samusBy + 1);
       const bombFloorUnderFoot =
         (pathStep.bomb || (pathStep.drop && floorBelowT === 0xf)) &&
@@ -6342,17 +6853,21 @@ export class LocalVisionAgent {
         const canAfford = gateCheck.openableNow || gate.need === 'BOMB_OR_BEAM';
         const keys: AIKey[] = [];
 
-        // 1) Selecionar munição adequada se a porta precisa e não está selecionada
-        if (needsAmmoNow && !canAfford && wram.selectedHudItem === 0) {
-          keys.push(selectKey);
+        // 1) Selecionar munição adequada se a porta precisa e não está selecionada. Comporta
+        // verde é SUPER míssil (slot 2) e amarela é power bomb (slot 3) — um toque só de SELECT
+        // nunca chega lá, e o tiro saía com o feixe (que é o "gastei 30 tiros e nada" do
+        // relatório). O driver gira até o slot certo e desiste se o HUD não tiver a casa.
+        const slot = this.slotPlanFor(wram, gate.need);
+        if (needsAmmoNow && !canAfford && (slot.tap || slot.restore)) {
+          keys.push(slot.tap ? selectKey : wram.controls.cancel);
           return this.makeMetroidAction(
             'EXPLORE',
             [...keys, 'UP'],
-            130,
+            110,
             'run',
             motionPct,
             'Exploração · Porta acima · selecionar munição',
-            `Porta acima (${doorColor}) · selecionando munição no HUD`,
+            `Porta acima (${doorColor}) · ${slot.why}`,
             wram,
           );
         }

@@ -49,18 +49,30 @@ export const KEYBOARD_MAP: Record<Exclude<AIKey, 'NONE'>, { key: string; code: s
   R: { key: 'e', code: 'KeyE', keyCode: 69, ejsIndex: 11 },
 };
 
-const CAPTURE_W = 240;
-const CAPTURE_H = 160;
+// 240×160 é a tela do GBA. O SNES é 256×224: com as constantes antigas, o letterbox jogava
+// ~24% das colunas (29+28 px) dentro da grade de análise como barra preta — os métricos de
+// movimento/contraste ficavam diluídos e o mapa do jogo perdia resolução. Passamos a casar o
+// tamanho do core; o agente lê width/height do frame, então nada mais precisa saber disso.
+const CAPTURE_W = 256;
+const CAPTURE_H = 224;
+const CAPTURE_GBA_W = 240;
+const CAPTURE_GBA_H = 160;
+
+function captureSize(): { w: number; h: number } {
+  if (typeof window === 'undefined') return { w: CAPTURE_W, h: CAPTURE_H };
+  return window.EJS_core === 'gba' ? { w: CAPTURE_GBA_W, h: CAPTURE_GBA_H } : { w: CAPTURE_W, h: CAPTURE_H };
+}
 
 let offscreenCanvas: HTMLCanvasElement | null = null;
 let offscreenCtx: CanvasRenderingContext2D | null = null;
 let currentHeldKeys = new Set<Exclude<AIKey, 'NONE'>>();
 
 function ensureOffscreenCanvas(): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } {
-  if (!offscreenCanvas || !offscreenCtx) {
+  const size = captureSize();
+  if (!offscreenCanvas || !offscreenCtx || offscreenCanvas.width !== size.w || offscreenCanvas.height !== size.h) {
     offscreenCanvas = document.createElement('canvas');
-    offscreenCanvas.width = CAPTURE_W;
-    offscreenCanvas.height = CAPTURE_H;
+    offscreenCanvas.width = size.w;
+    offscreenCanvas.height = size.h;
     offscreenCtx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
   }
   if (!offscreenCtx) {
@@ -132,6 +144,41 @@ export function setHeldGameInputs(nextKeys: AIKey[]): void {
     }
   }
   currentHeldKeys = target;
+}
+
+/**
+ * Lê o estado do núcleo com TTL. `getState()` do EmulatorJS **serializa o estado inteiro**
+ * (alguns MB): chamado a cada decisão, no mesmo frame do render, é a maior fonte de jitter do
+ * laço — e a IA local só precisa das posições/HP/portas, que não mudam entre dois frames
+ * seguidos. Um cache de ~90 ms corta ~95% desses pedidos sem perder informação relevante.
+ */
+let ramCache: { at: number; data: Uint8Array } | null = null;
+let ramCacheTtl = 0;
+
+export function invalidateRamCache(): void {
+  ramCache = null;
+}
+
+export async function readEmulatorRam(ttlMs = 0): Promise<Uint8Array | null> {
+  const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  if (ramCache && now - ramCache.at <= Math.max(ttlMs, ramCacheTtl)) return ramCache.data;
+  const gm = getEmulatorGameManager();
+  if (!gm || typeof gm.getState !== 'function') return null;
+  try {
+    const raw = await Promise.resolve(gm.getState());
+    if (!raw) return null;
+    const data = raw instanceof Uint8Array ? raw : new Uint8Array(raw as ArrayBuffer);
+    ramCache = { at: now, data };
+    ramCacheTtl = ttlMs;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+/** carregar save state / reset: o cache tem que morrer junto, senão a IA lê o mundo antigo */
+export function primeRamCacheAfterStateChange(): void {
+  invalidateRamCache();
 }
 
 export function destroyEmulator(): void {
@@ -305,10 +352,55 @@ export async function captureGameFrame(options: CaptureFrameOptions = {}): Promi
   }
 
   const { canvas, ctx } = ensureOffscreenCanvas();
+  const CAPTURE_W = canvas.width;
+  const CAPTURE_H = canvas.height;
   const gm = getEmulatorGameManager();
   const skipJpeg = Boolean(options.skipJpeg);
 
-  if (gm && typeof gm.screenshot === 'function') {
+  // Ordem do caminho de captura: `gameManager.screenshot()` devolve PNG, que ainda precisa de
+  // `createImageBitmap` para virar pixel — um encode + decode de imagem por decisão, no thread
+  // do render. O `drawImage` direto do canvas do jogo (com o patch de preserveDrawingBuffer)
+  // entrega os mesmos pixels sem passar por codec nenhum, então ele vem primeiro e o PNG fica
+  // como reserva (núcleos que não expõem o canvas, e.g. hardware renderer sem leitura).
+  let directOk = false;
+  {
+    const canvases = Array.from(document.querySelectorAll<HTMLCanvasElement>('#emulator-mount canvas'));
+    const source = canvases.sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0];
+    if (source && source.width && source.height) {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, CAPTURE_W, CAPTURE_H);
+      const scale = Math.min(CAPTURE_W / source.width, CAPTURE_H / source.height);
+      const w = Math.max(1, Math.round(source.width * scale));
+      const h = Math.max(1, Math.round(source.height * scale));
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(source, Math.round((CAPTURE_W - w) / 2), Math.round((CAPTURE_H - h) / 2), w, h);
+      const rgba = ctx.getImageData(0, 0, CAPTURE_W, CAPTURE_H).data;
+      let sig = '';
+      for (let i = 0; i < rgba.length; i += 1024) sig += rgba[i] + ',';
+      // frame preto = canvas sem conteúdo legível (preserveDrawingBuffer não aplicado): cai no PNG
+      let nonBlack = false;
+      for (let i = 0; i < rgba.length; i += 4096) {
+        if (rgba[i] || rgba[i + 1] || rgba[i + 2]) { nonBlack = true; break; }
+      }
+      if (nonBlack) {
+        directOk = true;
+        const freshFrame: CapturedFrame = {
+          base64Jpeg: skipJpeg ? '' : canvas.toDataURL('image/jpeg', 0.55).split(',')[1] ?? '',
+          width: CAPTURE_W,
+          height: CAPTURE_H,
+          rgba,
+          signature: sig,
+          source: 'canvas.drawImage',
+          fresh: true,
+        };
+        cachedFrame = freshFrame;
+        cachedFrameAt = now;
+        return freshFrame;
+      }
+    }
+  }
+
+  if (!directOk && gm && typeof gm.screenshot === 'function') {
     try {
       const raw = await gm.screenshot();
       if (raw && raw.length > 0) {
