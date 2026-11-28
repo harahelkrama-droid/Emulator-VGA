@@ -18,6 +18,7 @@ import {
   JumpModulator,
   SlotDriver,
   PreyChaser,
+  DoorAttemptBudget,
   cellKey,
   targetKey,
   type SentinelInput,
@@ -385,6 +386,52 @@ section('I. pacing: ida e volta pela sala não é progresso');
     airStall = Math.max(airStall, v.stallTicks);
   }
   check('parada no ar também conta travamento (soleira de porta não é ponto cego)', airStall >= 150, `máx=${airStall}`);
+}
+
+section('J. DoorAttemptBudget: a soleira tem prazo, e piscar o sensor não dá anistia');
+{
+  const b = new DoorAttemptBudget(120);
+  let fired = 0;
+  for (let t = 0; t < 119; t++) if (b.feed(t, 0x8cb3, 'RIGHT@13:9')) fired++;
+  check('119 ticks na mesma porta não desistem ainda', fired === 0, `${fired}`);
+  check('o 120º tick dá o prazo por encerrado', b.feed(119, 0x8cb3, 'RIGHT@13:9') === true);
+  check('e a porta fica registrada no estado para a UI', b.state.doorKey === '36019:RIGHT@13:9', b.state.doorKey);
+  // A REGRESSÃO QUE ESTA CLASSE NASCEU PARA MATAR: o contador inline comparava `=== 120` e
+  // zerava ao sair da soleira. Uma piscada do "near door" a cada 2 ticks e o prazo nunca vencia
+  // — foram 9.160 ticks sentado em 0x8CB3 x=216.
+  const flicker = new DoorAttemptBudget(120);
+  let flickerFired = 0;
+  for (let t = 0; t < 600; t++) {
+    const near = t % 2 === 0 ? 'RIGHT@13:9' : null;
+    if (flicker.feed(t, 0x8cb3, near)) flickerFired++;
+  }
+  check('com o sensor piscando a cada outro tick, o prazo ainda vence', flickerFired >= 1, `${flickerFired} disparos`);
+  // sair de verdade (ir procurar outra porta) não pode acumular dívida para sempre
+  const away = new DoorAttemptBudget(120);
+  for (let t = 0; t < 100; t++) away.feed(t, 0x8cb3, 'RIGHT@13:9');
+  for (let t = 100; t < 140; t++) away.feed(t, 0x8cb3, null);
+  check('40 ticks fora da soleira apagam a conta (ela foi fazer outra coisa)', away.state.ticks === 0, `${away.state.ticks}`);
+  // porta nova = aposta nova; não herda o fracasso da anterior
+  const other = new DoorAttemptBudget(120);
+  for (let t = 0; t < 119; t++) other.feed(t, 0x8cb3, 'RIGHT@13:9');
+  for (let t = 119; t < 130; t++) other.feed(t, 0x8cb3, 'LEFT@1:9');
+  check('trocar de porta reinicia o orçamento (a culpa não é da nova porta)', other.state.ticks === 11, `${other.state.ticks}`);
+  {
+    const once = new DoorAttemptBudget(3);
+    for (let t = 0; t < 2; t++) once.feed(t, 1, 'K');
+    const first = once.feed(3, 1, 'K');
+    const second = once.feed(4, 1, 'K');
+    check('o `feed` devolve `true` uma vez só por porta (sem spam de desistência)', first === true && second === false, `${first}/${second}`);
+    check('e o estado declara que aquela porta já foi dada por perdida', once.gaveUp === true);
+  }
+  {
+    // janela de tolerância: 8 ticks fora não jogam fora 119 ticks dentro
+    const grace = new DoorAttemptBudget(120);
+    for (let t = 0; t < 119; t++) grace.feed(t, 1, 'K');
+    for (let t = 119; t < 125; t++) grace.feed(t, 1, null);
+    check('ausência curta preserva a conta acumulada', grace.state.ticks === 119, `${grace.state.ticks}`);
+  }
+  check('o guardião expõe o estado no snapshot (a UI mostra a tentativa)', 'doorAttempt' in new ActionGuardian().snapshot());
 }
 
 console.log(

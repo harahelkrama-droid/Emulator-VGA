@@ -267,6 +267,8 @@ export interface AIStatusSnapshot {
     jump: { holdFrames: number; gapPx: number };
     slot: { taps: number; gaveUp: boolean; ownedSlots: number };
     lockedTarget: number | null;
+    /** tentativa de porta: há quantos ticks ela está na soleira desta porta (limite = budget) */
+    doorAttempt: { doorKey: string; ticks: number; budget: number };
     inventoryTrusted: boolean;
     inventoryIssue: string | null;
   };

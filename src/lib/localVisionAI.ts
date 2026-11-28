@@ -273,19 +273,10 @@ export class LocalVisionAgent {
    * travessia re-dispara. Custa 2,4 s e economiza a sessão inteira (ver `bounceTally`).
    */
   private entryCalm: { roomId: number; forbid: 'LEFT' | 'RIGHT'; until: number; x: number; y: number } | null = null;
-  /**
-   * Orçamento da TENTATIVA DE PORTA. Ficar na soleira atirando/girando slot sem a sala trocar não
-   * é progresso — é o estado em que a sessão de 25 min terminou: 9.160 ticks (79 % do tempo) em
-   * 0x8CB3 x=216 com `Abrindo porta (RIGHT)`, e o sentinela mudo porque o chão daquela soleira é
-   * lido como "no ar". Um humano atira, gira o slot, espera o scroll e, se nada acontece, trata a
-   * porta como trancada e procura outra. É o que este orçamento faz.
-   */
-  private doorAttempt = { key: '', ticks: 0 };
   private roomChain: number[] = [];
   private bounceTally = new Map<string, { n: number; tick: number }>();
   /** aresta proibida como destino de alvo: `${from}->${to}` → até quando */
   private bounceBan = new Map<string, number>();
-  /** ticks consecutivos dentro do estado de transição de porta (0x0b) */
 
   private entryDoorKey: string | null = null;
   private activeDoorKey: string | null = null;
@@ -2875,6 +2866,7 @@ export class LocalVisionAgent {
           jump: g.jump,
           slot: g.slot,
           lockedTarget: g.lock.lockedSlot,
+          doorAttempt: g.doorAttempt,
           inventoryTrusted: wram ? wram.inventoryTrusted : true,
           inventoryIssue: wram ? wram.inventoryIssue : null,
         };
@@ -6805,15 +6797,16 @@ export class LocalVisionAgent {
       const wpX = pathStep.wpBx * 16 + 8;
       const wpY = pathStep.wpBy * 16 + 8;
       const nearDoor = targetDoor && Math.hypot(targetDoor.x - wram.samusX, targetDoor.y - wram.samusY) <= 56;
-      if (nearDoor && targetDoor) {
-        const attemptKey = `${wram.roomId}:${targetDoor.key}`;
-        this.doorAttempt = { key: attemptKey, ticks: this.doorAttempt.key === attemptKey ? this.doorAttempt.ticks + 1 : 1 };
+      {
         // 120 ticks (~15 s de jogo a 8 decisões/s) cobrem com folga o scroll de abertura + 3
         // projéteis + uma volta de slot. Passou disso, a premissa "esta porta abre agora" caiu.
-        if (this.doorAttempt.ticks === 120) {
+        // A contagem mora em `DoorAttemptBudget` (pureza + teste em `guardianCheck`): a versão
+        // inline comparava `ticks === 120` e zerava ao sair da soleira, então uma piscada de
+        // "near door" a cada 2 ticks bastava para o orçamento nunca disparar.
+        const giveUp = this.guardian.doorBudget.feed(this.stepIndex, wram.roomId, nearDoor ? (targetDoor?.key ?? null) : null);
+        if (giveUp && targetDoor) {
           const rec = this.getOrCreateRoom(wram.roomId).doors.get(targetDoor.key);
           if (rec) rec.locked = true;
-          this.doorAttempt = { key: '', ticks: 0 };
           this.activeDoorKey = null;
           this.moveDir = this.moveDir === 'RIGHT' ? 'LEFT' : 'RIGHT';
           this.anchorX = wram.samusX;
@@ -6832,8 +6825,6 @@ export class LocalVisionAgent {
             wram,
           );
         }
-      } else if (this.doorAttempt.ticks > 0) {
-        this.doorAttempt = { key: '', ticks: 0 };
       }
       const floorBelowT = this.resolveBlockType(wram, samusBx, samusBy + 1);
       const bombFloorUnderFoot =

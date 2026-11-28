@@ -1041,6 +1041,86 @@ export class PreyChaser {
   }
 }
 
+/* ------------------------------------------------------ DoorAttemptBudget */
+
+/**
+ * Orçamento da tentativa de porta. Ficar na soleira atirando e girando slot **não** é progresso,
+ * e foi assim que a sessão de 25 min terminou: 9.160 ticks (79 % do tempo) em `0x8CB3 x=216`
+ * com `Abrindo porta (RIGHT)`, com o sentinela mudo porque o chão daquela soleira é lido como
+ * "no ar". Um humano atira, gira o slot, espera o scroll e — se nada acontece — trata a porta
+ * como trancada e procura outra. É isto que esta classe decide; quem executa é o agente.
+ *
+ * Dois detalhes que já pegaram regressão:
+ *  - o disparo é `>=` com trava por porta, não `=== N`: se a leitura de "near door" piscar (ela
+ *    sai 5 px da janela e volta), um `=== 120` nunca chega a bater e o orçamento vira enfeite;
+ *  - ausência curta é **janela de tolerância** (não zera, não conta), ausência longa zera. As
+ *    duas versões ingênuas — "decai sempre" e "zera sempre" — foram testadas e reprovariam: a
+ *    primeira dá anistia a cada piscada (o prazo nunca vence), a segunda perdoa o pacing.
+ */
+export class DoorAttemptBudget {
+  private key = '';
+  private ticks = 0;
+  private awayRun = 0;
+  private fired = false;
+
+  /**
+   * @param grace  ausências de até `grace` ticks consecutivos são *janela de tolerância* (o
+   *   sensor "perto da porta" pisca quando ela anda na soleira), não uma saída. Depois disso é
+   *   saída de verdade: a conta é zerada, porque ela foi fazer outra coisa.
+   */
+  constructor(private readonly budget = 120, private readonly grace = 8) {}
+
+  /**
+   * @param doorKey  porta-alvo da sala, ou `null` quando ela não está na soleira de nenhuma
+   * @returns `true` no tick em que se deve desistir da porta (uma vez só por porta)
+   */
+  feed(_tick: number, roomId: number, doorKey: string | null): boolean {
+    // a IDENTIDADE é a porta; a ausência é um estado dela. Trocar isso por "key = '' quando está
+    // fora" faz cada piscada trocar de identidade e o reset apagar a conta — foi exatamente o que
+    // o teste pegou (a janela de tolerância nunca existia).
+    if (doorKey) {
+      const key = `${roomId}:${doorKey}`;
+      if (key !== this.key) {
+        this.key = key;
+        this.ticks = 0;
+        this.awayRun = 0;
+        this.fired = false;
+      }
+    }
+    if (!doorKey) {
+      this.awayRun++;
+      if (this.awayRun > this.grace) {
+        this.ticks = 0;
+        this.fired = false;
+      }
+      return false;
+    }
+    this.awayRun = 0;
+    this.ticks++;
+    if (this.ticks >= this.budget && !this.fired) {
+      this.fired = true;
+      return true;
+    }
+    return false;
+  }
+
+  /** troca de sala / novo jogo */
+  reset(): void {
+    this.key = '';
+    this.ticks = 0;
+    this.awayRun = 0;
+    this.fired = false;
+  }
+
+  get state(): { doorKey: string; ticks: number; budget: number } {
+    return { doorKey: this.key, ticks: this.ticks, budget: this.budget };
+  }
+
+  get gaveUp(): boolean {
+    return this.fired;
+  }
+}
+
 /* -------------------------------------------------------------- facade */
 
 export interface GuardianSnapshot {
@@ -1054,6 +1134,8 @@ export interface GuardianSnapshot {
   deadCount: number;
   slot: { taps: number; gaveUp: boolean; ownedSlots: number };
   lock: { lockedSlot: number | null };
+  /** tentativa de porta: em que porta ela está e há quantos ticks (`budget` = limite) */
+  doorAttempt: { doorKey: string; ticks: number; budget: number };
   jump: { holdTicks: number; holdFrames: number; gapPx: number };
 }
 
@@ -1068,6 +1150,7 @@ export class ActionGuardian {
   readonly jump = new JumpModulator();
   readonly slots = new SlotDriver();
   readonly prey = new PreyChaser();
+  readonly doorBudget = new DoorAttemptBudget();
   private lastJump: JumpShape = { holdTicks: 3, holdFrames: 24, holdMs: 400, release: false, gapPx: 0, why: '' };
 
   reset(): void {
@@ -1077,6 +1160,7 @@ export class ActionGuardian {
     this.jump.reset();
     this.slots.reset();
     this.prey.reset();
+    this.doorBudget.reset();
   }
 
   /** esquece apostas mortas de uma sala quando um item novo a reabre */
@@ -1098,6 +1182,7 @@ export class ActionGuardian {
       deadCount,
       slot: this.slots.state,
       lock: this.prey.state,
+      doorAttempt: this.doorBudget.state,
       jump: {
         holdTicks: this.lastJump.holdTicks,
         holdFrames: this.lastJump.holdFrames,

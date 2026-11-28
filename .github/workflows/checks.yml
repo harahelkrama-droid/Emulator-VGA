@@ -1,0 +1,46 @@
+# Portão da IA. O histórico deste repo tem uma classe de falha que nenhum check anterior pegava:
+# a agente "rodando" há 22 minutos encostada num tijolo, com todas as suítes verdes. O que falta
+# para isso não voltar não é mais teste unitário — é um laço que joga de verdade e é medido.
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  suites:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit -p tsconfig.json
+      - run: npm run check:all
+      - run: npm run build
+
+  # Canário de jogo: 5 min de gameplay autônomo no snes9x WASM + portão §12 (salas visitadas e
+  # travamento sem saída). Não bloqueia PR de propósito — o harness depende de dois pacotes de
+  # core instalados com --no-save e de um ROM de 4 MB no índice; se ele quebrar por ambiente, a
+  # suíte acima continua verde e o problema aparece como falha vermelha aqui, não como PR travado.
+  playtest:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm i --no-save romdev-core-host@0.14.1 romdev-platform-snes@0.12.2
+      - run: npm run check:playtest
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playtest-gate
+          path: playtest/out3/gate.md
+          if-no-files-found: ignore
