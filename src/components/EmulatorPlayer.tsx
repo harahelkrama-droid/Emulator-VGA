@@ -1340,6 +1340,11 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
                   {snapshot.guardian.lockedTarget !== null && (
                     <span className="font-mono-data">alvo travado #{snapshot.guardian.lockedTarget}</span>
                   )}
+                  {snapshot.guardian.doorAttempt.ticks > 0 && (
+                    <span className="font-mono-data">
+                      porta: {snapshot.guardian.doorAttempt.ticks}/{snapshot.guardian.doorAttempt.budget} ticks na soleira
+                    </span>
+                  )}
                   <span className="font-mono-data">
                     apostas mortas: <strong className="text-[#eef3fb]">{snapshot.guardian.deadHypotheses}</strong>
                   </span>

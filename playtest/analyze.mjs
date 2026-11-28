@@ -212,21 +212,35 @@ console.log(lines.join('\n'));
       worstAt = { tick: r.tick, room: r.room, from: prev.tick };
     }
   }
+  // OS LIMIARES ESCALAM COM A JANELA: `npm run check:playtest` roda 5 min de jogo, o relatório
+  // cobrou 25. Fixar "≥5 salas" faria o probe rápido reprovar por comprimento, não por defeito —
+  // e um portão que reclama do tamanho é um portão que vão desligar.
   const gameSec = Math.max(...rows.map((r) => r.gms || 0)) / 1000;
+  const minutes = gameSec / 60;
+  const minRooms = Math.max(3, Math.round(minutes / 4));
+  const maxFrozen = Math.max(240, Math.round(minutes * 10));
   const roomCount = rooms.size;
-  const r1 = roomCount >= 5;
-  const r2 = worstFrozen <= 240;
+  const r1 = roomCount >= minRooms;
+  const r2 = worstFrozen <= maxFrozen;
   const selPct = (keysHit.SELECT || 0) / Math.max(1, rows.length);
   say('## Portão de regressão (§12)');
   say('');
-  say(`- ${r1 ? 'PASS' : 'FAIL'} · R1 salas visitadas: ${roomCount} (mínimo 5 em 25 min)`);
   say(
-    `- ${r2 ? 'PASS' : 'FAIL'} · R2 maior trecho preso (mesma sala, sem 20 px de ganho horizontal, fora de luta de chefe): ${worstFrozen} ticks${worstFrozenAt ? ` @tick ${worstFrozenAt.tick} sala ${worstFrozenAt.room} x=${worstFrozenAt.x}` : ''}`,
+      `- ${r1 ? 'PASS' : 'FAIL'} · R1 salas visitadas: ${roomCount} (mínimo ${minRooms} em ${minutes.toFixed(0)} min)`,
+    );
+  say(
+    `- ${r2 ? 'PASS' : 'FAIL'} · R2 maior trecho preso (mesma sala, sem 20 px de ganho horizontal, fora de luta de chefe): ${worstFrozen} ticks · limite ${maxFrozen}${worstFrozenAt ? ` @tick ${worstFrozenAt.tick} sala ${worstFrozenAt.room} x=${worstFrozenAt.x}` : ''}`,
   );
   say(`- contexto · maior período na mesma sala (em movimento conta): ${worstRun} ticks${worstAt ? ` @sala ${worstAt.room}` : ''}`);
   say(`- contexto · SELECT pressionado em ${(100 * selPct).toFixed(1)}% dos ticks (porta verde/amarela exige girar o slot)`);
   say(`- contexto · decisões por segundo de jogo: ${(rows.length / Math.max(1, gameSec)).toFixed(2)} · custo médio ${mean(rows.map((r) => r.dms || 0)).toFixed(2)} ms/decisão`);
   say(`- contexto · travamento declarado pelo agente: máx ${Math.max(...stuckVals)} ticks, ≥240 em ${stuckVals.filter((s) => s >= 240).length} ticks`);
+  const cdTicks = rows.filter((r) => (r.cd ?? 0) > 0).length;
+  say(
+    `- contexto · ticks com contagem regressiva da área (modo fuga): ${cdTicks}${
+      cdTicks === 0 ? ' · a janela nunca entrou em fuga — o portão NÃO cobre o modo fuga (ver mapAgentSim §M)' : ''
+    }`,
+  );
   say(`- contexto · correções de si mesma registradas: ${Math.max(...rows.map((r) => r.corr ?? 0), 0)}`);
   say(`- contexto · ticks com aperto curto (≤3 frames): ${rows.filter((r) => (r.holdFrames ?? 9) <= 3).length} de ${rows.length} (${pct(rows.filter((r) => (r.holdFrames ?? 9) <= 3).length, rows.length)})`);
   say('');

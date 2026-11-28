@@ -574,8 +574,14 @@ export class EscapeLadder {
     tick: number,
     v: SentinelVerdict,
     roomChanged: boolean,
-    opts: { inCombat: boolean; canReadMap: boolean },
+    opts: { inCombat: boolean; canReadMap: boolean; capStep?: number },
   ): EscapePlan {
+    // teto de degrau: durante a FUGA COM CONTADOR os dois degraus de cima (MAP_READ, BLOCK_ROOM)
+    // são ativamente errados — abrir o menu queima segundos do timer e bloquear a sala no grafo
+    // bloqueia a própria rota de saída. O agente só precisa de quem o tire dali.
+    const cap = Math.max(0, Math.min(4, opts.capStep ?? 4));
+    if (this.step > cap) this.step = cap;
+
     if (roomChanged) {
       this.reset();
       return NONE_PLAN;
@@ -592,7 +598,7 @@ export class EscapeLadder {
       // START atrasava 100+ ticks (tick 438, porta de entrada do teste é 420), no jogo real a
       // sala ficava bloqueada para sempre. Como o `canReadMap` do menu pode FALHAR na primeira
       // subida (ainda não faz 5 s de Save), o ciclo é o que dá a segunda chance.
-      this.step = stillStalled ? (this.step >= 4 ? 1 : this.step + 1) : 0;
+      this.step = stillStalled ? (this.step >= cap ? 1 : this.step + 1) : 0;
       this.rung = 'NONE';
     }
     if (v.stallTicks < 24) {
@@ -610,13 +616,18 @@ export class EscapeLadder {
     const wantStep = clamp(
       v.stallTicks >= 320 ? 4 : v.stallTicks >= 200 ? 3 : v.stallTicks >= 120 ? 2 : v.stallTicks >= 70 ? 1 : 0,
       0,
-      4,
+      cap,
     );
-    this.step = Math.max(this.step, wantStep);
+    // O atalho por severidade só existe para chegar rápido no topo da escada (bloquear a sala e
+    // trocar de rota quando ela está presa há minutos). Sob TETO — a fuga com contador — o topo não
+    // existe: ali o que se quer é o CICLO dos degraus de movimento, não ficar pinado no mais alto
+    // deles (medido: com `max(step, wantStep)` sob capStep=2 a escada virava SWEEP para sempre e
+    // o REVERSE_PUSH, que é o degrau que realmente inverte o empurrão, nunca mais aparecia).
+    this.step = cap < 4 ? Math.min(this.step, cap) : Math.min(cap, Math.max(this.step, wantStep));
 
     const rungs: EscapeRung[] = ['NUDGE', 'REVERSE_PUSH', 'SWEEP', 'MAP_READ', 'BLOCK_ROOM'];
     const rung = rungs[this.step];
-    if (rung === 'MAP_READ' && !opts.canReadMap && this.step < 4) this.step += 1;
+    if (rung === 'MAP_READ' && !opts.canReadMap && this.step < cap) this.step = Math.min(cap, this.step + 1);
     const chosen: EscapeRung = rungs[this.step];
 
     if (this.rung === 'NONE') {
@@ -1041,6 +1052,86 @@ export class PreyChaser {
   }
 }
 
+/* ------------------------------------------------------ DoorAttemptBudget */
+
+/**
+ * Orçamento da tentativa de porta. Ficar na soleira atirando e girando slot **não** é progresso,
+ * e foi assim que a sessão de 25 min terminou: 9.160 ticks (79 % do tempo) em `0x8CB3 x=216`
+ * com `Abrindo porta (RIGHT)`, com o sentinela mudo porque o chão daquela soleira é lido como
+ * "no ar". Um humano atira, gira o slot, espera o scroll e — se nada acontece — trata a porta
+ * como trancada e procura outra. É isto que esta classe decide; quem executa é o agente.
+ *
+ * Dois detalhes que já pegaram regressão:
+ *  - o disparo é `>=` com trava por porta, não `=== N`: se a leitura de "near door" piscar (ela
+ *    sai 5 px da janela e volta), um `=== 120` nunca chega a bater e o orçamento vira enfeite;
+ *  - ausência curta é **janela de tolerância** (não zera, não conta), ausência longa zera. As
+ *    duas versões ingênuas — "decai sempre" e "zera sempre" — foram testadas e reprovariam: a
+ *    primeira dá anistia a cada piscada (o prazo nunca vence), a segunda perdoa o pacing.
+ */
+export class DoorAttemptBudget {
+  private key = '';
+  private ticks = 0;
+  private awayRun = 0;
+  private fired = false;
+
+  /**
+   * @param grace  ausências de até `grace` ticks consecutivos são *janela de tolerância* (o
+   *   sensor "perto da porta" pisca quando ela anda na soleira), não uma saída. Depois disso é
+   *   saída de verdade: a conta é zerada, porque ela foi fazer outra coisa.
+   */
+  constructor(private readonly budget = 120, private readonly grace = 8) {}
+
+  /**
+   * @param doorKey  porta-alvo da sala, ou `null` quando ela não está na soleira de nenhuma
+   * @returns `true` no tick em que se deve desistir da porta (uma vez só por porta)
+   */
+  feed(_tick: number, roomId: number, doorKey: string | null): boolean {
+    // a IDENTIDADE é a porta; a ausência é um estado dela. Trocar isso por "key = '' quando está
+    // fora" faz cada piscada trocar de identidade e o reset apagar a conta — foi exatamente o que
+    // o teste pegou (a janela de tolerância nunca existia).
+    if (doorKey) {
+      const key = `${roomId}:${doorKey}`;
+      if (key !== this.key) {
+        this.key = key;
+        this.ticks = 0;
+        this.awayRun = 0;
+        this.fired = false;
+      }
+    }
+    if (!doorKey) {
+      this.awayRun++;
+      if (this.awayRun > this.grace) {
+        this.ticks = 0;
+        this.fired = false;
+      }
+      return false;
+    }
+    this.awayRun = 0;
+    this.ticks++;
+    if (this.ticks >= this.budget && !this.fired) {
+      this.fired = true;
+      return true;
+    }
+    return false;
+  }
+
+  /** troca de sala / novo jogo */
+  reset(): void {
+    this.key = '';
+    this.ticks = 0;
+    this.awayRun = 0;
+    this.fired = false;
+  }
+
+  get state(): { doorKey: string; ticks: number; budget: number } {
+    return { doorKey: this.key, ticks: this.ticks, budget: this.budget };
+  }
+
+  get gaveUp(): boolean {
+    return this.fired;
+  }
+}
+
 /* -------------------------------------------------------------- facade */
 
 export interface GuardianSnapshot {
@@ -1054,6 +1145,8 @@ export interface GuardianSnapshot {
   deadCount: number;
   slot: { taps: number; gaveUp: boolean; ownedSlots: number };
   lock: { lockedSlot: number | null };
+  /** tentativa de porta: em que porta ela está e há quantos ticks (`budget` = limite) */
+  doorAttempt: { doorKey: string; ticks: number; budget: number };
   jump: { holdTicks: number; holdFrames: number; gapPx: number };
 }
 
@@ -1068,6 +1161,7 @@ export class ActionGuardian {
   readonly jump = new JumpModulator();
   readonly slots = new SlotDriver();
   readonly prey = new PreyChaser();
+  readonly doorBudget = new DoorAttemptBudget();
   private lastJump: JumpShape = { holdTicks: 3, holdFrames: 24, holdMs: 400, release: false, gapPx: 0, why: '' };
 
   reset(): void {
@@ -1077,6 +1171,7 @@ export class ActionGuardian {
     this.jump.reset();
     this.slots.reset();
     this.prey.reset();
+    this.doorBudget.reset();
   }
 
   /** esquece apostas mortas de uma sala quando um item novo a reabre */
@@ -1098,6 +1193,7 @@ export class ActionGuardian {
       deadCount,
       slot: this.slots.state,
       lock: this.prey.state,
+      doorAttempt: this.doorBudget.state,
       jump: {
         holdTicks: this.lastJump.holdTicks,
         holdFrames: this.lastJump.holdFrames,

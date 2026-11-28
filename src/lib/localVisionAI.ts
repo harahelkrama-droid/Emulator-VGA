@@ -273,19 +273,22 @@ export class LocalVisionAgent {
    * travessia re-dispara. Custa 2,4 s e economiza a sessão inteira (ver `bounceTally`).
    */
   private entryCalm: { roomId: number; forbid: 'LEFT' | 'RIGHT'; until: number; x: number; y: number } | null = null;
+  /** true quando o contador de auto-destruição está rodando (fuga da área explodindo) */
+  private timedEscapeThisTick = false;
+  /** borda de subida do contador (dispara o replanejamento imediato da rota de fuga) */
+  private wasTimedEscape = false;
   /**
-   * Orçamento da TENTATIVA DE PORTA. Ficar na soleira atirando/girando slot sem a sala trocar não
-   * é progresso — é o estado em que a sessão de 25 min terminou: 9.160 ticks (79 % do tempo) em
-   * 0x8CB3 x=216 com `Abrindo porta (RIGHT)`, e o sentinela mudo porque o chão daquela soleira é
-   * lido como "no ar". Um humano atira, gira o slot, espera o scroll e, se nada acontece, trata a
-   * porta como trancada e procura outra. É o que este orçamento faz.
+   * Fuga concluída: o contador roda e ela já está na sala de origem. Daqui para frente as
+   * defesas anti-vaivém voltam a valer — "atravessar a mesma porta é o plano" só é verdade
+   * enquanto ela está RETROCEDENDO; depois de chegar, cruzar a porta de novo é o pingue-pongue
+   * que a mata (medido na simulação: `0x10 · Abrindo porta (RIGHT)` ⇄ `0x20 · Abrindo porta (LEFT)`
+   * por 600+ ticks com o contador estourando).
    */
-  private doorAttempt = { key: '', ticks: 0 };
+  private escapeReachedHome = false;
   private roomChain: number[] = [];
   private bounceTally = new Map<string, { n: number; tick: number }>();
   /** aresta proibida como destino de alvo: `${from}->${to}` → até quando */
   private bounceBan = new Map<string, number>();
-  /** ticks consecutivos dentro do estado de transição de porta (0x0b) */
 
   private entryDoorKey: string | null = null;
   private activeDoorKey: string | null = null;
@@ -1865,7 +1868,10 @@ export class LocalVisionAgent {
   }
 
   /** Monta o grafo nav a partir das estruturas que o agente já mantém (sem duplicar estado). */
-  private buildNavGraph(wram: MetroidWramSnapshot): NavGraph {
+  private buildNavGraph(
+    wram: MetroidWramSnapshot,
+    opts?: { ignoreLockedDoors?: boolean },
+  ): NavGraph {
     const rooms = new Map<number, NavRoom>();
     const ensure = (id: number): NavRoom => {
       let r = rooms.get(id);
@@ -1880,7 +1886,13 @@ export class LocalVisionAgent {
             doors.push({
               key,
               color,
-              blockedByWall: rec.locked,
+              // `ignoreLockedDoors` é para a FUGA: um carimbo "trancada" vem de uma tentativa
+              // antiga (munição errada, sala ainda não reaberta). Para exploração isso é certo —
+              // não se gasta munição duas vezes no mesmo batente. Para rota de saída é LETAL: a
+              // aresta some do grafo, o BFS não acha mais o caminho de volta, e a alternativa era
+              // "voltar por onde veio", que no caso do print mandava ela para MAIS DENTRO da área
+              // que estava explodindo. Na fuga, toda porta conhecida é porta.
+              blockedByWall: opts?.ignoreLockedDoors ? false : rec.locked,
               targetRoomId: linked,
               unknownColor: color === 'UNKNOWN',
             });
@@ -2079,6 +2091,20 @@ export class LocalVisionAgent {
       this.completionProfile === 'xfusion' ? XFUSION_TOTALS : COMPLETION_TOTALS,
     );
 
+    // (j0) a borda de subida do contador replaneja NO MESMO tick. A cadência de 40 ticks é boa
+    // para exploração e é inaceitável para fuga: com a área explodindo, 40 ticks são ~5 s de
+    // jogo gastos com o alvo velho (que apontava para DENTRO), e foi assim que ela morreu no print.
+    if (!wram.countdownActive) this.escapeReachedHome = false;
+    if (wram.countdownActive && !this.wasTimedEscape) {
+      this.wasTimedEscape = true;
+      this.navPlanTick = -9999;
+      this.activeDoorKey = null;
+      this.pendingTargets = [];
+      this.jumpHoldRemaining = 0;
+    } else if (!wram.countdownActive) {
+      this.wasTimedEscape = false;
+    }
+
     // (j) replaneja quando muda de sala, quando algo muda no estado ou a cada ~40 ticks
     if (this.stepIndex - this.navPlanTick > 40 || firstSight || this.navTarget === null) {
       this.refreshLockedDoors(wram);
@@ -2161,7 +2187,62 @@ export class LocalVisionAgent {
 
   private replan(wram: MetroidWramSnapshot): void {
     this.navPlanTick = this.stepIndex;
+    this.timedEscapeThisTick = wram.countdownActive;
     const graph = this.buildNavGraph(wram);
+
+    // FUGA DO CONTADOR. O objetivo durante a auto-destruição NÃO é explorar: é sair pela rota por
+    // onde ela entrou. Foi o que o relatório cobrou e o que faltava — o planificador de fronteira
+    // continuava escolhendo "a sala seguinte interessante", ela andava em círculos no poço e a
+    // área explodia com ela dentro. `roomChain` + o link reverso já registrado na chegada
+    // (`doorLinks`) sabem exatamente por onde ela veio; é só perguntar.
+    if (wram.countdownActive) {
+      // "voltar por onde eu vim" ingênuo é uma armadilha: se ela estava oscillando, a ÚLTIMA sala
+      // da cadeia é a mais FUNDA (o print do usuário: o contador ligou em 0x20 e o instinto de
+      // "voltar" mandou ela para 0x30, mais para dentro da área que estava explodindo). Fuga é
+      // direção, não histórico — o que se quer é a rota BFS de volta à sala de origem (a nave),
+      // que é exatamente o cálculo do modo retorno. Reusar o planificador com `everythingDone`
+      // evita inventar um segundo buscador para errar do mesmo jeito.
+      const escape = planNextTarget({
+        graph: this.buildNavGraph(wram, { ignoreLockedDoors: true }),
+        loadout: this.navLoadoutView(wram),
+        hint: null,
+        bossRooms: new Map(),
+        everythingDone: true,
+        backlogKeys: new Set<string>(),
+        startRoomId: this.navStartRoomId,
+      });
+      const t = escape.target;
+      if (t && (t.firstDoor || t.route.length > 0)) {
+        this.navTarget = { ...t, label: `fuga do contador · ${t.label}`, reason: 'auto-destruição em andamento · rota BFS de volta à sala de origem' };
+        return;
+      }
+      // Ela JÁ está na sala de origem: a fuga acabou. Caía aqui no heurístico de "voltar por onde
+      // veio" e ela atravessava a porta DE NOVO para dentro da área explodindo — pingue-pongue no
+      // batente de saída, que é a morte do print (medido na simulação: 0x10 → RIGHT → 0x20).
+      const atHome = this.navStartRoomId < 0 || this.navStartRoomId === wram.roomId;
+      this.escapeReachedHome = atHome;
+      if (atHome) {
+        // alvo terminal: sem `firstDoor`, para o `planPathInRoom` não escolher a porta por onde
+        // ela acabou de entrar como "objetivo" da sala
+        this.navTarget = {
+          kind: 'SHIP',
+          roomId: wram.roomId,
+          route: [],
+          firstDoor: null,
+          label: 'fuga do contador · sala de origem alcançada',
+          reason: 'auto-destruição · ela chegou de volta; segurar a posição e não reentrar pela rota',
+          score: 1000,
+        };
+        return;
+      }
+      // sem rota no grafo (chegada sem portas mapeadas): última opção é a porta por onde ela
+      // ENTROU nesta sala, medida pela geometria do spawn
+      const fallback = this.escapeReturnTarget(wram);
+      if (fallback) {
+        this.navTarget = fallback;
+        return;
+      }
+    }
     const plan = planNextTarget({
       graph,
       loadout: this.navLoadoutView(wram),
@@ -2183,9 +2264,50 @@ export class LocalVisionAgent {
     this.navBacklog = [...fresh, ...keep].slice(0, 12);
   }
 
+  /**
+   * A porta que devolve ela por onde veio. Duas fontes, nesta ordem: o link reverso do grafo
+   * (registrado na chegada à sala) e, se o grafo não soube, a porta GEOMETRICAMENTE mais perto do
+   * spawn — que é o batente por onde ela entrou, por construção.
+   */
+  private escapeReturnTarget(wram: MetroidWramSnapshot): NavTarget | null {
+    const chain = this.roomChain;
+    const here = this.roomGraph.get(wram.roomId);
+    let backRoom: number | null = null;
+    for (let i = chain.length - 1; i >= 0; i -= 1) {
+      if (chain[i] !== wram.roomId) {
+        backRoom = chain[i];
+        break;
+      }
+    }
+    let doorKey: string | null = null;
+    if (backRoom !== null) {
+      for (const [k, target] of here?.doorLinks ?? []) if (target === backRoom) doorKey = k;
+    }
+    if (!doorKey) {
+      const near = wram.doors
+        .map((d) => ({ d, dist: Math.hypot(d.x - wram.samusX, d.y - wram.samusY) }))
+        .sort((a, b) => a.dist - b.dist)[0];
+      if (near) doorKey = near.d.key;
+    }
+    if (!doorKey) return null;
+    return {
+      kind: 'SHIP',
+      roomId: backRoom ?? wram.roomId,
+      route: [doorKey],
+      firstDoor: doorKey,
+      label: 'fuga do contador · voltar por onde veio',
+      reason: 'área em auto-destruição · a rota de saída é o caminho de volta, não a fronteira',
+      score: 1000,
+    };
+  }
+
   /** Registra A→B→A e, no segundo round trip pela mesma porta, proíbe a aresta como alvo. */
   private registerRoomBounce(prevRoomId: number, curRoomId: number): void {
     if (prevRoomId <= 0 || curRoomId <= 0 || prevRoomId === curRoomId) return;
+    // na RETROCESSÃO da fuga, atravessar a mesma porta é o PLANO (voltar por onde veio), não o
+    // sintoma — banir a aresta aí é o que a matava na explosão. Depois de chegar na sala de
+    // origem, porém, o vaivém volta a ser vaivém e o orçamento precisa de novo existir.
+    if (this.timedEscapeThisTick && !this.escapeReachedHome) return;
     const chain = this.roomChain;
     const cameBackTo = chain.length > 0 && chain[chain.length - 1] === curRoomId;
     if (cameBackTo) {
@@ -2236,6 +2358,7 @@ export class LocalVisionAgent {
    */
   private applyBounceBan(target: NavTarget | null, wram: MetroidWramSnapshot): NavTarget | null {
     if (!target) return null;
+    if (wram.countdownActive && !this.escapeReachedHome) return target;
     if (target.roomId === wram.roomId) return target;
     if (this.bounceBanned(wram.roomId, target.roomId)) return null;
     const node = this.roomGraph.get(wram.roomId);
@@ -2324,6 +2447,11 @@ export class LocalVisionAgent {
       } else {
         this.offPlayfieldTicks = 0;
       }
+      // com o contador de auto-destruição rodando, abrir o mapa é perder tempo de forma
+      // produtiva para ninguém: ela já sabe por onde veio (o objetivo de fuga usa `roomChain`) e
+      // o menu não pausa o timer desta ROM. Quem já está com o mapa aberto continua a máquina de
+      // fechar abaixo — só não abrimos um novo.
+      if (wram.countdownActive && this.mapConsultPhase === 'IDLE') return null;
       if (!this.menuOpenAllowed()) return null;
       // Refratário: ler o mapa é caro (o jogo pausa). Severidade 3 significa "ler já", não
       // "reler a cada 2 ticks". E reler o mesmo mapa sem ter descoberto sala nenhuma desde a
@@ -2678,7 +2806,7 @@ export class LocalVisionAgent {
       this.stepIndex,
       this.guardian.sentinel.current,
       this.roomChangedThisTick,
-      { inCombat, canReadMap: this.menuOpenAllowed() },
+      { inCombat, canReadMap: this.menuOpenAllowed() && !wram.countdownActive, capStep: wram.countdownActive ? 2 : 4 },
     );
 
     // os dois campos antigos continuam coerentes (UI e uSearch leem isso)
@@ -2875,6 +3003,7 @@ export class LocalVisionAgent {
           jump: g.jump,
           slot: g.slot,
           lockedTarget: g.lock.lockedSlot,
+          doorAttempt: g.doorAttempt,
           inventoryTrusted: wram ? wram.inventoryTrusted : true,
           inventoryIssue: wram ? wram.inventoryIssue : null,
         };
@@ -6627,6 +6756,12 @@ export class LocalVisionAgent {
     const doorTargets: Array<{ key: string; bx: number; by: number; priority: number }> = [];
 
     for (const d of wram.doors) {
+      // FUGA CONCLUÍDA: na sala de origem, com o contador rodando, NENHUMA porta é objetivo.
+      // O `navTarget` terminal acima não bastava — a lista de portas da sala é montada à parte e
+      // era ela que empurrava ela de volta pelo batente (0x10 ⇄ 0x20 por 600+ ticks enquanto a
+      // área explodia). Um humano que chega ao ponto de fuga para de correr; é isto que a linha
+      // abaixo faz.
+      if (isTimedEscape && this.escapeReachedHome) break;
       if (d.blockedByWall && !isTimedEscape) continue;
       const rec = currNode.doors.get(d.key);
       if (rec?.locked && !isTimedEscape) continue;
@@ -6635,7 +6770,12 @@ export class LocalVisionAgent {
       // até o batente proibido do mesmo jeito e atravessar (foi o que o playtest mostrou: o laço
       // apenas mudou de par de salas, 0x8B7D/0x8BBB → 0x8BF9/0x8C37)
       const linkedRoom = currNode.doorLinks.get(d.key);
-      if (linkedRoom !== undefined && linkedRoom !== wram.roomId && this.bounceBanned(wram.roomId, linkedRoom)) {
+      if (
+        (!isTimedEscape || this.escapeReachedHome) &&
+        linkedRoom !== undefined &&
+        linkedRoom !== wram.roomId &&
+        this.bounceBanned(wram.roomId, linkedRoom)
+      ) {
         continue;
       }
 
@@ -6658,6 +6798,11 @@ export class LocalVisionAgent {
 
     let pathStep = this.planPathInRoom(wram, doorTargets);
     // veto de chegada: o plano não pode ser "voltar pela porta por onde ela acabou de entrar"
+    // O veto de chegada vale TAMBÉM na fuga. Eu o tinha isentado durante o contador "porque
+    // recuar é atravessar porta de novo" — e o resultado medido foi o pingue-pongue 0x10 ⇄ 0x20
+    // em cima do batente, com o timer estourando. As duas coisas não conflitam: o veto dura 14
+    // ticks e barra a REENTRADA imediata; a retrocessão de verdade acontece 14 ticks depois,
+    // quando ela já se virou e andou para dentro da sala.
     if (
       pathStep &&
       this.entryCalm &&
@@ -6805,15 +6950,16 @@ export class LocalVisionAgent {
       const wpX = pathStep.wpBx * 16 + 8;
       const wpY = pathStep.wpBy * 16 + 8;
       const nearDoor = targetDoor && Math.hypot(targetDoor.x - wram.samusX, targetDoor.y - wram.samusY) <= 56;
-      if (nearDoor && targetDoor) {
-        const attemptKey = `${wram.roomId}:${targetDoor.key}`;
-        this.doorAttempt = { key: attemptKey, ticks: this.doorAttempt.key === attemptKey ? this.doorAttempt.ticks + 1 : 1 };
+      {
         // 120 ticks (~15 s de jogo a 8 decisões/s) cobrem com folga o scroll de abertura + 3
         // projéteis + uma volta de slot. Passou disso, a premissa "esta porta abre agora" caiu.
-        if (this.doorAttempt.ticks === 120) {
+        // A contagem mora em `DoorAttemptBudget` (pureza + teste em `guardianCheck`): a versão
+        // inline comparava `ticks === 120` e zerava ao sair da soleira, então uma piscada de
+        // "near door" a cada 2 ticks bastava para o orçamento nunca disparar.
+        const giveUp = this.guardian.doorBudget.feed(this.stepIndex, wram.roomId, nearDoor ? (targetDoor?.key ?? null) : null);
+        if (giveUp && targetDoor) {
           const rec = this.getOrCreateRoom(wram.roomId).doors.get(targetDoor.key);
           if (rec) rec.locked = true;
-          this.doorAttempt = { key: '', ticks: 0 };
           this.activeDoorKey = null;
           this.moveDir = this.moveDir === 'RIGHT' ? 'LEFT' : 'RIGHT';
           this.anchorX = wram.samusX;
@@ -6832,8 +6978,6 @@ export class LocalVisionAgent {
             wram,
           );
         }
-      } else if (this.doorAttempt.ticks > 0) {
-        this.doorAttempt = { key: '', ticks: 0 };
       }
       const floorBelowT = this.resolveBlockType(wram, samusBx, samusBy + 1);
       const bombFloorUnderFoot =
