@@ -13,6 +13,7 @@ import {
 import { askGemini, askOllama } from '../lib/externalAI';
 import { LocalVisionAgent } from '../lib/localVisionAI';
 import { clearAIKnowledge, getSaveSummary, readAIKnowledge, readSaveSlot, upsertAIKnowledge, writeSaveSlot } from '../lib/saveDb';
+import { invalidateRamCache } from '../lib/emulatorBridge';
 import { readMetroidWram } from '../lib/snesWram';
 import type {
   AIAction,
@@ -55,6 +56,28 @@ const selfFixKey = (gameFile: string) => `retroplay_ai_self_corrections_v1:${gam
 
 const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 
+/**
+ * Orçamento do laço de IA. O piso de 90 ms existia porque a cadência só precisava "andar e
+ * atirar". Com pulo de altura variável (ver `JumpModulator` em actionGuardian) o piso precisa
+ * ser um frame: é o `time` da ação que decide quando o botão é solto, e 90 ms de piso tornava
+ * o pulo curto fisicamente impossível de expressar.
+ */
+const AI_TICK_MIN_MS = 17;
+const AI_TICK_MAX_MS = 160;
+/** acima disto a decisão está comendo o frame budget do render: o pump recua sozinho */
+const AI_TICK_BUDGET_MS = 12;
+
+interface AiTickResult {
+  /** quando chamar o próximo tick */
+  delayMs: number;
+  /** soltar as teclas antes do próximo tick (engines externos disparam e largam) */
+  release?: boolean;
+  /** custo da decisão, para o backoff adaptativo */
+  costMs?: number;
+  /** encerrou a sessão de IA */
+  stop?: boolean;
+}
+
 export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const screenWrapRef = useRef<HTMLDivElement | null>(null);
@@ -67,6 +90,13 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
     controller: null,
   });
   const consecutiveAiErrors = useRef(0);
+  const aiPumpRef = useRef<{ raf: number; running: boolean; nextAt: number; intervalMs: number }>({
+    raf: 0,
+    running: false,
+    nextAt: 0,
+    intervalMs: 125,
+  });
+  const previewSkipRef = useRef(0);
 
   const [ready, setReady] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -193,6 +223,8 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
 
   const stopAI = () => {
     aiLoopStopRef.current.active = false;
+    cancelAnimationFrame(aiPumpRef.current.raf);
+    aiPumpRef.current.running = false;
     if (aiLoopStopRef.current.controller) {
       aiLoopStopRef.current.controller.abort();
       aiLoopStopRef.current.controller = null;
@@ -364,25 +396,19 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
     ctx.drawImage(temp, 0, 0, pv.width, pv.height);
   };
 
-  const startAILoop = async (cautionAlreadyApproved = aiCautionApproved, openFullscreen = true) => {
-    if (!ready) {
-      onNotify('Aguarde o jogo iniciar antes de ativar a IA.');
-      return;
-    }
-    setShowTouchPad(false);
-    if (openFullscreen) {
-      void enterFullscreen();
-    }
-    setAiPromptQuestion(null);
-    agentRef.current.reset();
-    aiLoopStopRef.current.active = true;
-    setAiActive(true);
-    consecutiveAiErrors.current = 0;
-
-    while (aiLoopStopRef.current.active) {
-      try {
+  /**
+   * UMA decisão do agente. Era o corpo de um `while (ativo) { ... await sleep() }`; virou
+   * função para ser puxada por um pump de `requestAnimationFrame` com trava de reentrância. O
+   * laço antigo encavalava decisões quando o núcleo atrasava e serializava o estado inteiro do
+   * emulador a cada tick dentro do frame de render — era isso que derrubava o FPS quando a IA
+   * ligava.
+   */
+  const runAiTick = async (cautionAlreadyApproved: boolean): Promise<AiTickResult> => {
+    try {
         const startedAt = performance.now();
-        const wram = aiEngine === 'local-vision' ? await readMetroidWram() : null;
+        // TTL do estado: `getState()` serializa megabytes no EmulatorJS. 90 ms de cache custam
+        // ~5 frames de atraso de percepção no pior caso e devolvem o frame budget ao render.
+        const wram = aiEngine === 'local-vision' ? await readMetroidWram(90) : null;
         const maxCacheAgeMs =
           aiEngine === 'local-vision'
             ? wram?.valid
@@ -397,8 +423,10 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
           skipJpeg: aiEngine === 'local-vision',
           maxCacheAgeMs,
         });
+        // o preview é decorativo: 3x por segundo basta, e economiza um putImageData por tick
         if (frame.fresh !== false) {
-          drawPreviewFrame(frame.rgba, frame.width, frame.height);
+          previewSkipRef.current = (previewSkipRef.current + 1) % 3;
+          if (previewSkipRef.current === 0) drawPreviewFrame(frame.rgba, frame.width, frame.height);
         }
 
         let action: AIAction;
@@ -422,7 +450,7 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
           aiLoopStopRef.current.controller = null;
         }
 
-        if (!aiLoopStopRef.current.active) break;
+        if (!aiLoopStopRef.current.active) return { delayMs: 0, stop: true };
 
         const keysToHold: AIKey[] = action.keys && action.keys.length > 0 ? action.keys : [action.key];
         const elapsed = Math.round(performance.now() - startedAt);
@@ -458,26 +486,29 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
         if (action.phase === 'unsure' || action.phase === 'missing') {
           stopAI();
           setAiPromptQuestion(action.question || 'A IA pediu confirmação para continuar nesta tela.');
-          break;
+          return { delayMs: 0, stop: true };
         }
 
+        // Cadência = `time` da ação, com piso de um frame e teto de 160 ms. A decisão que
+        // estourar o orçamento atrasa o próximo tick em vez de encavalar: o FPS do emulador é
+        // a prioridade; a IA é a passageira.
+        consecutiveAiErrors.current = 0;
+        setHeldGameInputs(keysToHold);
         if (aiEngine === 'local-vision') {
-          // Loop contínuo em tempo real (~125ms) mantendo teclas pressionadas entre quadros sem soltar no vácuo
-          setHeldGameInputs(keysToHold);
-          await sleep(Math.min(160, Math.max(90, action.time)));
-        } else {
-          setHeldGameInputs(keysToHold);
-          await sleep(action.time);
-          releaseAllGameInputs();
-          await sleep(160);
+          return {
+            delayMs: Math.min(AI_TICK_MAX_MS, Math.max(AI_TICK_MIN_MS, action.time)),
+            costMs: elapsed,
+          };
         }
+        return { delayMs: Math.max(AI_TICK_MIN_MS, action.time), release: true, costMs: elapsed };
       } catch (err) {
         const error = err as Error;
-        if (error.name === 'AbortError') break;
+        // abort do fetch externo: o pump já foi cancelado, não há o que esperar
+        if (error.name === 'AbortError') return { delayMs: 0, stop: true };
         if (aiEngine === 'gemini' && !navigator.onLine) {
           setAiEngine('local-vision');
           onNotify('Sem internet: alternado para IA Local sem API.');
-          continue;
+          return { delayMs: 120 };
         }
         // Não deixa a IA morrer no primeiro erro: tenta recuperar até 3 vezes com backoff.
         consecutiveAiErrors.current = (consecutiveAiErrors.current ?? 0) + 1;
@@ -486,8 +517,7 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
           setAiStatusText(`Erro IA (tentativa ${consecutiveAiErrors.current}/3) — recuperando em ${backoff}ms`);
           setAiReason(error.message);
           releaseAllGameInputs();
-          await sleep(backoff);
-          continue;
+          return { delayMs: backoff };
         }
         setAiStatusText(`Erro: ${error.message.slice(0, 48)}`);
         setAiReason(error.message);
@@ -495,10 +525,69 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
         aiLoopStopRef.current.active = false;
         setAiActive(false);
         onNotify(`IA parou após ${consecutiveAiErrors.current} falhas seguidas. Clique para reiniciar.`);
-        break;
+        return { delayMs: 0, stop: true };
       }
+  };
+
+  const pumpAi = () => {
+    const pp = aiPumpRef.current;
+    if (!aiLoopStopRef.current.active) return;
+    pp.raf = requestAnimationFrame(async () => {
+      if (!aiLoopStopRef.current.active) return;
+      const now = performance.now();
+      if (pp.running || now < pp.nextAt) {
+        pumpAi();
+        return;
+      }
+      pp.running = true;
+      const t0 = performance.now();
+      let res: AiTickResult;
+      try {
+        res = await runAiTick(aiCautionApproved);
+      } catch (err) {
+        onNotify(`Tick da IA falhou: ${(err as Error).message.slice(0, 40)}`);
+        res = { delayMs: 600 };
+      }
+      pp.running = false;
+      if (res.stop) {
+        releaseAllGameInputs();
+        return;
+      }
+      if (res.release) {
+        // engines externos apertam e largam: o "largar" também é um tick do pump, não um sleep
+        releaseAllGameInputs();
+        pp.nextAt = performance.now() + Math.max(res.delayMs, 160);
+        pumpAi();
+        return;
+      }
+      const over = (res.costMs ?? performance.now() - t0) > AI_TICK_BUDGET_MS ? 40 : -8;
+      pp.intervalMs = Math.min(AI_TICK_MAX_MS, Math.max(AI_TICK_MIN_MS, pp.intervalMs + over));
+      pp.nextAt = performance.now() + Math.max(res.delayMs, pp.intervalMs);
+      pumpAi();
+    });
+  };
+
+  const startAILoop = async (cautionAlreadyApproved = aiCautionApproved, openFullscreen = true) => {
+    if (!ready) {
+      onNotify('Aguarde o jogo iniciar antes de ativar a IA.');
+      return;
     }
-    releaseAllGameInputs();
+    setShowTouchPad(false);
+    if (openFullscreen) {
+      void enterFullscreen();
+    }
+    setAiPromptQuestion(null);
+    agentRef.current.reset();
+    aiLoopStopRef.current.active = true;
+    setAiActive(true);
+    consecutiveAiErrors.current = 0;
+    const pp = aiPumpRef.current;
+    pp.intervalMs = 125;
+    pp.nextAt = 0;
+    pp.running = false;
+    previewSkipRef.current = 0;
+    invalidateRamCache();
+    pumpAi();
   };
 
   const handleEngineChange = (next: AIEngine) => {
@@ -1215,6 +1304,63 @@ export function EmulatorPlayer({ game, onClose, onNotify }: EmulatorPlayerProps)
                 )}
               </div>
             </div>
+
+            {/* Guarda de ação (`src/lib/actionGuardian.ts`): sem este bloco a tela mostrava
+                "Explorando" enquanto a IA pulava no mesmo tijolo havia 22 minutos. É o painel
+                que torna o travamento visível — e, portanto, corrigível. */}
+            {snapshot.guardian && (
+              <div className="mt-3 rounded-lg border border-[#24314a] bg-[#0c1322] px-2.5 py-2">
+                <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[10px] text-[#94a3bf]">
+                  <span className="font-semibold text-[#eef3fb]">Guarda de ação</span>
+                  <span>·</span>
+                  <span className="font-mono-data">
+                    sem progresso:{' '}
+                    <strong className={snapshot.guardian.stallTicks >= 120 ? 'text-[#fca5a5]' : snapshot.guardian.stallTicks >= 48 ? 'text-[#fbbf24]' : 'text-[#6ee7b7]'}>
+                      {snapshot.guardian.stallTicks} ticks
+                    </strong>
+                  </span>
+                  <span className="font-mono-data">sala: {snapshot.guardian.roomTicks} ticks</span>
+                  <span className="font-mono-data">
+                    empurrão: {snapshot.guardian.pushDir ?? '—'}
+                    {snapshot.guardian.pinnedEdge ? ` · presa na borda ${snapshot.guardian.pinnedEdge}` : ''}
+                  </span>
+                  {snapshot.guardian.escapeRung !== 'NONE' && (
+                    <span className="font-mono-data rounded-md bg-[#fbbf24]/15 px-1.5 py-0.5 text-[#fbbf24]">
+                      escape: {snapshot.guardian.escapeRung} ({snapshot.guardian.escapeStep + 1}/5)
+                    </span>
+                  )}
+                  <span className="font-mono-data">
+                    pulo: {snapshot.guardian.jump.holdFrames} frames · vão {snapshot.guardian.jump.gapPx}px
+                  </span>
+                  <span className="font-mono-data">
+                    SELECT: {snapshot.guardian.slot.taps} toques
+                    {snapshot.guardian.slot.gaveUp ? ' · casa inexistente no HUD' : ''} ·{' '}
+                    {snapshot.guardian.slot.ownedSlots} casas
+                  </span>
+                  {snapshot.guardian.lockedTarget !== null && (
+                    <span className="font-mono-data">alvo travado #{snapshot.guardian.lockedTarget}</span>
+                  )}
+                  <span className="font-mono-data">
+                    apostas mortas: <strong className="text-[#eef3fb]">{snapshot.guardian.deadHypotheses}</strong>
+                  </span>
+                  {!snapshot.guardian.inventoryTrusted && (
+                    <span className="rounded-md bg-[#fca5a5]/15 px-1.5 py-0.5 font-semibold text-[#fca5a5]">
+                      inventário ilegível · {snapshot.guardian.inventoryIssue ?? 'leitura descartada'}
+                    </span>
+                  )}
+                </div>
+                {snapshot.guardian.hypotheses.length > 0 && (
+                  <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-[#94a3bf]">
+                    {snapshot.guardian.hypotheses.map((h) => (
+                      <span key={h.key} className="font-mono-data">
+                        {h.note || h.kind}: {h.attempts} tentativa{h.attempts === 1 ? '' : 's'}
+                        {h.status === 'DEAD' ? ' · morta' : ''}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="mt-4 border-t border-[#24314a] pt-3.5">
               <div className="flex flex-wrap items-center justify-between gap-3">

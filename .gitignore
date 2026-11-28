@@ -18,3 +18,10 @@ analysis-tmp/
 .analysis-tmp/
 video-analysis/
 image-search/
+
+# Saídas do playtest headless: um run de 25 min são ~12 mil linhas de log por decisão + frames
+# PNG (≈19 MB). O que se versiona são as tabelas resumidas (metrics.md / gate.md), forçadas com
+# `git add -f`; o resto fica local. Os scripts exigem os pacotes do core, que NÃO são
+# dependência do app: `npm i --no-save romdev-core-host@0.14.1 romdev-platform-snes@0.12.2`.
+playtest/out*/
+playtest/*.log

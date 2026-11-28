@@ -1,5 +1,11 @@
 /**
  * Gera um index.html autocontido pronto para publicar no repositório GitHub Pages
+ *
+ * ATENÇÃO (camada de verificação): o laço de IA embutido aqui é uma cópia minificada e
+ * independente do `LocalVisionAgent`, e **não** recebeu a `src/lib/actionGuardian.ts`
+ * (âncora horizontal, escada de escape sem autofagocitose, orçamento de aposta, pulo por vão,
+ * driver de SELECT). As correções do relatório do playtest de 25 min vivem no agente do app;
+ * portá-las para cá é trabalho separado (a cópia não tem suíte de teste própria).
  * (harahelkrama-droid/Emulator-GBA), com IA local sem API que joga em tela cheia,
  * filtra elementos estáticos do cenário, analisa as 16 peças/armadura/reserva de energia,
  * memoriza rotas, evita colisão de saves em ROMs locais e registra o Service Worker PWA.

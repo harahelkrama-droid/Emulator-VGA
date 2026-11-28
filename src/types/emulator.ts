@@ -253,6 +253,23 @@ export interface AIStatusSnapshot {
     /** portas da sala atual com a cor reconhecida no frame (base da decisão de abrir/voltar) */
     currentRoomDoors: Array<{ key: string; color: string; closed: boolean }>;
   };
+  /** camada de verificação (`src/lib/actionGuardian.ts`): apostas, travamento e degrau de escape */
+  guardian?: {
+    stallTicks: number;
+    roomTicks: number;
+    severity: number;
+    pushDir: string | null;
+    pinnedEdge: 'LEFT' | 'RIGHT' | null;
+    escapeRung: 'NONE' | 'NUDGE' | 'REVERSE_PUSH' | 'SWEEP' | 'MAP_READ' | 'BLOCK_ROOM';
+    escapeStep: number;
+    deadHypotheses: number;
+    hypotheses: Array<{ key: string; kind: string; attempts: number; failures: number; status: string; note: string }>;
+    jump: { holdFrames: number; gapPx: number };
+    slot: { taps: number; gaveUp: boolean; ownedSlots: number };
+    lockedTarget: number | null;
+    inventoryTrusted: boolean;
+    inventoryIssue: string | null;
+  };
   // Sistema de interação com objetos/terminal/energia
   interaction?: {
     nearbyObjects: Array<{

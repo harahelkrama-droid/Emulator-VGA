@@ -321,6 +321,9 @@ class World {
       doors,
       blockTypes,
       btsBytes: new Uint8Array(16 * 14),
+      // fixtures de simulação descrevem mundos auto-consistentes: a leitura é confiável
+      inventoryTrusted: true,
+      inventoryIssue: null,
     };
   }
 
