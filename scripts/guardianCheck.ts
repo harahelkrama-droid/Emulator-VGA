@@ -434,6 +434,35 @@ section('J. DoorAttemptBudget: a soleira tem prazo, e piscar o sensor não dá a
   check('o guardião expõe o estado no snapshot (a UI mostra a tentativa)', 'doorAttempt' in new ActionGuardian().snapshot());
 }
 
+section('K. capStep: na fuga com contador a escada não bloqueia a sala nem abre o mapa');
+{
+  const mk = () => {
+    const g = new ActionGuardian();
+    // travamento longo, sem progresso, sem sala nova
+    for (let t = 0; t < 700; t++) {
+      g.sentinel.feed(baseInput({ tick: t, roomId: 0x55, x: 30 + (t % 7), y: 144, grounded: true, keys: ['RIGHT'] }));
+    }
+    return g;
+  };
+  const capped = mk();
+  const rungs = new Set<string>();
+  for (let t = 700; t < 1300; t++) {
+    capped.sentinel.feed(baseInput({ tick: t, roomId: 0x55, x: 30 + (t % 7), y: 144, grounded: true, keys: ['RIGHT'] }));
+    const p = capped.ladder.next(t, capped.sentinel.current, false, { inCombat: false, canReadMap: true, capStep: 2 });
+    rungs.add(p.rung);
+  }
+  check('com capStep=2 a escada nunca chega em MAP_READ/BLOCK_ROOM', !rungs.has('MAP_READ') && !rungs.has('BLOCK_ROOM'), [...rungs].join(','));
+  check('e CICLA os degraus de movimento em vez de pinar no mais alto', rungs.has('REVERSE_PUSH') && rungs.has('SWEEP'), [...rungs].join(','));
+
+  const free = mk();
+  const rungsFree = new Set<string>();
+  for (let t = 700; t < 1300; t++) {
+    free.sentinel.feed(baseInput({ tick: t, roomId: 0x55, x: 30 + (t % 7), y: 144, grounded: true, keys: ['RIGHT'] }));
+    rungsFree.add(free.ladder.next(t, free.sentinel.current, false, { inCombat: false, canReadMap: true }).rung);
+  }
+  check('sem o teto, o mesmo cenário sobe até bloquear a sala (a isenção é o que muda)', rungsFree.has('BLOCK_ROOM'), [...rungsFree].join(','));
+}
+
 console.log(
   failures.length === 0
     ? `\n\x1b[1m\x1b[32mGUARDA DE AÇÃO OK\x1b[0m  · ${passed} verificações\n`

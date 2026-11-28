@@ -574,8 +574,14 @@ export class EscapeLadder {
     tick: number,
     v: SentinelVerdict,
     roomChanged: boolean,
-    opts: { inCombat: boolean; canReadMap: boolean },
+    opts: { inCombat: boolean; canReadMap: boolean; capStep?: number },
   ): EscapePlan {
+    // teto de degrau: durante a FUGA COM CONTADOR os dois degraus de cima (MAP_READ, BLOCK_ROOM)
+    // são ativamente errados — abrir o menu queima segundos do timer e bloquear a sala no grafo
+    // bloqueia a própria rota de saída. O agente só precisa de quem o tire dali.
+    const cap = Math.max(0, Math.min(4, opts.capStep ?? 4));
+    if (this.step > cap) this.step = cap;
+
     if (roomChanged) {
       this.reset();
       return NONE_PLAN;
@@ -592,7 +598,7 @@ export class EscapeLadder {
       // START atrasava 100+ ticks (tick 438, porta de entrada do teste é 420), no jogo real a
       // sala ficava bloqueada para sempre. Como o `canReadMap` do menu pode FALHAR na primeira
       // subida (ainda não faz 5 s de Save), o ciclo é o que dá a segunda chance.
-      this.step = stillStalled ? (this.step >= 4 ? 1 : this.step + 1) : 0;
+      this.step = stillStalled ? (this.step >= cap ? 1 : this.step + 1) : 0;
       this.rung = 'NONE';
     }
     if (v.stallTicks < 24) {
@@ -610,13 +616,18 @@ export class EscapeLadder {
     const wantStep = clamp(
       v.stallTicks >= 320 ? 4 : v.stallTicks >= 200 ? 3 : v.stallTicks >= 120 ? 2 : v.stallTicks >= 70 ? 1 : 0,
       0,
-      4,
+      cap,
     );
-    this.step = Math.max(this.step, wantStep);
+    // O atalho por severidade só existe para chegar rápido no topo da escada (bloquear a sala e
+    // trocar de rota quando ela está presa há minutos). Sob TETO — a fuga com contador — o topo não
+    // existe: ali o que se quer é o CICLO dos degraus de movimento, não ficar pinado no mais alto
+    // deles (medido: com `max(step, wantStep)` sob capStep=2 a escada virava SWEEP para sempre e
+    // o REVERSE_PUSH, que é o degrau que realmente inverte o empurrão, nunca mais aparecia).
+    this.step = cap < 4 ? Math.min(this.step, cap) : Math.min(cap, Math.max(this.step, wantStep));
 
     const rungs: EscapeRung[] = ['NUDGE', 'REVERSE_PUSH', 'SWEEP', 'MAP_READ', 'BLOCK_ROOM'];
     const rung = rungs[this.step];
-    if (rung === 'MAP_READ' && !opts.canReadMap && this.step < 4) this.step += 1;
+    if (rung === 'MAP_READ' && !opts.canReadMap && this.step < cap) this.step = Math.min(cap, this.step + 1);
     const chosen: EscapeRung = rungs[this.step];
 
     if (this.rung === 'NONE') {

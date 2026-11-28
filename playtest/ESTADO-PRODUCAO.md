@@ -1,13 +1,13 @@
 # Estado de produção — IA do emulador
 
 Nota de handoff **enxuta** (fonte de verdade para retomar o trabalho sem reler o histórico).
-Regra de manutenção: este arquivo é **reescrito**, não anexado; se passar de ~90 linhas, podar.
+Regra de manutenção: este arquivo é **reescrito**, não anexado; se passar de ~90 linhas, podar. Relatório completo com números e causas: `playtest/RELATORIO-IA-25min.md`.
 Logs de 25 min e frames não entram aqui nem no índice — só as tabelas (`*/metrics.md`, `*/gate.md`).
 
 ## Onde está (2026-11-28)
 
 - Branch `arena/240a0717-emulator-vga` → **PR #14** (base `main`, 22 arquivos).
-- `npm run check:all` = **389 verificações / 7 suítes**, todas verdes. `tsc --noEmit` e `vite build` limpos.
+- `npm run check:all` = **403 verificações / 7 suítes**, todas verdes. `tsc --noEmit` e `vite build` limpos.
 - Portão §12 na sessão de 25 min: **PASS** (11 salas · 232 ticks presos). Sessão-base (código antigo): **FAIL** (3 salas · 9.221 ticks).
 
 ## Como re-verificar (3 comandos, ~40 s)
@@ -38,6 +38,7 @@ Precisa de `npm i --no-save romdev-core-host@0.14.1 romdev-platform-snes@0.12.2`
 | 9 | spawn na sala nova empurrando o batente de entrada → re-disparava a porta (240 flips) | `entryCalm` (veto de chegada) + ban do **par** de salas no alvo **e** nas portas da sala | `localVisionAI.ts` |
 | 10 | ida-e-volta pela sala contava como progresso (amplitude ≠ saldo) | `oscillating`: 8+ inversões vs amostra atrasada, latch do corredor (`roomXMin/roomXMax`) | `actionGuardian.ts` |
 | 11 | prazo da porta nunca vencia (`=== 120` + reset ao piscar o sensor) | `DoorAttemptBudget` (`>=` com trava por porta, janela de tolerância de 8 ticks) | idem, usado em `localVisionAI` |
+| 12 | **fuga com a área explodindo**: sem objetivo de fuga o planificador mandava para dentro; o carimbo `locked` sumia com a rota de saída; e as minhas próprias defesas anti-vaivém viravam o vaivém no batente | replan forçado na subida do contador + rota BFS até a sala de origem em grafo permissivo (`ignoreLockedDoors`) + `escapeReachedHome` (nenhuma porta é alvo; `entryCalm`/ban voltam a valer) + `capStep=2` na escada e mapa fechado durante o `TIME` | `localVisionAI.ts` + `EscapeLadder` |
 
 ## Ainda não provado (não vender como pronto)
 
@@ -45,8 +46,9 @@ Precisa de `npm i --no-save romdev-core-host@0.14.1 romdev-platform-snes@0.12.2`
 - **`githubExport.ts`**: embute uma cópia minificada do laço de IA que **não** recebeu o `actionGuardian.ts` e não tem suíte. Documentado no cabeçalho do arquivo.
 - **"X-Fusion"** é suposição do repositório; o cabeçalho do ROM é `SNESFOREVER.COM.BR`. Constantes de sala/POV vieram da leitura de WRAM desta ROM.
 - CI: `checks.yml` roda as suítes (bloqueante) e o canário de playtest (`continue-on-error`) — o job de canário ainda não foi executado em runner real.
+- **Modo fuga (`TIME`/auto-destruição) não tem prova de ROM**: a sessão de 25 min nunca entra em contagem (`countdown ticks = 0`; o timer só liga depois da Mother Brain). Coberto por `mapAgentSim` §M (8 verificações de grafo/navegação), não pelo hardware. Para fechar isto, forçar o byte `0x0943` no harness.
 - 588 ticks "congelados" na sessão final são a luta do Draygon: isentados no portão e no `EscapeLadder` **só** por chefe (isentaria "inimigo vivo" qualquer, escondia o bug original).
 
 ## Arquivos que importam
 
-`src/lib/actionGuardian.ts` (puro, ~1.150 linhas, sem import de DOM) · `src/lib/localVisionAI.ts` (~7,9k linhas, o laço) · `src/lib/snesWram.ts` (leitura validada) · `src/lib/emulatorBridge.ts` (pump/caches) · `src/components/EmulatorPlayer.tsx` (painel "Guarda de ação") · `scripts/guardianCheck.ts` (especificação executável dos itens 1–5, 10, 11 — 83 verificações, seções A–J) · `playtest/{aiPlaytest.ts,analyze.mjs,control.ts,probe.ts}` · `playtest/RELATORIO-IA-25min.md` (diagnóstico completo, §1–§13).
+`src/lib/actionGuardian.ts` (puro, ~1.150 linhas, sem import de DOM) · `src/lib/localVisionAI.ts` (~7,9k linhas, o laço) · `src/lib/snesWram.ts` (leitura validada) · `src/lib/emulatorBridge.ts` (pump/caches) · `src/components/EmulatorPlayer.tsx` (painel "Guarda de ação") · `scripts/guardianCheck.ts` (especificação executável dos itens 1–5, 10–12 — 86 verificações, seções A–K) · `playtest/{aiPlaytest.ts,analyze.mjs,control.ts,probe.ts}` · `playtest/RELATORIO-IA-25min.md` (diagnóstico completo, §1–§14).

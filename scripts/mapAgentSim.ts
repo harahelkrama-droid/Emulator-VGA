@@ -838,6 +838,62 @@ section('L. Metroid na sala: seguir o bicho até a saída em vez de gastar a run
   check('não ficou parado esperando: começou a andar na hora', leftAt >= 0 && leftAt < 30, `tick=${leftAt}`);
 }
 
+/* ===== M. Contador de auto-destruição: o objetivo vira a porta por onde ela VEIO ===== */
+section('M. Fuga com contador: voltar pela rota de entrada, sem abrir mapa e sem bloquear a sala');
+{
+  // O caso do print do usuário: a área está explodindo (TIME correndo no HUD), ela "buja" no
+  // poço sem saber para onde ir e morre na explosão. O planificador de fronteira não serve para
+  // fuga — durante o contador o destino é o caminho de volta, e as defesas anti-loop do agente
+  // (ban de aresta, veto de chegada, leitura de mapa, BLOCK_ROOM) têm que SAIR do caminho, porque
+  // atravessar a mesma porta de novo é exatamente o plano.
+  const w = new World();
+  w.link(0x10, 0x20, 'PINK');
+  w.link(0x20, 0x30, 'PINK');
+  w.room(0x30).items.push({ x: 210, y: 138, kind: 'MISSILE' });
+  const agent = new LocalVisionAgent();
+  (agent as unknown as { menuArmAfterTicks: number }).menuArmAfterTicks = 0;
+  const acts: AIAction[] = [];
+  const roomSeq: number[] = [];
+  const tgtFromTick: string[] = [];
+  let deepAt = -1;
+  let outAt = -1;
+  let ESCAPE_AT = -1;
+  let startBefore = 0;
+  for (let t = 0; t < 1400; t++) {
+    // o contador liga no tick em que ela pisa na sala mais funda — é o caso do print: sem rota de
+    // fuga, "voltar por onde veio" apontava para MAIS DENTRO da área explodindo
+    if (ESCAPE_AT < 0 && w.cur === 0x30) {
+      ESCAPE_AT = t;
+      w.countdownActive = true;
+      startBefore = w.startPresses;
+    }
+    const a = agent.decide(w.frame(), 'action', 'Difícil', w.wram());
+    acts.push(a);
+    roomSeq.push(w.cur);
+    tgtFromTick.push(
+      ((agent as unknown as { navTarget: { label?: string } | null }).navTarget?.label ?? '-'),
+    );
+    w.apply(a);
+    if (deepAt < 0 && w.cur === 0x30) deepAt = t;
+    if (deepAt >= 0 && t > ESCAPE_AT && outAt < 0 && w.cur !== 0x30) outAt = t;
+  }
+  const after = acts.slice(ESCAPE_AT);
+  const navTarget = (agent as unknown as { navTarget: { label?: string; kind?: string } | null }).navTarget;
+
+  check('antes do contador ela chegou na sala funda (o teste precisa dela lá dentro)', deepAt >= 0 && ESCAPE_AT > 0, `tick=${deepAt} · contador em ${ESCAPE_AT}`);
+  check('o objetivo de fuga é a volta, não a fronteira', /fuga do contador/.test(navTarget?.label ?? ''), navTarget?.label ?? 'sem alvo');
+  check('e ela sai da sala funda com o contador rodando', outAt > ESCAPE_AT, `tick de saída=${outAt}`);
+  check('atravessa de volta até a sala de origem (a nave)', w.cur === 0x10, `sala=0x${w.cur.toString(16)}`);
+  check('e NÃO reentra na sala funda depois de escapar (pingue-pongue no batente de saída mata)', !roomSeq.slice(ESCAPE_AT + 120).includes(0x30), `salas vistas=${[...new Set(roomSeq.slice(ESCAPE_AT + 120))].map((r) => '0x' + r.toString(16)).join(',')}`);
+  check('não abre o mapa enquanto a área explode (cada tick é tempo de vida)', w.startPresses === startBefore, `${w.startPresses - startBefore} START no trecho`);
+  check('nenhum degrau BLOCK_ROOM/MAP_READ durante a fuga', !after.some((a) => /BLOCK_ROOM|MAP_READ/.test(a.sceneLabel ?? '')), after.map((a) => a.sceneLabel ?? '').filter((l) => l.includes('Escape')).slice(0, 2).join(','));
+  const pushed = after.slice(0, 40).some((a) => ks(a).includes('LEFT'));
+  check('começa a andar para fora em <40 ticks (não fica bujando)', pushed);
+  check('e sai da sala funda em <120 ticks de contador (≈15 s de jogo)', outAt - ESCAPE_AT < 120, `${outAt - ESCAPE_AT} ticks`);
+  check('o alvo de fuga vale desde o primeiro tick do contador (não espera a cadência de 40)', tgtFromTick.slice(ESCAPE_AT, ESCAPE_AT + 8).every((l) => /fuga do contador/.test(l)), tgtFromTick.slice(ESCAPE_AT, ESCAPE_AT + 3).join(' | ') || 'sem alvo');
+  check('o orçamento de porta não bloqueia a rota de saída', !after.some((a) => (a.sceneLabel ?? '').includes('Porta desistida')));
+}
+
 console.log(
   failures.length === 0
     ? `\n\x1b[1m\x1b[32mSIMULAÇÃO DE NAVEGAÇÃO OK\x1b[0m  · ${passed} verificações\n`

@@ -6,6 +6,7 @@
 - contexto · SELECT pressionado em 0.0% dos ticks (porta verde/amarela exige girar o slot)
 - contexto · decisões por segundo de jogo: 6.84 · custo médio 0.59 ms/decisão
 - contexto · travamento declarado pelo agente: máx 206 ticks, ≥240 em 0 ticks
+- contexto · ticks com contagem regressiva da área (modo fuga): 0 · a janela nunca entrou em fuga — o portão NÃO cobre o modo fuga (ver mapAgentSim §M)
 - contexto · correções de si mesma registradas: 1
 - contexto · ticks com aperto curto (≤3 frames): 0 de 10259 (0.0%)
 

@@ -235,6 +235,12 @@ console.log(lines.join('\n'));
   say(`- contexto · SELECT pressionado em ${(100 * selPct).toFixed(1)}% dos ticks (porta verde/amarela exige girar o slot)`);
   say(`- contexto · decisões por segundo de jogo: ${(rows.length / Math.max(1, gameSec)).toFixed(2)} · custo médio ${mean(rows.map((r) => r.dms || 0)).toFixed(2)} ms/decisão`);
   say(`- contexto · travamento declarado pelo agente: máx ${Math.max(...stuckVals)} ticks, ≥240 em ${stuckVals.filter((s) => s >= 240).length} ticks`);
+  const cdTicks = rows.filter((r) => (r.cd ?? 0) > 0).length;
+  say(
+    `- contexto · ticks com contagem regressiva da área (modo fuga): ${cdTicks}${
+      cdTicks === 0 ? ' · a janela nunca entrou em fuga — o portão NÃO cobre o modo fuga (ver mapAgentSim §M)' : ''
+    }`,
+  );
   say(`- contexto · correções de si mesma registradas: ${Math.max(...rows.map((r) => r.corr ?? 0), 0)}`);
   say(`- contexto · ticks com aperto curto (≤3 frames): ${rows.filter((r) => (r.holdFrames ?? 9) <= 3).length} de ${rows.length} (${pct(rows.filter((r) => (r.holdFrames ?? 9) <= 3).length, rows.length)})`);
   say('');
